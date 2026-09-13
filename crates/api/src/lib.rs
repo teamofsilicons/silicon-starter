@@ -10,8 +10,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use silicon_starter_core::{
-    CreateDiscussion, CreateStarter, Discussion, SEED_YAML, Starter, Version, Visibility, valid_id,
-    validate_silicon_yaml,
+    CreateDiscussion, CreateStarter, Discussion, SEED_YAML, Starter, Version, Visibility,
+    release_version, valid_id, validate_silicon_yaml,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -508,6 +508,18 @@ async fn publish(
     }
     if !s.starters.read().await.contains_key(&id) {
         return Err(StatusCode::NOT_FOUND);
+    }
+    let candidate = release_version(&input.version).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if s.versions
+        .read()
+        .await
+        .get(&id)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| release_version(&v.version).ok())
+        .any(|version| version >= candidate)
+    {
+        return Err(StatusCode::CONFLICT);
     }
     let v = Version {
         version: input.version,
