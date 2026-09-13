@@ -423,6 +423,12 @@ fn verify_iam_signature(secret: &[u8], signature: &str, timestamp: &str, body: &
     mac.verify_slice(&expected).is_ok()
 }
 
+pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, router(seeded_state())).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
@@ -431,9 +437,4 @@ mod webhook_tests {
     fn rejects_stale_signatures() {
         assert!(!verify_iam_signature(b"secret", "v1=00", "1", b"{}"));
     }
-}
-pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, router(seeded_state())).await?;
-    Ok(())
 }
