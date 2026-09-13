@@ -221,15 +221,24 @@ pub fn stage_and_commit(dir: impl AsRef<Path>, message: &str) -> Result<String, 
     head(dir)
 }
 fn add_keep_files(dir: &Path) -> Result<(), String> {
-    let entries: Vec<_> = fs::read_dir(dir).map_err(|e| e.to_string())?.filter_map(Result::ok).collect();
+    let entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
     let mut content = false;
     for entry in &entries {
         let name = entry.file_name();
-        if name == ".git" || name == ".starter" || name == ".siliconkeep" { continue; }
+        if name == ".git" || name == ".starter" || name == ".siliconkeep" || name == ".DS_Store" {
+            continue;
+        }
         content = true;
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() { add_keep_files(&entry.path())?; }
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            add_keep_files(&entry.path())?;
+        }
     }
-    if !content && !dir.join(".git").exists() { fs::write(dir.join(".siliconkeep"), b"").map_err(|e| e.to_string())?; }
+    if !content && !dir.join(".git").exists() {
+        fs::write(dir.join(".siliconkeep"), b"").map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 pub fn commit_history(dir: impl AsRef<Path>, limit: usize) -> Result<String, String> {

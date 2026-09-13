@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
@@ -152,8 +152,15 @@ pub fn router(state: AppState) -> Router {
                         .expect("valid frontend origin"),
                 )
                 .allow_credentials(true)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([
+                    HeaderName::from_static("content-type"),
+                    HeaderName::from_static("x-starter-session"),
+                    HeaderName::from_static("x-starter-mode"),
+                    HeaderName::from_static("x-silicon-iam-signature"),
+                    HeaderName::from_static("x-silicon-iam-timestamp"),
+                    HeaderName::from_static("x-silicon-iam-key-version"),
+                ]),
         )
 }
 async fn health() -> Json<serde_json::Value> {
