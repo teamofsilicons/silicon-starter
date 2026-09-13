@@ -458,22 +458,11 @@ async fn pull(
     if local::is_repo(&target) {
         let mut binding = local::load_binding(&target)
             .map_err(|_| "target is an existing non-Starter git repository")?;
+        local::ensure_main(&target)?;
         if !run_git_dir(&target, ["status", "--porcelain"].as_ref())?.is_empty() {
-            return Err("local changes must be committed before updating".into());
+            local::stage_and_commit(&target, "Local changes before Starter update")?;
         }
-        run_git_dir(
-            &target,
-            [
-                "fetch",
-                temp.to_str().ok_or("bundle path is not UTF-8")?,
-                "refs/heads/main:refs/remotes/starter/main",
-            ]
-            .as_ref(),
-        )?;
-        run_git_dir(
-            &target,
-            ["merge", "--ff-only", "refs/remotes/starter/main"].as_ref(),
-        )?;
+        let _ = merge_transaction(&target, &temp)?;
         binding.mode = if download {
             Mode::Download
         } else {
@@ -595,22 +584,209 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
 }
+
+/// Merge an archive in a disposable clone, then fast-forward the user's checkout.
+/// The real checkout is touched only after the merge (and any Omni repair) succeeds.
+fn merge_transaction(target: &Path, bundle: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let stage = std::env::temp_dir().join(format!(
+        "starter-update-{}-{}",
+        std::process::id(),
+        local::unique()
+    ));
+    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        let parent = stage.parent().unwrap_or_else(|| Path::new("."));
+        local::run_git(
+            parent,
+            [
+                "clone",
+                "--no-hardlinks",
+                target.to_str().ok_or("repository path is not UTF-8")?,
+                stage.to_str().ok_or("temporary path is not UTF-8")?,
+            ]
+            .as_ref(),
+        )?;
+        local::ensure_main(&stage)?;
+        local::run_git(
+            &stage,
+            [
+                "fetch",
+                bundle.to_str().ok_or("bundle path is not UTF-8")?,
+                "refs/heads/main:refs/remotes/starter/main",
+            ]
+            .as_ref(),
+        )?;
+        let remote = "refs/remotes/starter/main";
+        let merge = local::run_git(&stage, ["merge", "--ff-only", remote].as_ref());
+        if merge.is_err()
+            && let Err(error) = local::run_git(&stage, ["merge", "--no-edit", remote].as_ref())
+        {
+            resolve_with_omni(&stage, &error)?;
+        }
+        if !local::run_git(&stage, ["ls-files", "-u"].as_ref())?.is_empty() {
+            return Err("update left unresolved merge entries".into());
+        }
+        let commit = local::head(&stage)?;
+        local::run_git(
+            target,
+            [
+                "fetch",
+                stage.to_str().ok_or("temporary path is not UTF-8")?,
+                "refs/heads/main:refs/remotes/starter/transaction",
+            ]
+            .as_ref(),
+        )?;
+        local::run_git(
+            target,
+            ["reset", "--hard", "refs/remotes/starter/transaction"].as_ref(),
+        )?;
+        Ok(commit)
+    })();
+    let _ = fs::remove_dir_all(&stage);
+    result
+}
+
+fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let binary = [
+        std::env::var_os("SILICON_OMNI").map(PathBuf::from),
+        Some(PathBuf::from("silicon-omni")),
+        Some(PathBuf::from("so")),
+        Some(PathBuf::from("../silicon-omni/target/release/silicon-omni")),
+        Some(PathBuf::from("../silicon-omni/target/debug/silicon-omni")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| {
+        candidate.components().count() > 1 || Process::new(candidate).arg("--help").output().is_ok()
+    })
+    .ok_or("merge conflict needs silicon-omni, but no silicon-omni executable was found")?;
+    let listed = Process::new(&binary).arg("providers").output()?;
+    if !listed.status.success() {
+        return Err("silicon-omni could not list an available provider".into());
+    }
+    let providers: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if providers.is_empty() {
+        return Err(
+            "merge conflict needs an installed, authenticated silicon-omni provider".into(),
+        );
+    }
+    let session = format!("starter-merge-{}-{}", std::process::id(), local::unique());
+    let prompt = format!(
+        "Resolve the git merge conflict in this checkout. Inspect every conflict, preserve the intended changes from both sides, remove all conflict markers, then stage and commit the complete result with message `Resolve Starter update conflict`. Do not merely explain; edit the files. Git reported: {merge_error}"
+    );
+    let mut last_error = String::new();
+    for provider in providers {
+        let out = Process::new(&binary)
+            .current_dir(stage)
+            .args([
+                "send",
+                "--key",
+                "general",
+                "--providers",
+                &provider,
+                &session,
+                &prompt,
+            ])
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {
+                wait_omni_idle(&binary, &session);
+                if local::run_git(stage, ["ls-files", "-u"].as_ref())?.is_empty() {
+                    if !local::run_git(stage, ["status", "--porcelain"].as_ref())?.is_empty() {
+                        local::stage_and_commit(stage, "Resolve Starter update conflict")?;
+                    }
+                    if local::run_git(stage, ["status", "--porcelain"].as_ref())?.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(out) => last_error = String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    let _ = local::run_git(stage, ["merge", "--abort"].as_ref());
+    Err(format!("silicon-omni could not resolve the merge conflict: {last_error}").into())
+}
+
+fn wait_omni_idle(binary: &Path, session: &str) {
+    for _ in 0..60 {
+        let Ok(out) = Process::new(binary).args(["status", session]).output() else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) else {
+            return;
+        };
+        let snapshot = value.get("snapshot").unwrap_or(&value);
+        if snapshot.get("status").and_then(Value::as_str) == Some("waiting")
+            && snapshot.get("in_turn").and_then(Value::as_bool) != Some(true)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn revert(t: &str) -> Result<(), Box<dyn std::error::Error>> {
     let r = local::repo_root()?;
     if !local::run_git(&r, ["status", "--porcelain"].as_ref())?.is_empty() {
-        return Err("commit or stash local changes before revert".into());
+        local::stage_and_commit(&r, "Local changes before Starter revert")?;
     }
     let c = local::run_git(&r, ["rev-parse", &format!("{t}^{{commit}}")].as_ref())?;
-    match local::run_git(&r, ["revert", "--no-edit", &c].as_ref()) {
-        Ok(v) => {
-            println!("{v}");
-            Ok(())
-        }
-        Err(e) => {
-            let _ = local::run_git(&r, ["revert", "--abort"].as_ref());
-            Err(format!("revert could not merge cleanly and was aborted: {e}").into())
-        }
+    let stage = std::env::temp_dir().join(format!(
+        "starter-revert-{}-{}",
+        std::process::id(),
+        local::unique()
+    ));
+    let parent = stage.parent().unwrap_or_else(|| Path::new("."));
+    local::run_git(
+        parent,
+        [
+            "clone",
+            "--no-hardlinks",
+            r.to_str().ok_or("repository path is not UTF-8")?,
+            stage.to_str().ok_or("temporary path is not UTF-8")?,
+        ]
+        .as_ref(),
+    )?;
+    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        local::ensure_main(&stage)?;
+        // Reset only the disposable index/worktree to the requested tree. The
+        // current branch and all history remain in place until the new commit.
+        local::run_git(&stage, ["read-tree", "--reset", "-u", &c].as_ref())?;
+        local::run_git(&stage, ["clean", "-fd"].as_ref())?;
+        local::run_git(&stage, ["add", "-A"].as_ref())?;
+        local::run_git(
+            &stage,
+            ["commit", "--allow-empty", "-m", &format!("Revert to {t}")].as_ref(),
+        )?;
+        let new_head = local::head(&stage)?;
+        local::run_git(
+            &r,
+            [
+                "fetch",
+                stage.to_str().ok_or("temporary path is not UTF-8")?,
+                "refs/heads/main:refs/remotes/starter/revert",
+            ]
+            .as_ref(),
+        )?;
+        local::run_git(
+            &r,
+            ["reset", "--hard", "refs/remotes/starter/revert"].as_ref(),
+        )?;
+        Ok(new_head)
+    })();
+    let _ = fs::remove_dir_all(&stage);
+    if let Ok(ref new_head) = result {
+        println!("reverted to {c}; new commit {new_head}");
     }
+    result.map(|_| ())
 }
 fn report(body: &str, pr: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let title = if let Some(p) = pr {
