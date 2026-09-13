@@ -456,13 +456,18 @@ async fn pull(
         PathBuf::from(id.rsplit('.').next().unwrap_or(id))
     };
     if local::is_repo(&target) {
+        let target = target
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve Starter checkout: {e}"))?;
         let mut binding = local::load_binding(&target)
             .map_err(|_| "target is an existing non-Starter git repository")?;
         local::ensure_main(&target)?;
         if !run_git_dir(&target, ["status", "--porcelain"].as_ref())?.is_empty() {
             local::stage_and_commit(&target, "Local changes before Starter update")?;
         }
-        let _ = merge_transaction(&target, &temp)?;
+        let merged = merge_transaction(&target, &temp);
+        let _ = fs::remove_file(&temp);
+        merged?;
         binding.mode = if download {
             Mode::Download
         } else {
@@ -472,7 +477,6 @@ async fn pull(
         binding.pinned = rf.map(str::to_owned);
         local::save_binding(&target, &binding)?;
         local::register_checkout(&target, &binding)?;
-        let _ = fs::remove_file(temp);
         println!("updated {id} at {commit}");
         return Ok(());
     }
@@ -563,16 +567,22 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
                 continue;
             }
             active += 1;
-            let exe = std::env::current_exe()?;
-            let status = Process::new(&exe)
-                .current_dir(&entry.path)
-                .args(["--api", api, "update", "now"])
-                .status()?;
-            if !status.success() {
-                eprintln!(
+            let result = std::env::current_exe().and_then(|exe| {
+                Process::new(exe)
+                    .current_dir(&entry.path)
+                    .args(["--api", api, "update", "now"])
+                    .status()
+            });
+            match result {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
                     "auto-update failed for {}: exit {}",
                     entry.binding.id, status
-                );
+                ),
+                Err(error) => eprintln!(
+                    "auto-update failed for {}: could not run starter: {}",
+                    entry.binding.id, error
+                ),
             }
         }
         if active == 0 {
@@ -646,10 +656,21 @@ fn merge_transaction(target: &Path, bundle: &Path) -> Result<String, Box<dyn std
 }
 
 fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.parent()?
+                .parent()?
+                .parent()?
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .map(|p| p.join("silicon-omni/target/release/silicon-omni"));
     let binary = [
         std::env::var_os("SILICON_OMNI").map(PathBuf::from),
         Some(PathBuf::from("silicon-omni")),
         Some(PathBuf::from("so")),
+        sibling,
         Some(PathBuf::from("../silicon-omni/target/release/silicon-omni")),
         Some(PathBuf::from("../silicon-omni/target/debug/silicon-omni")),
     ]
@@ -659,6 +680,13 @@ fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std:
         candidate.components().count() > 1 || Process::new(candidate).arg("--help").output().is_ok()
     })
     .ok_or("merge conflict needs silicon-omni, but no silicon-omni executable was found")?;
+    let binary = if binary.components().count() > 1 {
+        binary
+            .canonicalize()
+            .map_err(|_| "silicon-omni executable path does not exist")?
+    } else {
+        binary
+    };
     let listed = Process::new(&binary).arg("providers").output()?;
     if !listed.status.success() {
         return Err("silicon-omni could not list an available provider".into());
