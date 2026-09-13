@@ -397,15 +397,40 @@ async fn iam_webhook(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoRe
         .get("x-silicon-iam-timestamp")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let mut mac = HmacSha256::new_from_slice(secret.to_string_lossy().as_bytes())
-        .expect("HMAC accepts any key");
-    mac.update(format!("{ts}.").as_bytes());
-    mac.update(&body);
-    let expected = format!("v1={}", hex::encode(mac.finalize().into_bytes()));
-    if sig != expected {
+    if !verify_iam_signature(secret.to_string_lossy().as_bytes(), sig, ts, &body) {
         return StatusCode::UNAUTHORIZED;
     }
     StatusCode::NO_CONTENT
+}
+fn verify_iam_signature(secret: &[u8], signature: &str, timestamp: &str, body: &[u8]) -> bool {
+    let Ok(ts) = timestamp.parse::<i64>() else {
+        return false;
+    };
+    if (Utc::now().timestamp() - ts).abs() > 300 {
+        return false;
+    }
+    let Some(encoded) = signature.strip_prefix("v1=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(encoded) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+        return false;
+    };
+    mac.update(format!("{timestamp}.").as_bytes());
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_stale_signatures() {
+        assert!(!verify_iam_signature(b"secret", "v1=00", "1", b"{}"));
+    }
 }
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
