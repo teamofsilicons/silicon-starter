@@ -18,6 +18,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 mod auth;
+mod semantic;
+mod store;
 mod telemetry;
 
 #[derive(Clone, Default)]
@@ -31,6 +33,7 @@ pub struct AppState {
     pub bundle_commits: Arc<RwLock<HashMap<String, String>>>,
     pub auth: Arc<auth::AuthState>,
     pub telemetry: Arc<telemetry::Telemetry>,
+    pub store: Option<Arc<store::Store>>,
 }
 #[derive(Deserialize)]
 struct ListQuery {
@@ -163,6 +166,19 @@ pub fn router(state: AppState) -> Router {
                 ]),
         )
 }
+async fn persist_state(s: &AppState) {
+    let Some(store) = &s.store else { return };
+    let value = json!({
+        "starters": *s.starters.read().await,
+        "versions": *s.versions.read().await,
+        "discussions": *s.discussions.read().await,
+        "bundles": s.bundles.read().await.iter().map(|(k,v)| (k.clone(), BASE64.encode(v))).collect::<HashMap<_,_>>(),
+        "bundle_commits": *s.bundle_commits.read().await,
+    });
+    if let Err(e) = store.save(value).await {
+        eprintln!("starter state persistence failed: {e}");
+    }
+}
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status":"ok","service":"silicon-starter","api_version":"v1"}))
 }
@@ -205,16 +221,32 @@ async fn search(
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> Json<Vec<Starter>> {
-    list(
+    let Json(mut items) = list(
         State(s),
         headers,
         Query(ListQuery {
-            q: q.q,
+            q: q.q.clone(),
             org: None,
             visibility: None,
         }),
     )
-    .await
+    .await;
+    let Some(query) = q.q else { return Json(items) };
+    if std::env::var_os("GEMINI_API_KEY").is_none() || query.trim().is_empty() {
+        return Json(items);
+    }
+    let Ok(query_embedding) = semantic::embed(&query, true).await else {
+        return Json(items);
+    };
+    let mut scored = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let text = format!("{} {} {}", item.name, item.description, item.yaml);
+        if let Ok(embedding) = semantic::embed(&text, false).await {
+            scored.push((semantic::cosine(&query_embedding, &embedding), item));
+        }
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Json(scored.into_iter().map(|(_, item)| item).collect())
 }
 async fn show(
     State(s): State<AppState>,
@@ -301,6 +333,7 @@ async fn create(
         "backend",
         json!({"type":"starter.created","starter_id":x.id,"source":"api"}),
     );
+    persist_state(&s).await;
     Ok((StatusCode::CREATED, Json(x)))
 }
 async fn star(
@@ -317,7 +350,10 @@ async fn star(
     let mut m = s.starters.write().await;
     let x = m.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     x.stars += 1;
-    Ok(Json(x.clone()))
+    let out = x.clone();
+    drop(m);
+    persist_state(&s).await;
+    Ok(Json(out))
 }
 async fn fork(
     State(s): State<AppState>,
@@ -340,6 +376,8 @@ async fn fork(
         ..src
     };
     m.insert(fork.id.clone(), fork.clone());
+    drop(m);
+    persist_state(&s).await;
     Ok((StatusCode::CREATED, Json(fork)))
 }
 async fn archive(
@@ -442,6 +480,8 @@ async fn push(
         .write()
         .await
         .insert(id.clone(), input.commit.clone());
+    drop(starters);
+    persist_state(&s).await;
     Ok(Json(
         json!({"id":id,"commit":input.commit,"message":input.message}),
     ))
@@ -473,6 +513,7 @@ async fn publish(
         .entry(id)
         .or_default()
         .push(v.clone());
+    persist_state(&s).await;
     Ok(Json(v))
 }
 async fn commits(
@@ -545,6 +586,7 @@ async fn add_discussion(
         .entry(id)
         .or_default()
         .push(d.clone());
+    persist_state(&s).await;
     Ok((StatusCode::CREATED, Json(d)))
 }
 async fn auth_login() -> impl IntoResponse {
@@ -727,11 +769,58 @@ async fn iam_webhook(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoRe
     StatusCode::NO_CONTENT
 }
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let state = seeded_state();
+    let mut state = seeded_state();
+    if let Some(store) = store::Store::connect_from_env().await? {
+        let store = Arc::new(store);
+        if let Ok(Some(payload)) = store.load().await {
+            restore_state(&state, payload).await;
+        }
+        state.store = Some(store);
+    }
     state.auth.load().await?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+async fn restore_state(s: &AppState, payload: serde_json::Value) {
+    let Some(object) = payload.as_object() else {
+        return;
+    };
+    if let Some(value) = object
+        .get("starters")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.starters.write().await = value;
+    }
+    if let Some(value) = object
+        .get("versions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.versions.write().await = value;
+    }
+    if let Some(value) = object
+        .get("discussions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.discussions.write().await = value;
+    }
+    if let Some(value) = object
+        .get("bundle_commits")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.bundle_commits.write().await = value;
+    }
+    if let Some(map) = object.get("bundles").and_then(|v| v.as_object()) {
+        let decoded = map
+            .iter()
+            .filter_map(|(k, v)| {
+                v.as_str()
+                    .and_then(|b| BASE64.decode(b).ok().map(|b| (k.clone(), b)))
+            })
+            .collect();
+        *s.bundles.write().await = decoded;
+    }
 }
 
 #[cfg(test)]

@@ -20,3 +20,4 @@ base64.workspace = true
 urlencoding.workspace = true
 reqwest.workspace = true
 space-station.workspace = true
+sqlx.workspace = true
