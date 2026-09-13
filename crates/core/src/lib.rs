@@ -66,6 +66,28 @@ pub fn valid_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
+
+/// Parse the public `Y.X` release notation and return numeric components.
+pub fn release_version(value: &str) -> Result<(u64, u64), String> {
+    let (major, minor) = value
+        .split_once('.')
+        .ok_or_else(|| "version must use Y.X notation".to_string())?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|b| b.is_ascii_digit())
+        || !minor.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("version must use Y.X notation with numeric components".into());
+    }
+    Ok((
+        major
+            .parse()
+            .map_err(|_| "version component is too large")?,
+        minor
+            .parse()
+            .map_err(|_| "version component is too large")?,
+    ))
+}
 pub fn validate_silicon_yaml(text: &str) -> Result<(), String> {
     let value: serde_yaml::Value =
         serde_yaml::from_str(text).map_err(|e| format!("silicon.yaml is invalid YAML: {e}"))?;
@@ -104,5 +126,7 @@ mod tests {
         assert!(!valid_id("../secret"));
         assert!(local::is_hex_commit(&"a".repeat(40)));
         assert!(!local::is_hex_commit("main"));
+        assert_eq!(release_version("2.7"), Ok((2, 7)));
+        assert!(release_version("2").is_err());
     }
 }

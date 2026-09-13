@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use silicon_starter_core::{
     SEED_YAML,
     local::{self, Binding, Mode},
-    validate_silicon_yaml,
+    release_version, validate_silicon_yaml,
 };
 use std::{
     fs,
@@ -504,6 +504,7 @@ async fn publish(
     ver: &str,
     notes: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    release_version(ver).map_err(|e| format!("invalid release version: {e}"))?;
     let b = local::load_binding(".")?;
     if b.mode != Mode::Development {
         return Err("only pulled developer starters may publish".into());
@@ -532,7 +533,8 @@ async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>>
             if b.mode == Mode::Development {
                 return Err("developer pull checkouts never auto-update".into());
             }
-            b.auto_update = true
+            b.auto_update = true;
+            b.pinned = None;
         }
         "off" => b.auto_update = false,
         "now" => {
