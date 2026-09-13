@@ -1,0 +1,13 @@
+[package]
+name = "starter"
+version = "0.1.0"
+edition = "2024"
+[[bin]]
+name = "starter"
+path = "src/main.rs"
+[dependencies]
+silicon-starter-core = { path = "../core" }
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
