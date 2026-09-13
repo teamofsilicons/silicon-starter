@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+pub mod local;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Starter {
     pub id: String,
@@ -100,5 +102,7 @@ mod tests {
         assert!(validate_silicon_yaml(SEED_YAML).is_ok());
         assert!(valid_id("tos.hello-world"));
         assert!(!valid_id("../secret"));
+        assert!(local::is_hex_commit(&"a".repeat(40)));
+        assert!(!local::is_hex_commit("main"));
     }
 }

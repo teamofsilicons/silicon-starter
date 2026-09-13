@@ -1,15 +1,14 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
-use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::json;
-use sha2::Sha256;
 use silicon_starter_core::{
     CreateDiscussion, CreateStarter, Discussion, SEED_YAML, Starter, Version, Visibility, valid_id,
     validate_silicon_yaml,
@@ -18,7 +17,9 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-type HmacSha256 = Hmac<Sha256>;
+mod auth;
+mod telemetry;
+
 #[derive(Clone, Default)]
 pub struct AppState {
     pub starters: Arc<RwLock<HashMap<String, Starter>>>,
@@ -26,6 +27,9 @@ pub struct AppState {
     pub discussions: Arc<RwLock<HashMap<String, Vec<Discussion>>>>,
     pub sessions: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     pub data_file: Option<String>,
+    pub bundles: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub auth: Arc<auth::AuthState>,
+    pub telemetry: Arc<telemetry::Telemetry>,
 }
 #[derive(Deserialize)]
 struct ListQuery {
@@ -36,6 +40,23 @@ struct ListQuery {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+}
+#[derive(Deserialize)]
+struct PushRequest {
+    commit: String,
+    bundle_base64: String,
+    yaml: String,
+    #[serde(default)]
+    message: String,
+}
+#[derive(Deserialize)]
+struct PublishRequest {
+    selector: String,
+    version: String,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    notes: String,
 }
 
 pub fn seeded_state() -> AppState {
@@ -86,6 +107,8 @@ pub fn seeded_state() -> AppState {
     }
     AppState {
         starters: Arc::new(RwLock::new(map)),
+        auth: Arc::new(auth::AuthState::from_env()),
+        telemetry: Arc::new(telemetry::Telemetry::from_env()),
         ..Default::default()
     }
 }
@@ -99,17 +122,38 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/starters/{id}/versions", get(versions))
         .route("/api/v1/starters/{id}/star", post(star))
         .route("/api/v1/starters/{id}/fork", post(fork))
+        .route("/api/v1/starters/{id}/archive", get(archive))
+        .route("/api/v1/starters/{id}/download", get(archive))
+        .route("/api/v1/starters/{id}/push", post(push))
+        .route("/api/v1/starters/{id}/publish", post(publish))
+        .route("/api/v1/starters/{id}/commits", get(commits))
         .route(
             "/api/v1/starters/{id}/discussions",
             get(discussions).post(add_discussion),
         )
         .route("/auth/login", get(auth_login))
-        .route("/auth/callback", get(auth_callback))
+        .route(
+            "/auth/callback",
+            get(auth_callback).post(auth_callback_json),
+        )
         .route("/auth/cli", post(auth_cli))
         .route("/auth/cli/status", get(auth_cli_status))
+        .route("/auth/session", get(auth_session))
+        .route("/auth/logout", post(auth_logout))
         .route("/webhooks/iam", post(iam_webhook))
         .with_state(state)
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(
+                    std::env::var("STARTER_FRONTEND_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
+                        .parse::<HeaderValue>()
+                        .expect("valid frontend origin"),
+                )
+                .allow_credentials(true)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
 }
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status":"ok","service":"silicon-starter","api_version":"v1"}))
@@ -117,13 +161,21 @@ async fn health() -> Json<serde_json::Value> {
 async fn organizations() -> Json<serde_json::Value> {
     Json(json!({"items":[{"id":"tos","name":"teamofsilicons"},{"id":"lab","name":"lab"}]}))
 }
-async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json<Vec<Starter>> {
+async fn list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> Json<Vec<Starter>> {
     let term = q.q.unwrap_or_default().to_lowercase();
+    let authenticated = s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false);
     Json(
         s.starters
             .read()
             .await
             .values()
+            .filter(|x| matches!(x.visibility, Visibility::Public) || authenticated)
             .filter(|x| q.org.as_ref().is_none_or(|o| &x.owner == o))
             .filter(|x| {
                 q.visibility.as_ref().is_none_or(|v| {
@@ -140,9 +192,14 @@ async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json<Vec
             .collect(),
     )
 }
-async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Vec<Starter>> {
+async fn search(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SearchQuery>,
+) -> Json<Vec<Starter>> {
     list(
         State(s),
+        headers,
         Query(ListQuery {
             q: q.q,
             org: None,
@@ -153,15 +210,24 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> Json
 }
 async fn show(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Starter>, StatusCode> {
-    s.starters
+    let x = s
+        .starters
         .read()
         .await
         .get(&id)
         .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if matches!(x.visibility, Visibility::Private)
+        && !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(x))
 }
 async fn versions(
     State(s): State<AppState>,
@@ -188,8 +254,18 @@ async fn versions(
 }
 async fn create(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<CreateStarter>,
 ) -> Result<(StatusCode, Json<Starter>), (StatusCode, Json<serde_json::Value>)> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"authentication required"})),
+        ));
+    }
     if !valid_id(&input.id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -213,12 +289,23 @@ async fn create(
         yaml: input.yaml,
     };
     s.starters.write().await.insert(input.id, x.clone());
+    s.telemetry.record(
+        "backend",
+        json!({"type":"starter.created","starter_id":x.id,"source":"api"}),
+    );
     Ok((StatusCode::CREATED, Json(x)))
 }
 async fn star(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Starter>, StatusCode> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let mut m = s.starters.write().await;
     let x = m.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     x.stars += 1;
@@ -226,8 +313,15 @@ async fn star(
 }
 async fn fork(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Starter>), StatusCode> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let mut m = s.starters.write().await;
     let src = m.get(&id).ok_or(StatusCode::NOT_FOUND)?.clone();
     let fork = Starter {
@@ -240,7 +334,133 @@ async fn fork(
     m.insert(fork.id.clone(), fork.clone());
     Ok((StatusCode::CREATED, Json(fork)))
 }
-async fn discussions(State(s): State<AppState>, Path(id): Path<String>) -> Json<Vec<Discussion>> {
+async fn archive(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut starters = s.starters.write().await;
+    let starter = starters.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if matches!(starter.visibility, Visibility::Private)
+        && !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    starter.downloads += 1;
+    let bundles = s.bundles.read().await;
+    let bundle = bundles.get(&id).cloned().unwrap_or_default();
+    Ok(Json(json!({
+        "bundle_base64": BASE64.encode(bundle),
+        "commit": q.get("ref").or_else(|| q.get("version")).cloned().unwrap_or_else(|| "main".into())
+    })))
+}
+async fn push(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<PushRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"authentication required"})),
+        ));
+    }
+    if headers.get("x-starter-mode").and_then(|v| v.to_str().ok()) == Some("download") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"downloaded starters are not pushable; use starter pull"})),
+        ));
+    }
+    if let Err(e) = validate_silicon_yaml(&input.yaml) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error":e}))));
+    }
+    let bundle = BASE64.decode(input.bundle_base64.as_bytes()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("invalid bundle_base64: {e}")})),
+        )
+    })?;
+    let mut starters = s.starters.write().await;
+    let starter = starters.get_mut(&id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(json!({"error":"starter not found"})),
+    ))?;
+    starter.yaml = input.yaml;
+    starter.updated_at = Utc::now();
+    starter.version = input.commit.chars().take(8).collect();
+    s.bundles.write().await.insert(id.clone(), bundle);
+    Ok(Json(
+        json!({"id":id,"commit":input.commit,"message":input.message}),
+    ))
+}
+async fn publish(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<PublishRequest>,
+) -> Result<Json<Version>, StatusCode> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !s.starters.read().await.contains_key(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let v = Version {
+        version: input.version,
+        commit: input.commit.unwrap_or(input.selector),
+        notes: input.notes,
+        published_at: Utc::now(),
+    };
+    s.versions
+        .write()
+        .await
+        .entry(id)
+        .or_default()
+        .push(v.clone());
+    Ok(Json(v))
+}
+async fn commits(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    if !s.starters.read().await.contains_key(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(
+        s.versions
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| json!({"commit":v.commit,"message":v.notes,"created_at":v.published_at}))
+            .collect(),
+    ))
+}
+async fn discussions(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Json<Vec<Discussion>> {
+    if let Some(starter) = s.starters.read().await.get(&id)
+        && matches!(starter.visibility, Visibility::Private)
+        && !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        return Json(Vec::new());
+    }
     Json(
         s.discussions
             .read()
@@ -252,9 +472,16 @@ async fn discussions(State(s): State<AppState>, Path(id): Path<String>) -> Json<
 }
 async fn add_discussion(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<CreateDiscussion>,
 ) -> Result<(StatusCode, Json<Discussion>), StatusCode> {
+    if !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     if input.body.trim().is_empty() || !s.starters.read().await.contains_key(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -316,18 +543,71 @@ async fn auth_callback(
                 .into_response();
         }
     }
-    match exchange_slt(slt).await {
-        Ok((session, token)) => {
-            s.sessions.write().await.insert(session.clone(), token);
-            (
-                [(
-                    "set-cookie",
-                    format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
-                )],
-                Json(json!({"authenticated":true,"session_id":session})),
-            )
-                .into_response()
-        }
+    let cookie_state = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(';')
+                .find_map(|p| p.trim().strip_prefix("starter_login_state="))
+        });
+    match s
+        .auth
+        .login(
+            slt,
+            cookie_state,
+            q.get("state").map(String::as_str),
+            &app_id(),
+            &app_secret(),
+        )
+        .await
+    {
+        Ok(session) => (
+            [(
+                "set-cookie",
+                format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+            )],
+            Json(json!({"authenticated":true,"session_id":session})),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error":e}))).into_response(),
+    }
+}
+#[derive(Deserialize)]
+struct AuthCallbackBody {
+    slt: String,
+    state: Option<String>,
+}
+async fn auth_callback_json(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Json(body): Json<AuthCallbackBody>,
+) -> impl IntoResponse {
+    let expected = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(';')
+                .find_map(|p| p.trim().strip_prefix("starter_login_state="))
+        });
+    match s
+        .auth
+        .login(
+            &body.slt,
+            expected,
+            body.state.as_deref(),
+            &app_id(),
+            &app_secret(),
+        )
+        .await
+    {
+        Ok(session) => (
+            [(
+                "set-cookie",
+                format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+            )],
+            Json(json!({"authenticated":true})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error":e}))).into_response(),
     }
 }
@@ -342,90 +622,69 @@ async fn auth_cli(
         )
             .into_response();
     };
-    match exchange_slt(slt).await {
-        Ok((session, token)) => {
-            s.sessions.write().await.insert(session.clone(), token);
-            (
-                StatusCode::OK,
-                Json(json!({"authenticated":true,"session_id":session})),
-            )
-                .into_response()
-        }
+    match s
+        .auth
+        .login(slt, None, None, &app_id(), &app_secret())
+        .await
+    {
+        Ok(session) => (
+            StatusCode::OK,
+            Json(json!({"authenticated":true,"session_id":session})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error":e}))).into_response(),
     }
 }
 async fn auth_cli_status(headers: HeaderMap, State(s): State<AppState>) -> Json<serde_json::Value> {
-    let session = headers
-        .get("x-starter-session")
-        .and_then(|v| v.to_str().ok());
-    let authenticated = session.is_some_and(|id| s.sessions.blocking_read().contains_key(id));
-    Json(json!({"authenticated":authenticated}))
+    Json(s.auth.status(session_id(&headers).as_deref()).await)
 }
-async fn exchange_slt(slt: &str) -> Result<(String, serde_json::Value), String> {
-    let secret = std::env::var("STARTER_IAM_APP_SECRET")
-        .map_err(|_| "STARTER_IAM_APP_SECRET is not configured".to_string())?;
-    let app_id = std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "tos>starter".into());
-    let response = reqwest::Client::new()
-        .post("https://backend.iam.teamofsilicons.com/api/v1/app-auth/tokens")
-        .basic_auth(&app_id, Some(secret))
-        .header("Idempotency-Key", Uuid::now_v7().to_string())
-        .form(&[("app_id", app_id.as_str()), ("slt", slt)])
-        .send()
-        .await
-        .map_err(|e| format!("IAM token exchange failed: {e}"))?;
-    let status = response.status();
-    let body = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("IAM returned invalid JSON: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("IAM token exchange returned {status}: {body}"));
+async fn auth_session(headers: HeaderMap, State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(s.auth.status(session_id(&headers).as_deref()).await)
+}
+async fn auth_logout(headers: HeaderMap, State(s): State<AppState>) -> impl IntoResponse {
+    if let Some(id) = session_id(&headers) {
+        let _ = s.auth.remove(&id).await;
     }
-    Ok((Uuid::now_v7().to_string(), body))
+    (
+        [("set-cookie", "starter_session=; Max-Age=0; Path=/")],
+        Json(json!({"authenticated":false})),
+    )
+}
+fn session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-starter-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    v.split(';')
+                        .find_map(|p| p.trim().strip_prefix("starter_session=").map(str::to_owned))
+                })
+        })
+}
+fn app_id() -> String {
+    std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "tos>starter".into())
+}
+fn app_secret() -> String {
+    std::env::var("STARTER_IAM_APP_SECRET").unwrap_or_default()
 }
 async fn iam_webhook(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoResponse {
     let Some(secret) = std::env::var_os("STARTER_IAM_WEBHOOK_SECRET") else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    let Some(sig) = headers
-        .get("x-silicon-iam-signature")
-        .and_then(|v| v.to_str().ok())
-    else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    let ts = headers
-        .get("x-silicon-iam-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !verify_iam_signature(secret.to_string_lossy().as_bytes(), sig, ts, &body) {
+    if !auth::verify_webhook_now(&headers, &body, secret.to_string_lossy().as_bytes()) {
         return StatusCode::UNAUTHORIZED;
     }
     StatusCode::NO_CONTENT
 }
-fn verify_iam_signature(secret: &[u8], signature: &str, timestamp: &str, body: &[u8]) -> bool {
-    let Ok(ts) = timestamp.parse::<i64>() else {
-        return false;
-    };
-    if (Utc::now().timestamp() - ts).abs() > 300 {
-        return false;
-    }
-    let Some(encoded) = signature.strip_prefix("v1=") else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(encoded) else {
-        return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
-        return false;
-    };
-    mac.update(format!("{timestamp}.").as_bytes());
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
-}
-
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let state = seeded_state();
+    state.auth.load().await?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, router(seeded_state())).await?;
+    axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
@@ -435,6 +694,10 @@ mod webhook_tests {
 
     #[test]
     fn rejects_stale_signatures() {
-        assert!(!verify_iam_signature(b"secret", "v1=00", "1", b"{}"));
+        assert!(!auth::verify_webhook_now(
+            &HeaderMap::new(),
+            b"{}",
+            b"secret"
+        ));
     }
 }
