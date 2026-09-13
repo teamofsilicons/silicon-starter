@@ -13,7 +13,10 @@ use silicon_starter_core::{
     CreateDiscussion, CreateStarter, Discussion, SEED_YAML, Starter, Version, Visibility, valid_id,
     validate_silicon_yaml,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -34,6 +37,7 @@ pub struct AppState {
     pub auth: Arc<auth::AuthState>,
     pub telemetry: Arc<telemetry::Telemetry>,
     pub store: Option<Arc<store::Store>>,
+    pub iam_event_ids: Arc<RwLock<HashSet<String>>>,
 }
 #[derive(Deserialize)]
 struct ListQuery {
@@ -174,6 +178,7 @@ async fn persist_state(s: &AppState) {
         "discussions": *s.discussions.read().await,
         "bundles": s.bundles.read().await.iter().map(|(k,v)| (k.clone(), BASE64.encode(v))).collect::<HashMap<_,_>>(),
         "bundle_commits": *s.bundle_commits.read().await,
+        "iam_event_ids": *s.iam_event_ids.read().await,
     });
     if let Err(e) = store.save(value).await {
         eprintln!("starter state persistence failed: {e}");
@@ -601,7 +606,10 @@ async fn auth_login() -> impl IntoResponse {
     (
         [(
             "set-cookie",
-            format!("starter_login_state={state}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+            format!(
+                "starter_login_state={state}; HttpOnly; SameSite=Lax{}; Path=/",
+                secure_cookie()
+            ),
         )],
         Redirect::temporary(&url),
     )
@@ -652,7 +660,10 @@ async fn auth_callback(
         Ok(session) => (
             [(
                 "set-cookie",
-                format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+                format!(
+                    "starter_session={session}; HttpOnly; SameSite=Lax{}; Path=/",
+                    secure_cookie()
+                ),
             )],
             Json(json!({"authenticated":true,"session_id":session})),
         )
@@ -691,7 +702,10 @@ async fn auth_callback_json(
         Ok(session) => (
             [(
                 "set-cookie",
-                format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+                format!(
+                    "starter_session={session}; HttpOnly; SameSite=Lax{}; Path=/",
+                    secure_cookie()
+                ),
             )],
             Json(json!({"authenticated":true})),
         )
@@ -756,15 +770,49 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
 fn app_id() -> String {
     std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "tos>starter".into())
 }
+fn secure_cookie() -> &'static str {
+    if std::env::var("STARTER_FRONTEND_URL")
+        .ok()
+        .is_some_and(|v| v.starts_with("https://"))
+    {
+        "; Secure"
+    } else {
+        ""
+    }
+}
 fn app_secret() -> String {
     std::env::var("STARTER_IAM_APP_SECRET").unwrap_or_default()
 }
-async fn iam_webhook(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoResponse {
+async fn iam_webhook(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    body: axum::body::Bytes,
+) -> StatusCode {
     let Some(secret) = std::env::var_os("STARTER_IAM_WEBHOOK_SECRET") else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
     if !auth::verify_webhook_now(&headers, &body, secret.to_string_lossy().as_bytes()) {
         return StatusCode::UNAUTHORIZED;
+    }
+    let Some(event_id) = auth::webhook_event_id(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let inserted = {
+        let mut ids = s.iam_event_ids.write().await;
+        if ids.contains(&event_id) {
+            false
+        } else {
+            if ids.len() >= 4096 {
+                // Keep memory bounded; snapshots preserve the retained IDs across restarts.
+                if let Some(oldest) = ids.iter().next().cloned() {
+                    ids.remove(&oldest);
+                }
+            }
+            ids.insert(event_id)
+        }
+    };
+    if inserted {
+        persist_state(&s).await;
     }
     StatusCode::NO_CONTENT
 }
@@ -810,6 +858,12 @@ async fn restore_state(s: &AppState, payload: serde_json::Value) {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
     {
         *s.bundle_commits.write().await = value;
+    }
+    if let Some(value) = object
+        .get("iam_event_ids")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.iam_event_ids.write().await = value;
     }
     if let Some(map) = object.get("bundles").and_then(|v| v.as_object()) {
         let decoded = map

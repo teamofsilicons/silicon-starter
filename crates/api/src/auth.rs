@@ -264,6 +264,16 @@ pub fn verify_webhook_now(headers: &HeaderMap, body: &[u8], secret: &[u8]) -> bo
     verify_webhook(headers, body, secret, Utc::now().timestamp())
 }
 
+/// Extract the authenticated event ID after signature verification. Test envelopes nest metadata.
+pub fn webhook_event_id(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value
+        .pointer("/metadata/event_id")
+        .or_else(|| value.pointer("/test/metadata/event_id"))?
+        .as_str()
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +307,17 @@ mod tests {
         );
         h.insert("x-silicon-iam-signature", "v1=00".parse().unwrap());
         assert!(!verify_webhook(&h, b"{}", b"secret", 0));
+    }
+
+    #[test]
+    fn extracts_production_and_testing_event_ids() {
+        assert_eq!(
+            webhook_event_id(br#"{"metadata":{"event_id":"e1"}}"#).as_deref(),
+            Some("e1")
+        );
+        assert_eq!(
+            webhook_event_id(br#"{"test":{"metadata":{"event_id":"e2"}}}"#).as_deref(),
+            Some("e2")
+        );
     }
 }

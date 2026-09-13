@@ -34,8 +34,11 @@ impl BriefcaseStorage {
             iam_base: std::env::var("IAM_URL").unwrap_or_else(|_| IAM_DEFAULT.into()),
             briefcase_base: std::env::var("BRIEFCASE_URL")
                 .unwrap_or_else(|_| BRIEFCASE_DEFAULT.into()),
-            app_id: std::env::var("BRIEFCASE_APP_ID").unwrap_or_else(|_| "tos>starter".into()),
-            app_secret: required("BRIEFCASE_APP_SECRET")?,
+            app_id: std::env::var("BRIEFCASE_APP_ID")
+                .or_else(|_| std::env::var("STARTER_IAM_APP_ID"))
+                .unwrap_or_else(|_| "tos>starter".into()),
+            app_secret: std::env::var("BRIEFCASE_APP_SECRET")
+                .or_else(|_| required("STARTER_IAM_APP_SECRET"))?,
             org_id: std::env::var("BRIEFCASE_ORG_ID").ok(),
             subject_token: subject_token.into(),
         })
