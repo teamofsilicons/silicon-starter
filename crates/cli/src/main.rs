@@ -635,6 +635,9 @@ fn merge_transaction(target: &Path, bundle: &Path) -> Result<String, Box<dyn std
         if !local::run_git(&stage, ["ls-files", "-u"].as_ref())?.is_empty() {
             return Err("update left unresolved merge entries".into());
         }
+        if has_conflict_markers(&stage) {
+            return Err("update left merge conflict markers".into());
+        }
         let commit = local::head(&stage)?;
         local::run_git(
             target,
@@ -724,6 +727,10 @@ fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std:
             Ok(out) if out.status.success() => {
                 wait_omni_idle(&binary, &session);
                 if local::run_git(stage, ["ls-files", "-u"].as_ref())?.is_empty() {
+                    if has_conflict_markers(stage) {
+                        last_error = "provider left merge conflict markers".into();
+                        continue;
+                    }
                     if !local::run_git(stage, ["status", "--porcelain"].as_ref())?.is_empty() {
                         local::stage_and_commit(stage, "Resolve Starter update conflict")?;
                     }
@@ -738,6 +745,14 @@ fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std:
     }
     let _ = local::run_git(stage, ["merge", "--abort"].as_ref());
     Err(format!("silicon-omni could not resolve the merge conflict: {last_error}").into())
+}
+
+fn has_conflict_markers(stage: &Path) -> bool {
+    local::run_git(
+        stage,
+        ["grep", "-nE", "^(<<<<<<<|=======|>>>>>>>)", "--", "."].as_ref(),
+    )
+    .is_ok()
 }
 
 fn wait_omni_idle(binary: &Path, session: &str) {
