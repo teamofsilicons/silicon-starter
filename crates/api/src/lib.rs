@@ -39,6 +39,7 @@ pub struct AppState {
     pub telemetry: Arc<telemetry::Telemetry>,
     pub store: Option<Arc<store::Store>>,
     pub iam_event_ids: Arc<RwLock<HashSet<String>>>,
+    pub briefcase_entries: Arc<RwLock<HashMap<String, Uuid>>>,
 }
 #[derive(Deserialize)]
 struct ListQuery {
@@ -180,6 +181,7 @@ async fn persist_state(s: &AppState) {
         "bundles": s.bundles.read().await.iter().map(|(k,v)| (k.clone(), BASE64.encode(v))).collect::<HashMap<_,_>>(),
         "bundle_commits": *s.bundle_commits.read().await,
         "iam_event_ids": *s.iam_event_ids.read().await,
+        "briefcase_entries": *s.briefcase_entries.read().await,
     });
     if let Err(e) = store.save(value).await {
         eprintln!("starter state persistence failed: {e}");
@@ -520,23 +522,28 @@ async fn publish(
         .or_default()
         .push(v.clone());
     persist_state(&s).await;
-    publish_to_briefcase(&s, &headers, &id, &v).await;
+    if let Some(entry) = publish_to_briefcase(&s, &headers, &id, &v).await {
+        s.briefcase_entries
+            .write()
+            .await
+            .insert(format!("{id}:{}", v.commit), entry);
+        persist_state(&s).await;
+    }
     Ok(Json(v))
 }
 
-async fn publish_to_briefcase(s: &AppState, headers: &HeaderMap, id: &str, version: &Version) {
-    let Some(session_id) = session_id(headers) else {
-        return;
-    };
-    let Some(session) = s.auth.get(&session_id).await else {
-        return;
-    };
+async fn publish_to_briefcase(
+    s: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    version: &Version,
+) -> Option<Uuid> {
+    let session_id = session_id(headers)?;
+    let session = s.auth.get(&session_id).await?;
     let Ok(storage) = briefcase::BriefcaseStorage::from_env(session.access_token) else {
-        return;
+        return None;
     };
-    let Some(bundle) = s.bundles.read().await.get(id).cloned() else {
-        return;
-    };
+    let bundle = s.bundles.read().await.get(id).cloned()?;
     let org = id.split('.').next().unwrap_or("public");
     let base = format!("public/starters/{org}/{id}");
     let parent = storage
@@ -547,7 +554,7 @@ async fn publish_to_briefcase(s: &AppState, headers: &HeaderMap, id: &str, versi
         .upload_public_bundle(&parent, "starter.git.bundle", bundle)
         .await
     else {
-        return;
+        return None;
     };
     if let Some(entry) = result
         .get("id")
@@ -555,7 +562,9 @@ async fn publish_to_briefcase(s: &AppState, headers: &HeaderMap, id: &str, versi
         .and_then(|value| Uuid::parse_str(value).ok())
     {
         let _ = storage.set_public_link(entry).await;
+        return Some(entry);
     }
+    None
 }
 async fn commits(
     State(s): State<AppState>,
@@ -900,6 +909,12 @@ async fn restore_state(s: &AppState, payload: serde_json::Value) {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
     {
         *s.iam_event_ids.write().await = value;
+    }
+    if let Some(value) = object
+        .get("briefcase_entries")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        *s.briefcase_entries.write().await = value;
     }
     if let Some(map) = object.get("bundles").and_then(|v| v.as_object()) {
         let decoded = map
