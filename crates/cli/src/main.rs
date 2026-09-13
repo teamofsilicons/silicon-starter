@@ -100,23 +100,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token: Some(token),
             command: None,
         } => {
-            request(
+            let value = request_value(
                 &c.api,
                 "/auth/cli",
                 Method::POST,
                 Some(json!({"slt":token})),
             )
-            .await?
+            .await?;
+            if let Some(id) = value.get("session_id").and_then(|v| v.as_str()) {
+                let path = session_path();
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, id)?;
+            }
+            println!("{value}");
         }
         Command::Login {
             token: None,
             command: Some(LoginCommand::Status { json }),
         } => {
-            let value = json!({"authenticated": false, "reason":"no starter session; run `starter login <SLT>`"});
+            let session = fs::read_to_string(session_path()).ok();
+            let value = request_value_with_headers(
+                &c.api,
+                "/auth/cli/status",
+                Method::GET,
+                None,
+                session.as_deref(),
+            )
+            .await
+            .unwrap_or_else(|_| json!({"authenticated":false}));
             if json {
                 println!("{value}")
             } else {
-                println!("authenticated: false\nreason: no starter session")
+                println!("authenticated: {}", value["authenticated"])
             }
         }
         Command::Login { .. } => {
@@ -204,6 +221,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::List => request(&c.api, "/api/v1/starters", Method::GET, None).await?,
     }
     Ok(())
+}
+fn session_path() -> std::path::PathBuf {
+    std::env::var_os("SILICON_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| ".".into())
+        .join(".starter/session")
+}
+async fn request_value(
+    base: &str,
+    path: &str,
+    method: Method,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    request_value_with_headers(base, path, method, body, None).await
+}
+async fn request_value_with_headers(
+    base: &str,
+    path: &str,
+    method: Method,
+    body: Option<serde_json::Value>,
+    session: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut req = client.request(method, format!("{base}{path}"));
+    if let Some(id) = session {
+        req = req.header("x-starter-session", id.trim());
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let response = req.send().await?;
+    let status = response.status();
+    let value = response.json::<serde_json::Value>().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {value}").into());
+    }
+    Ok(value)
 }
 fn run_git(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let out = Process::new("git").args(args).output()?;

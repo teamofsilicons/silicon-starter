@@ -24,6 +24,7 @@ pub struct AppState {
     pub starters: Arc<RwLock<HashMap<String, Starter>>>,
     pub versions: Arc<RwLock<HashMap<String, Vec<Version>>>>,
     pub discussions: Arc<RwLock<HashMap<String, Vec<Discussion>>>>,
+    pub sessions: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     pub data_file: Option<String>,
 }
 #[derive(Deserialize)]
@@ -105,6 +106,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(auth_login))
         .route("/auth/callback", get(auth_callback))
         .route("/auth/cli", post(auth_cli))
+        .route("/auth/cli/status", get(auth_cli_status))
         .route("/webhooks/iam", post(iam_webhook))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -289,37 +291,97 @@ async fn auth_login() -> impl IntoResponse {
         Redirect::temporary(&url),
     )
 }
-async fn auth_callback(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
-    if !q.contains_key("slt") {
+async fn auth_callback(
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let Some(slt) = q.get("slt") else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"IAM callback requires a short-lived token"})),
         )
             .into_response();
+    };
+    if let Some(expected) = q.get("state") {
+        let cookie = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !cookie.contains(&format!("starter_login_state={expected}")) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"login state does not match the initiating browser"})),
+            )
+                .into_response();
+        }
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(
-            json!({"error":"IAM exchange is disabled until STARTER_IAM_APP_SECRET is configured"}),
-        ),
-    )
-        .into_response()
+    match exchange_slt(slt).await {
+        Ok((session, token)) => {
+            s.sessions.write().await.insert(session.clone(), token);
+            (
+                [(
+                    "set-cookie",
+                    format!("starter_session={session}; HttpOnly; SameSite=Lax; Secure; Path=/"),
+                )],
+                Json(json!({"authenticated":true,"session_id":session})),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error":e}))).into_response(),
+    }
 }
-async fn auth_cli(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
-    if body.get("slt").and_then(|v| v.as_str()).is_none() {
+async fn auth_cli(
+    State(s): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(slt) = body.get("slt").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"send only an IAM short-lived token as slt"})),
         )
             .into_response();
+    };
+    match exchange_slt(slt).await {
+        Ok((session, token)) => {
+            s.sessions.write().await.insert(session.clone(), token);
+            (
+                StatusCode::OK,
+                Json(json!({"authenticated":true,"session_id":session})),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error":e}))).into_response(),
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(
-            json!({"error":"IAM exchange is disabled until STARTER_IAM_APP_SECRET is configured"}),
-        ),
-    )
-        .into_response()
+}
+async fn auth_cli_status(headers: HeaderMap, State(s): State<AppState>) -> Json<serde_json::Value> {
+    let session = headers
+        .get("x-starter-session")
+        .and_then(|v| v.to_str().ok());
+    let authenticated = session.is_some_and(|id| s.sessions.blocking_read().contains_key(id));
+    Json(json!({"authenticated":authenticated}))
+}
+async fn exchange_slt(slt: &str) -> Result<(String, serde_json::Value), String> {
+    let secret = std::env::var("STARTER_IAM_APP_SECRET")
+        .map_err(|_| "STARTER_IAM_APP_SECRET is not configured".to_string())?;
+    let app_id = std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "tos>starter".into());
+    let response = reqwest::Client::new()
+        .post("https://backend.iam.teamofsilicons.com/api/v1/app-auth/tokens")
+        .basic_auth(&app_id, Some(secret))
+        .header("Idempotency-Key", Uuid::now_v7().to_string())
+        .form(&[("app_id", app_id.as_str()), ("slt", slt)])
+        .send()
+        .await
+        .map_err(|e| format!("IAM token exchange failed: {e}"))?;
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("IAM returned invalid JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("IAM token exchange returned {status}: {body}"));
+    }
+    Ok((Uuid::now_v7().to_string(), body))
 }
 async fn iam_webhook(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoResponse {
     let Some(secret) = std::env::var_os("STARTER_IAM_WEBHOOK_SECRET") else {
