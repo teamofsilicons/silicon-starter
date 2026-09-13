@@ -182,6 +182,27 @@ pub fn clone_bundle(
     })?;
     Ok(())
 }
+pub fn bundle_head(path: impl AsRef<Path>) -> Result<String, String> {
+    let path = path.as_ref();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let value = run_git(
+        parent,
+        [
+            "bundle",
+            "list-heads",
+            path.to_str().ok_or("bundle path is not UTF-8")?,
+        ]
+        .as_ref(),
+    )?;
+    let commit = value
+        .split_whitespace()
+        .next()
+        .ok_or("bundle contains no heads")?;
+    if !is_hex_commit(commit) {
+        return Err("bundle head is not a valid commit id".into());
+    }
+    Ok(commit.into())
+}
 pub fn is_hex_commit(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }

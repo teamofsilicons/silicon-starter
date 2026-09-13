@@ -434,7 +434,7 @@ async fn pull(
         .get("bundle_base64")
         .and_then(Value::as_str)
         .ok_or("archive response omitted bundle_base64")?;
-    let commit = v
+    let response_commit = v
         .get("commit")
         .and_then(Value::as_str)
         .ok_or("archive response omitted commit")?;
@@ -444,6 +444,11 @@ async fn pull(
         local::unique()
     ));
     fs::write(&temp, B64.decode(b)?)?;
+    let commit = if local::is_hex_commit(response_commit) {
+        response_commit.to_owned()
+    } else {
+        local::bundle_head(&temp)?
+    };
     let current_binding = local::load_binding(".").ok();
     let target = if current_binding.as_ref().is_some_and(|b| b.id == id) {
         PathBuf::from(".")
@@ -482,7 +487,7 @@ async fn pull(
         println!("updated {id} at {commit}");
         return Ok(());
     }
-    local::clone_bundle(&temp, &target, commit)?;
+    local::clone_bundle(&temp, &target, &commit)?;
     let _ = fs::remove_file(temp);
     let binding = Binding {
         id: id.into(),
@@ -635,7 +640,12 @@ fn webhook(url: &str, secret: Option<&str>) -> Result<(), Box<dyn std::error::Er
         path,
         serde_json::to_vec(&json!({"url":url,"secret":secret}))?,
     )?;
-    println!("webhook configured; the daemon will deliver registered IAM events");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(webhook_path(), fs::Permissions::from_mode(0o600))?;
+    }
+    println!("webhook configured for the daemon");
     Ok(())
 }
 fn unhook() -> Result<(), Box<dyn std::error::Error>> {

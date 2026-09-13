@@ -28,6 +28,7 @@ pub struct AppState {
     pub sessions: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     pub data_file: Option<String>,
     pub bundles: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub bundle_commits: Arc<RwLock<HashMap<String, String>>>,
     pub auth: Arc<auth::AuthState>,
     pub telemetry: Arc<telemetry::Telemetry>,
 }
@@ -352,9 +353,35 @@ async fn archive(
     starter.downloads += 1;
     let bundles = s.bundles.read().await;
     let bundle = bundles.get(&id).cloned().unwrap_or_default();
+    if bundle.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let requested = q.get("ref").or_else(|| q.get("version"));
+    let commit = if let Some(r) = requested {
+        s.versions
+            .read()
+            .await
+            .get(&id)
+            .and_then(|vs| {
+                vs.iter()
+                    .find(|v| &v.version == r)
+                    .map(|v| v.commit.clone())
+            })
+            .unwrap_or_else(|| r.clone())
+    } else {
+        s.bundle_commits
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    };
+    if commit.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(Json(json!({
         "bundle_base64": BASE64.encode(bundle),
-        "commit": q.get("ref").or_else(|| q.get("version")).cloned().unwrap_or_else(|| "main".into())
+        "commit": commit
     })))
 }
 async fn push(
@@ -387,6 +414,14 @@ async fn push(
             Json(json!({"error":format!("invalid bundle_base64: {e}")})),
         )
     })?;
+    if !(input.commit.len() == 40 || input.commit.len() == 64)
+        || !input.commit.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"commit must be a full git object id"})),
+        ));
+    }
     let mut starters = s.starters.write().await;
     let starter = starters.get_mut(&id).ok_or((
         StatusCode::NOT_FOUND,
@@ -396,6 +431,10 @@ async fn push(
     starter.updated_at = Utc::now();
     starter.version = input.commit.chars().take(8).collect();
     s.bundles.write().await.insert(id.clone(), bundle);
+    s.bundle_commits
+        .write()
+        .await
+        .insert(id.clone(), input.commit.clone());
     Ok(Json(
         json!({"id":id,"commit":input.commit,"message":input.message}),
     ))
