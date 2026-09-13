@@ -110,6 +110,7 @@ impl BriefcaseStorage {
     }
 
     /// Read the current bytes for a Briefcase file entry.
+    #[allow(dead_code)]
     pub async fn read_file(&self, entry_id: Uuid) -> Result<Vec<u8>, String> {
         let body = json!({"entry_id": entry_id, "download": true});
         let proof = self

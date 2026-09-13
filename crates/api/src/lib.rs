@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 mod auth;
+mod briefcase;
 mod semantic;
 mod store;
 mod telemetry;
@@ -515,11 +516,46 @@ async fn publish(
     s.versions
         .write()
         .await
-        .entry(id)
+        .entry(id.clone())
         .or_default()
         .push(v.clone());
     persist_state(&s).await;
+    publish_to_briefcase(&s, &headers, &id, &v).await;
     Ok(Json(v))
+}
+
+async fn publish_to_briefcase(s: &AppState, headers: &HeaderMap, id: &str, version: &Version) {
+    let Some(session_id) = session_id(headers) else {
+        return;
+    };
+    let Some(session) = s.auth.get(&session_id).await else {
+        return;
+    };
+    let Ok(storage) = briefcase::BriefcaseStorage::from_env(session.access_token) else {
+        return;
+    };
+    let Some(bundle) = s.bundles.read().await.get(id).cloned() else {
+        return;
+    };
+    let org = id.split('.').next().unwrap_or("public");
+    let base = format!("public/starters/{org}/{id}");
+    let parent = storage
+        .ensure_release_path(org, id, &version.version)
+        .await
+        .unwrap_or_else(|_| base.clone());
+    let Ok(result) = storage
+        .upload_public_bundle(&parent, "starter.git.bundle", bundle)
+        .await
+    else {
+        return;
+    };
+    if let Some(entry) = result
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        let _ = storage.set_public_link(entry).await;
+    }
 }
 async fn commits(
     State(s): State<AppState>,
