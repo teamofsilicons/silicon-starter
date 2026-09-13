@@ -13,7 +13,7 @@ const sample: Starter[] = [
   { id: 'tos.knowledge', name: 'Knowledge Graph', description: 'Turn source material into a queryable silicon memory.', owner: 'teamofsilicons', visibility: 'public', version: '0.9', downloads: 611, stars: 39, updated_at: new Date().toISOString(), tags: ['memory', 'search'], yaml: 'silicon:\n  id: knowledge:tos\nisi: {}\naccess: {}\nflow: []' },
 ];
 
-const API = import.meta.env.VITE_API_URL || 'https://backend.starter.teamofsilicons.com';
+const API = import.meta.env.VITE_API_URL || '';
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(`${API}${path}`, { credentials: 'include', ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
   if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);

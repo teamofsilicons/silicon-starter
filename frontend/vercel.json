@@ -1,1 +1,1 @@
-{"rewrites":[{"source":"/api/:path*","destination":"https://backend.starter.teamofsilicons.com/api/:path*"},{"source":"/auth/:path*","destination":"https://backend.starter.teamofsilicons.com/auth/:path*"}]}
+{"rewrites":[{"source":"/api/:path*","destination":"https://j6wc9snmms.us-east-1.awsapprunner.com/api/:path*"},{"source":"/auth/:path*","destination":"https://j6wc9snmms.us-east-1.awsapprunner.com/auth/:path*"}]}
