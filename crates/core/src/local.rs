@@ -145,7 +145,8 @@ pub fn clone_bundle(
     if !is_hex_commit(commit) {
         return Err("server returned an invalid commit id".into());
     }
-    let target = target.as_ref();
+    let target = std::path::absolute(target).map_err(|e| e.to_string())?;
+    let target = target.as_path();
     if target.exists()
         && fs::read_dir(target)
             .map_err(|e| e.to_string())?
@@ -261,4 +262,53 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", unique()));
     fs::write(&tmp, bytes)?;
     fs::rename(tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clones_into_relative_directory_from_any_working_directory() {
+        let name = format!(".starter-clone-check-{}-{}", std::process::id(), unique());
+        let source = std::env::temp_dir().join(&name);
+        fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-b", "main"]).unwrap();
+        fs::write(source.join("README.md"), "starter content\n").unwrap();
+        run_git(&source, &["add", "README.md"]).unwrap();
+        run_git(
+            &source,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+        let (bundle, commit) = bundle(&source).unwrap();
+        let targets = [
+            PathBuf::from(&name),
+            PathBuf::from(format!("{name}-parent/nested")),
+        ];
+        let results: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                let result = clone_bundle(&bundle, target, &commit);
+                let content = fs::read_to_string(target.join("README.md"));
+                (result, content)
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_file(&bundle);
+        let _ = fs::remove_dir_all(&targets[0]);
+        let _ = fs::remove_dir_all(format!("{name}-parent"));
+        for (result, content) in results {
+            assert_eq!(result, Ok(()));
+            assert_eq!(content.unwrap(), "starter content\n");
+        }
+    }
 }

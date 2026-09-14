@@ -2,6 +2,18 @@
 
 A CLI-first registry for versioned silicon architectures. The repository ships a Rust API/CLI and a SolidJS web client.
 
+## Install
+
+Install on macOS (Apple Silicon or Intel) or Linux (ARM64 or x86_64):
+
+```sh
+curl -fsSL https://starter.teamofsilicons.com/install.sh | sh
+```
+
+[Release downloads](https://github.com/teamofsilicons/silicon-starter/releases/latest) include the installer and binaries. The installer selects your platform, verifies the download checksum, and puts `starter` on your PATH. It uses `/usr/local/bin` (with `sudo` when needed), or falls back to `~/.local/bin` and configures your shell’s PATH. Open a new terminal if the installer updates your shell configuration. Git is required for repository operations; Rust is not required.
+
+The CLI connects to the production API at `https://backend.starter.teamofsilicons.com`. Override it with `--api http://127.0.0.1:8080` or `STARTER_API_URL=http://127.0.0.1:8080` for local development.
+
 ## Local
 
 ```sh
@@ -29,15 +41,13 @@ starter publish history
 starter revert <commit>
 ```
 
-The CLI reads `STARTER_API_URL` (default `http://127.0.0.1:8080`) and stores its IAM session, checkout registry, and webhook settings below `SILICON_HOME` (or `HOME`) in `.starter`. `starter update on` clears a release pin so a downloaded checkout can resume tracking the latest archive. Set `SPACE_STATION_TELEMETRY=0` to disable optional telemetry.
+The CLI reads `STARTER_API_URL` (default `https://backend.starter.teamofsilicons.com`) and stores its IAM session, checkout registry, and webhook settings below `SILICON_HOME` (or `HOME`) in `.starter`. `starter update on` clears a release pin so a downloaded checkout can resume tracking the latest archive. Set `SPACE_STATION_TELEMETRY=0` to disable optional telemetry.
 
-## Install
+## Build CLI releases
 
-The release installer will be published from GitHub once the first signed binary is cut:
+On macOS with Xcode command-line tools, Rust, Zig, and cargo-zigbuild installed, run `bash scripts/build-cli-release.sh`. It builds all four platforms and writes the archives, installer, and `SHA256SUMS` to `target/cli-release` for a GitHub release.
 
-```sh
-curl -fsSL https://github.com/teamofsilicons/silicon-starter/releases/latest/download/install.sh | sh
-```
+Check a built binary with `python3 scripts/check-cli.py target/aarch64-apple-darwin/release/starter`; check the installer without changing your machine with `python3 scripts/check-install.py`.
 
 ## Backend on EC2
 

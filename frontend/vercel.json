@@ -9,6 +9,10 @@
       "destination": "https://backend.starter.teamofsilicons.com/auth/:path*"
     },
     {
+      "source": "/install.sh",
+      "destination": "https://github.com/teamofsilicons/silicon-starter/releases/latest/download/install.sh"
+    },
+    {
       "source": "/starters/:path*",
       "destination": "/index.html"
     },

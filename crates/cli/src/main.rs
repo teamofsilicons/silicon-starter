@@ -20,7 +20,11 @@ use std::{
     about = "Version controlled silicon starter registry. Use --help to explore the command tree."
 )]
 struct Cli {
-    #[arg(long, env = "STARTER_API_URL", default_value = "http://127.0.0.1:8080")]
+    #[arg(
+        long,
+        env = "STARTER_API_URL",
+        default_value = "https://backend.starter.teamofsilicons.com"
+    )]
     api: String,
     #[command(subcommand)]
     command: Command,
@@ -918,7 +922,8 @@ async fn request_value(
     m: Method,
     b: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    request_value_with_headers(api, p, m, b, None).await
+    let session = fs::read_to_string(session_path()).ok();
+    request_value_with_headers(api, p, m, b, session.as_deref()).await
 }
 async fn request_value_with_headers(
     api: &str,
