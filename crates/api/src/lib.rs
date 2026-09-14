@@ -15,6 +15,8 @@ use silicon_starter_core::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    process::Command,
     sync::Arc,
 };
 use tokio::sync::RwLock;
@@ -133,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/starters/{id}/star", post(star))
         .route("/api/v1/starters/{id}/fork", post(fork))
         .route("/api/v1/starters/{id}/archive", get(archive))
+        .route("/api/v1/starters/{id}/files", get(files))
         .route("/api/v1/starters/{id}/download", get(archive))
         .route("/api/v1/starters/{id}/push", post(push))
         .route("/api/v1/starters/{id}/publish", post(publish))
@@ -436,6 +439,87 @@ async fn archive(
         "bundle_base64": BASE64.encode(bundle),
         "commit": commit
     })))
+}
+
+/// Return the checked-in text files from the published git bundle.
+async fn files(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let starter = s
+        .starters
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if matches!(starter.visibility, Visibility::Private)
+        && !s.auth.status(session_id(&headers).as_deref()).await["authenticated"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let bundle = s.bundles.read().await.get(&id).cloned().unwrap_or_default();
+    let root = std::env::temp_dir().join(format!(
+        "starter-files-{}-{}",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    let bundle_path = std::env::temp_dir().join(format!(
+        "starter-bundle-{}-{}",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    fs::write(&bundle_path, &bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let commit = s
+        .bundle_commits
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    if bundle.is_empty() {
+        return Ok(Json(
+            json!({"commit": commit, "files": [{"path": "silicon.yaml", "content": starter.yaml}]}),
+        ));
+    }
+    let clone = Command::new("git")
+        .args(["clone", "--quiet"])
+        .arg(&bundle_path)
+        .arg(&root)
+        .output();
+    let result = clone.ok().filter(|x| x.status.success()).and_then(|_| {
+        let listed = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .ok()?;
+        if !listed.status.success() {
+            return None;
+        }
+        let mut out = Vec::new();
+        let canonical_root = fs::canonicalize(&root).ok()?;
+        for path in String::from_utf8_lossy(&listed.stdout).lines().take(500) {
+            let file = root.join(path);
+            let Ok(canonical) = fs::canonicalize(&file) else {
+                continue;
+            };
+            if !canonical.starts_with(&canonical_root) || !canonical.is_file() {
+                continue;
+            }
+            let bytes = fs::read(canonical).ok()?;
+            if bytes.len() > 512 * 1024 || bytes.iter().any(|b| *b == 0) {
+                continue;
+            }
+            out.push(json!({"path": path, "content": String::from_utf8(bytes).ok()?}));
+        }
+        Some(json!({"commit": commit, "files": out}))
+    });
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_file(&bundle_path);
+    result.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 async fn push(
     State(s): State<AppState>,
