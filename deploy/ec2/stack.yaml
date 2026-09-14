@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Native Silicon Starter API on dedicated EC2 with systemd and HTTPS
+Parameters:
+  Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+Resources:
+  Artifacts:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: {Status: Enabled}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: StarterReleaseAndSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${Artifacts.Arn}/releases/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-starter/production/runtime-Qxvmn2
+                  - arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-starter/production/database-url-GQf2fq
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Starter HTTPS only; administration through SSM
+      VpcId: vpc-04b23a487cfe0bd8e
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+  DatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: sg-0eec16df4566cff81
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref SecurityGroup
+      Description: Native Starter API
+  Instance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId: !Ref Ami
+      InstanceType: t4g.small
+      IamInstanceProfile: !Ref Profile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: subnet-07945746462c26b2d
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref SecurityGroup]
+      MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: false}
+      Tags:
+        - {Key: Name, Value: silicon-starter-native}
+        - {Key: Service, Value: silicon-starter}
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y git python3 postgresql15
+          useradd --system --home-dir /var/lib/starter --shell /sbin/nologin starter
+          install -d -o starter -g starter -m 0700 /var/lib/starter
+          install -d -m 0700 /etc/starter
+          install -d -m 0755 /opt/starter/releases /etc/systemd/journald.conf.d
+          printf '[Journal]\nStorage=persistent\nSystemMaxUse=256M\nMaxRetentionSec=30day\n' > /etc/systemd/journald.conf.d/starter.conf
+          systemctl restart systemd-journald
+          systemctl enable --now amazon-ssm-agent
+  Address:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags: [{Key: Service, Value: silicon-starter}]
+Outputs:
+  InstanceId: {Value: !Ref Instance}
+  PublicIp: {Value: !Ref Address}
+  ArtifactBucket: {Value: !Ref Artifacts}

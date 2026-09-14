@@ -8,16 +8,18 @@ Type=simple
 User=starter
 Group=starter
 WorkingDirectory=/var/lib/starter
-Environment=STARTER_BIND=0.0.0.0:8080
-EnvironmentFile=-/etc/starter/starter-api.env
-ExecStart=/usr/local/bin/starter-api
+EnvironmentFile=/etc/starter/starter-api.env
+ExecStart=/opt/starter/current/starter-api
 Restart=on-failure
 RestartSec=5s
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/starter
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

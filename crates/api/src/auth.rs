@@ -20,9 +20,24 @@ pub struct IamTokens {
     #[serde(default)]
     pub expires_in: i64,
     #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
     pub actor: Option<Value>,
     #[serde(default)]
     pub org_id: Option<String>,
+    #[serde(default)]
+    pub org_ids: Vec<String>,
+}
+
+impl IamTokens {
+    pub fn organizations(&self) -> Vec<String> {
+        let mut orgs = self.org_ids.clone();
+        orgs.extend(self.org_id.iter().cloned());
+        orgs.retain(|org| !org.is_empty());
+        orgs.sort();
+        orgs.dedup();
+        orgs
+    }
 }
 
 #[derive(Clone, Default)]
@@ -43,8 +58,10 @@ impl AuthState {
         let Some(path) = &self.file else {
             return Ok(());
         };
-        let Ok(text) = tokio::fs::read_to_string(path).await else {
-            return Ok(());
+        let text = match tokio::fs::read_to_string(path).await {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("cannot read session store: {error}")),
         };
         let sessions =
             serde_json::from_str(&text).map_err(|e| format!("session store is invalid: {e}"))?;
@@ -92,14 +109,23 @@ impl AuthState {
         app_id: &str,
         app_secret: &str,
     ) -> Result<String, String> {
-        if expected_state != state {
+        if !valid_login_state(expected_state, state) {
             return Err("login state does not match the initiating browser".into());
         }
         self.insert(exchange_slt(slt, app_id, app_secret).await?)
             .await
     }
     pub async fn get(&self, id: &str) -> Option<IamTokens> {
-        self.sessions.read().await.get(id).cloned()
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .filter(|tokens| {
+                tokens
+                    .expires_at
+                    .is_some_and(|expiry| expiry > Utc::now().timestamp())
+            })
+            .cloned()
     }
     pub async fn remove(&self, id: &str) -> Result<bool, String> {
         let removed = self.sessions.write().await.remove(id).is_some();
@@ -113,10 +139,36 @@ impl AuthState {
             Some(id) => self.get(id).await,
             None => None,
         } {
-            Some(t) => serde_json::json!({"authenticated":true,"actor":t.actor,"org_id":t.org_id}),
+            Some(t) => {
+                let orgs = t.organizations();
+                serde_json::json!({"authenticated":true,"actor":t.actor,"org_id":if orgs.len() == 1 { orgs.first() } else { None },"org_ids":orgs})
+            }
             None => serde_json::json!({"authenticated":false}),
         }
     }
+}
+
+pub fn valid_login_state(expected: Option<&str>, supplied: Option<&str>) -> bool {
+    matches!((expected, supplied), (Some(expected), Some(supplied)) if !expected.is_empty() && expected == supplied)
+}
+
+fn authorized_organizations(value: &Value, app_id: &str) -> Result<Vec<String>, String> {
+    if value["active"] != true || value["client_id"].as_str() != Some(app_id) {
+        return Err("IAM session is inactive or belongs to another application".into());
+    }
+    let mut orgs: Vec<String> = value
+        .get("authorizations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(value.get("authorization"))
+        .filter_map(|authorization| authorization.get("org_id").and_then(Value::as_str))
+        .filter(|org| !org.is_empty())
+        .map(str::to_owned)
+        .collect();
+    orgs.sort();
+    orgs.dedup();
+    Ok(orgs)
 }
 
 /// Exchange an IAM SLT. The SLT is never persisted or returned by this helper.
@@ -150,7 +202,19 @@ pub async fn exchange_slt_with_key(
     if !status.is_success() {
         return Err(format!("IAM token exchange returned {status}: {body}"));
     }
-    serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid token JSON: {e}"))
+    let mut tokens: IamTokens =
+        serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid token JSON: {e}"))?;
+    let authorization = introspect(&tokens.access_token, app_id, app_secret, None).await?;
+    tokens.org_ids = authorized_organizations(&authorization, app_id)?;
+    tokens.expires_at = Some(
+        authorization["expires_at"]
+            .as_i64()
+            .filter(|expiry| *expiry > Utc::now().timestamp())
+            .ok_or("IAM returned an expired session or no token expiry")?,
+    );
+    // IAM's current multi-organization flow omits the legacy token org_id.
+    tokens.org_id = (tokens.org_ids.len() == 1).then(|| tokens.org_ids[0].clone());
+    Ok(tokens)
 }
 
 #[allow(dead_code)]
@@ -179,7 +243,6 @@ pub async fn refresh_tokens(
     serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid refresh JSON: {e}"))
 }
 
-#[allow(dead_code)]
 pub async fn introspect(
     access_token: &str,
     app_id: &str,
@@ -277,6 +340,74 @@ pub fn webhook_event_id(body: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn expired_and_legacy_sessions_require_a_new_login() {
+        let state = AuthState::default();
+        for expires_at in [
+            None,
+            Some(Utc::now().timestamp() - 1),
+            Some(Utc::now().timestamp() + 1800),
+        ] {
+            let tokens = IamTokens {
+                access_token: "test".into(),
+                refresh_token: "test".into(),
+                expires_in: 1800,
+                expires_at,
+                actor: None,
+                org_id: None,
+                org_ids: vec!["tos".into()],
+            };
+            let id = state.insert(tokens).await.unwrap();
+            assert_eq!(
+                state.get(&id).await.is_some(),
+                expires_at.is_some_and(|expiry| expiry > Utc::now().timestamp())
+            );
+        }
+    }
+    #[test]
+    fn browser_state_requires_both_values_and_an_exact_match() {
+        assert!(valid_login_state(
+            Some("random-state"),
+            Some("random-state")
+        ));
+        for (expected, supplied) in [
+            (None, None),
+            (Some("state"), None),
+            (None, Some("state")),
+            (Some(""), Some("")),
+            (Some("state"), Some("state-prefix")),
+        ] {
+            assert!(!valid_login_state(expected, supplied));
+        }
+    }
+
+    #[test]
+    fn organizations_come_from_active_application_authorizations() {
+        let mut response = serde_json::json!({
+            "active":true,"client_id":"tos>starter",
+            "authorizations":[{"org_id":"tos"},{"org_id":"lab"},{"org_id":"tos"}]
+        });
+        assert_eq!(
+            authorized_organizations(&response, "tos>starter").unwrap(),
+            ["lab", "tos"]
+        );
+        assert!(authorized_organizations(&response, "another>app").is_err());
+        response["active"] = false.into();
+        assert!(authorized_organizations(&response, "tos>starter").is_err());
+        response = serde_json::json!({"active":true,"client_id":"tos>starter","authorization":{"org_id":"tos"}});
+        assert_eq!(
+            authorized_organizations(&response, "tos>starter").unwrap(),
+            ["tos"]
+        );
+        response["authorization"] = Value::Null;
+        response["org_id"] = "unverified".into();
+        assert!(
+            authorized_organizations(&response, "tos>starter")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn accepts_exact_signature_and_rejects_duplicate_security_headers() {
         let ts = "1000";

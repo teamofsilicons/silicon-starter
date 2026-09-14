@@ -44,6 +44,8 @@ pub struct Discussion {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateStarter {
     pub id: String,
+    #[serde(default)]
+    pub org_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,
