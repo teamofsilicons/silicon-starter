@@ -959,12 +959,16 @@ async fn iam_webhook(
 }
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = seeded_state();
-    if let Some(store) = store::Store::connect_from_env().await? {
-        let store = Arc::new(store);
-        if let Ok(Some(payload)) = store.load().await {
-            restore_state(&state, payload).await;
+    match store::Store::connect_from_env().await {
+        Ok(Some(store)) => {
+            let store = Arc::new(store);
+            if let Ok(Some(payload)) = store.load().await {
+                restore_state(&state, payload).await;
+            }
+            state.store = Some(store);
         }
-        state.store = Some(store);
+        Ok(None) => {}
+        Err(error) => eprintln!("database unavailable; using in-memory state: {error}"),
     }
     state.auth.load().await?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
