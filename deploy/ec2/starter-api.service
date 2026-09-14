@@ -1,0 +1,23 @@
+[Unit]
+Description=Silicon Starter API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starter
+Group=starter
+WorkingDirectory=/var/lib/starter
+Environment=STARTER_BIND=0.0.0.0:8080
+EnvironmentFile=-/etc/starter/starter-api.env
+ExecStart=/usr/local/bin/starter-api
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/starter
+
+[Install]
+WantedBy=multi-user.target

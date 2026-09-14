@@ -129,6 +129,8 @@ aws for backend & storage, crates for rust packages, github for codebase, vercel
 frontend on `starter.teamofsilicons.com` and backend `backend.starter.teamofsilicons.com`
 namecheap cli is also installed along with aws cli, crates creds (shubham/unlikefraction/tos/silicon-omni/.keys), gh cli & vercel cli.
 
+dont use docker in production. for backend, bundle the rust and deploy it directly on an ec2 instance. similarly for anything else we can do without requiring docker. its easy to attach things to systemd, maintain our own logs and manually deploy when a change is made.
+
 # make it prod worthy with upto 100 pushes daily, and about 10k pulls+downloads / day
 
 codebase should be modularised. ship binaries, never raw codebases.

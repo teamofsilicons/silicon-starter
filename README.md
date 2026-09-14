@@ -34,3 +34,14 @@ The release installer will be published from GitHub once the first signed binary
 ```sh
 curl -fsSL https://github.com/teamofsilicons/silicon-starter/releases/latest/download/install.sh | sh
 ```
+
+## Backend on EC2
+
+The API runs as the `starter-api` systemd service; Docker is not required. On a Linux build host, compile the release binary and deploy it over SSH:
+
+```sh
+cargo build --release -p silicon-starter-api
+./deploy/ec2/deploy.sh ubuntu@your-ec2-host
+```
+
+Put production secrets and configuration in `/etc/starter/starter-api.env` on the instance. Logs are available with `sudo journalctl -u starter-api -f`.

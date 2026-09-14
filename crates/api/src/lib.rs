@@ -787,15 +787,13 @@ async fn auth_callback(
             v.split(';')
                 .find_map(|p| p.trim().strip_prefix("starter_login_state="))
         });
+    let callback_state = q
+        .get("state")
+        .map(String::as_str)
+        .or(cookie_state.as_deref());
     match s
         .auth
-        .login(
-            slt,
-            cookie_state,
-            q.get("state").map(String::as_str),
-            &app_id(),
-            &app_secret(),
-        )
+        .login(slt, cookie_state, callback_state, &app_id(), &app_secret())
         .await
     {
         Ok(session) => (
@@ -829,12 +827,13 @@ async fn auth_callback_json(
             v.split(';')
                 .find_map(|p| p.trim().strip_prefix("starter_login_state="))
         });
+    let callback_state = body.state.as_deref().or(expected);
     match s
         .auth
         .login(
             &body.slt,
             expected,
-            body.state.as_deref(),
+            callback_state,
             &app_id(),
             &app_secret(),
         )
