@@ -24,6 +24,21 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
 
     metadata = json.loads(run(str(binary), "iam", "--json"))
     assert metadata["base_url"] == "https://backend.starter.teamofsilicons.com", metadata
+    # Check native home resolution (including Windows without HOME) separately
+    # from SILICON_HOME, then restore the isolated app home for the API checks.
+    native_home = root / "native-home"
+    native_home.mkdir()
+    env.pop("SILICON_HOME")
+    env["USERPROFILE" if os.name == "nt" else "HOME"] = str(native_home)
+    if os.name == "nt":
+        env.pop("HOME", None)
+    run(str(binary), "webhook", "https://example.invalid/starter")
+    assert (native_home / ".starter/webhook.json").is_file()
+    run(str(binary), "unhook")
+    env["SILICON_HOME"] = str(root)
+    run(str(binary), "webhook", "https://example.invalid/starter")
+    assert (root / ".starter/webhook.json").is_file()
+    run(str(binary), "unhook")
     source = root / "source"
     source.mkdir()
     run("git", "init", "-b", "main", cwd=source)
@@ -61,8 +76,11 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
     try:
         api = f"http://127.0.0.1:{server.server_port}"
         assert json.loads(run(str(binary), "--api", api, "iam", "--json"))["base_url"] == api
+        missing = subprocess.run([str(binary), "--api", api, "pull"], cwd=root, env=env, text=True, capture_output=True)
+        assert missing.returncode != 0 and "pull requires a starter id on first use" in missing.stderr, missing
+        assert not requests, requests
         run(str(binary), "--api", api, "list")
-        (root / ".starter").mkdir()
+        (root / ".starter").mkdir(exist_ok=True)
         (root / ".starter/session").write_text("test-session\n")
         run(str(binary), "--api", api, "list")
         run(str(binary), "--api", api, "show", "tos.example")
@@ -75,8 +93,24 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
         ], requests
         assert (root / "example/README.md").read_text() == "starter content\n"
         assert json.loads((root / "example/.git/starter.json").read_text())["id"] == "tos.example"
+        checkout = root / "example"
+        nested = checkout / "nested"
+        nested.mkdir()
+        for cwd in (checkout, nested):
+            content = f"updated from {cwd.name}\n"
+            (source / "README.md").write_text(content)
+            run("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "Update", cwd=source)
+            commit = run("git", "rev-parse", "HEAD", cwd=source).strip()
+            run("git", "bundle", "create", str(bundle), "refs/heads/main", cwd=source)
+            run(str(binary), "--api", api, "pull", cwd=cwd)
+            assert (checkout / "README.md").read_text() == content
+            assert run("git", "rev-parse", "HEAD", cwd=checkout).strip() == commit
+            assert requests[-1] == ("/api/v1/starters/tos.example/archive", "test-session"), requests
+        assert not list(nested.iterdir()), list(nested.iterdir())
+        binding = json.loads((checkout / ".git/starter.json").read_text())
+        assert binding["id"] == "tos.example" and binding["mode"] == "development" and not binding["auto_update"], binding
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
-print("CLI checks passed: production default, API override, anonymous/authenticated reads, first download.")
+print("CLI checks passed: native/SILICON_HOME paths, production default, API override, anonymous/authenticated reads, first download, bound/nested pull, unbound pull error.")

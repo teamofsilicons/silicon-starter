@@ -60,12 +60,15 @@ pub fn save_binding(dir: impl AsRef<Path>, binding: &Binding) -> Result<(), Stri
     let bytes = serde_json::to_vec_pretty(binding).map_err(|e| e.to_string())?;
     fs::write(p, bytes).map_err(|e| e.to_string())
 }
-pub fn registry_path() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     std::env::var_os("SILICON_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(std::env::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".starter/registry.json")
+        .join(".starter")
+}
+pub fn registry_path() -> PathBuf {
+    data_dir().join("registry.json")
 }
 pub fn register_checkout(dir: impl AsRef<Path>, binding: &Binding) -> Result<(), String> {
     let path = dir

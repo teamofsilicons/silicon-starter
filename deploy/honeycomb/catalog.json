@@ -1,0 +1,5 @@
+{
+  "description": "Silicon Starter is a CLI-first registry for creating, sharing, and maintaining versioned silicon architectures. Developers can publish validated Stemcell silicon.yaml projects, track commit and release history, and work in editable Git checkouts. Users can search the catalog, download a published release, pin a version, or follow the latest archive with automatic checkout updates. IAM provides identity and organization access, while Briefcase stores project archives. The SolidJS website offers a companion catalog and project interface. The native starter command is available for macOS, Linux, and Windows on ARM64 and x86_64. Git is required for repository operations.",
+  "website_url": "https://starter.teamofsilicons.com",
+  "docs_url": "https://starter.teamofsilicons.com/docs"
+}

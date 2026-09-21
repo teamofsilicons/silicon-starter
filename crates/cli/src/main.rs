@@ -422,7 +422,11 @@ async fn pull(
     spec: Option<&str>,
     download: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let spec = spec.ok_or("pull requires a starter id on first use")?;
+    let root = local::repo_root().unwrap_or_else(|_| PathBuf::from("."));
+    let current_binding = local::load_binding(&root).ok();
+    let spec = spec
+        .or_else(|| current_binding.as_ref().map(|b| b.id.as_str()))
+        .ok_or("pull requires a starter id on first use")?;
     let (id, rf) = spec
         .split_once('@')
         .map_or((spec, None), |(a, b)| (a, Some(b)));
@@ -453,9 +457,8 @@ async fn pull(
     } else {
         local::bundle_head(&temp)?
     };
-    let current_binding = local::load_binding(".").ok();
     let target = if current_binding.as_ref().is_some_and(|b| b.id == id) {
-        PathBuf::from(".")
+        root
     } else {
         PathBuf::from(id.rsplit('.').next().unwrap_or(id))
     };
@@ -884,18 +887,10 @@ fn unhook() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 fn webhook_path() -> PathBuf {
-    std::env::var_os("SILICON_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".starter/webhook.json")
+    local::data_dir().join("webhook.json")
 }
 fn session_path() -> PathBuf {
-    std::env::var_os("SILICON_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".starter/session")
+    local::data_dir().join("session")
 }
 async fn authed_request_value(
     api: &str,
