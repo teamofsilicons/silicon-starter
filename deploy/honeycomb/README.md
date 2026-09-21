@@ -32,7 +32,7 @@ The complete configuration, including the existing deployed webhook signing secr
 
 ## Release status
 
-Version `0.1.2` is publicly available. It fixes `starter pull` without an explicit ID in an existing checkout, including invocation from a subdirectory. Its six-platform archive is 11,143,923 bytes with SHA-256 `bf4081f89d2b85deec39bb2b7c859f9cf2e95b904e5fdb9f7aa1ddd0817cacf9`.
+Version `0.1.3` is publicly available. It fixes false merge-conflict reports from ordinary equals-sign dividers and binary content while retaining detection of real conflict markers. It includes the `0.1.2` fix for pulling without an explicit ID from an existing checkout or subdirectory. Its six-platform archive is 11,144,409 bytes with SHA-256 `3d40ea7454530ac68ca276c85c8193db44d5cf8efb927a283d0369945743bd56`.
 
 Public review `04dcce57-78fc-44ba-b481-4c1adf98b723` completed for configuration revision 2. The application is active and public; subsequent release uploads under this accepted revision publish directly.
 

@@ -757,9 +757,17 @@ fn resolve_with_omni(stage: &Path, merge_error: &str) -> Result<(), Box<dyn std:
 }
 
 fn has_conflict_markers(stage: &Path) -> bool {
+    // Equals-only lines are also ordinary text dividers; check the other markers.
     local::run_git(
         stage,
-        ["grep", "-nE", "^(<<<<<<<|=======|>>>>>>>)", "--", "."].as_ref(),
+        [
+            "grep",
+            "-IqE",
+            r"^(<{7,}|>{7,}|\|{7,})([[:space:]]|$)",
+            "--",
+            ".",
+        ]
+        .as_ref(),
     )
     .is_ok()
 }

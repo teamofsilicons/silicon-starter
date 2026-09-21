@@ -43,7 +43,9 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
     source.mkdir()
     run("git", "init", "-b", "main", cwd=source)
     (source / "README.md").write_text("starter content\n")
-    run("git", "add", "README.md", cwd=source)
+    (source / "dividers.txt").write_text("Heading\n=======\n\n====================\nSection\n====================\n")
+    (source / "fixture.bin").write_bytes(b"\0\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n")
+    run("git", "add", "README.md", "dividers.txt", "fixture.bin", cwd=source)
     run("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Initial", cwd=source)
     commit = run("git", "rev-parse", "HEAD", cwd=source).strip()
     bundle = root / "starter.bundle"
@@ -109,8 +111,24 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
         assert not list(nested.iterdir()), list(nested.iterdir())
         binding = json.loads((checkout / ".git/starter.json").read_text())
         assert binding["id"] == "tos.example" and binding["mode"] == "development" and not binding["auto_update"], binding
+        previous_commit = commit
+        previous_content = (checkout / "README.md").read_text()
+        for content in (
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n",
+            "<<<<<<<<<< branch\nours\n",
+            "||||||| parent\nbase\n",
+            ">>>>>>>\n",
+        ):
+            (source / "README.md").write_text(content)
+            run("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "Unresolved conflict", cwd=source)
+            commit = run("git", "rev-parse", "HEAD", cwd=source).strip()
+            run("git", "bundle", "create", str(bundle), "refs/heads/main", cwd=source)
+            conflict = subprocess.run([str(binary), "--api", api, "pull"], cwd=checkout, env=env, text=True, capture_output=True)
+            assert conflict.returncode != 0 and "update left merge conflict markers" in conflict.stderr, conflict
+            assert run("git", "rev-parse", "HEAD", cwd=checkout).strip() == previous_commit
+            assert (checkout / "README.md").read_text() == previous_content
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
-print("CLI checks passed: native/SILICON_HOME paths, production default, API override, anonymous/authenticated reads, first download, bound/nested pull, unbound pull error.")
+print("CLI checks passed: native/SILICON_HOME paths, production default, API override, anonymous/authenticated reads, first download, bound/nested pull, unbound pull error, divider/binary content, conflict rollback.")
