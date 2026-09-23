@@ -8,7 +8,9 @@ exec 9>/var/lock/starter-deploy.lock
 flock -n 9
 previous=$(readlink -e /opt/starter/current || true)
 backup=$(mktemp -d)
-for target in /etc/starter/starter-api.env /etc/systemd/system/starter-api.service; do
+refresh_was_enabled=$(systemctl is-enabled starter-db-refresh.timer 2>/dev/null || true)
+managed_files=(/etc/starter/starter-api.env /etc/systemd/system/starter-api.service /etc/systemd/system/starter-db-refresh.service /etc/systemd/system/starter-db-refresh.timer)
+for target in "${managed_files[@]}"; do
   [[ ! -f "$target" ]] || cp -p "$target" "$backup/$(basename "$target")"
 done
 rollback() {
@@ -16,13 +18,23 @@ rollback() {
   trap - EXIT
   if [[ "$result" != 0 ]]; then
     systemctl stop starter-api || true
-    for target in /etc/starter/starter-api.env /etc/systemd/system/starter-api.service; do
-      [[ ! -f "$backup/$(basename "$target")" ]] || cp -p "$backup/$(basename "$target")" "$target"
+    if [[ "$refresh_was_enabled" != enabled ]]; then
+      systemctl disable --now starter-db-refresh.timer || true
+    fi
+    for target in "${managed_files[@]}"; do
+      if [[ -f "$backup/$(basename "$target")" ]]; then
+        cp -p "$backup/$(basename "$target")" "$target"
+      else
+        rm -f "$target"
+      fi
     done
     if [[ -n "$previous" ]]; then
       ln -sfn "$previous" /opt/starter/current.next
       mv -Tf /opt/starter/current.next /opt/starter/current
       systemctl daemon-reload
+      if [[ -f "$previous/refresh-database.py" ]]; then
+        python3 "$previous/refresh-database.py" --no-restart --region "$region" || printf 'Could not refresh the restored database credential.\n' >&2
+      fi
       systemctl restart starter-api || true
     fi
   fi
@@ -49,7 +61,10 @@ path = pathlib.Path('/etc/starter/starter-api.env')
 path.write_text(text)
 path.chmod(0o600)
 PY
-install -m 0644 "$release/starter-api.service" /etc/systemd/system/starter-api.service
+python3 "$release/refresh-database.py" --no-restart --region "$region"
+for unit in starter-api.service starter-db-refresh.service starter-db-refresh.timer; do
+  install -m 0644 "$release/$unit" "/etc/systemd/system/$unit"
+done
 ln -sfn "$release" /opt/starter/current.next
 mv -Tf /opt/starter/current.next /opt/starter/current
 systemctl daemon-reload
@@ -57,6 +72,7 @@ systemctl enable starter-api
 systemctl restart starter-api
 for attempt in {1..30}; do
   if curl -fsS http://127.0.0.1:8080/healthz; then
+    systemctl enable --now starter-db-refresh.timer
     printf '\nInstalled %s\n' "$release"
     exit 0
   fi

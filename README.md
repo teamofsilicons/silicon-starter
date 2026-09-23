@@ -89,7 +89,7 @@ See [Honeycomb publishing](deploy/honeycomb/README.md) for upload, review, and r
 
 ## Backend on EC2
 
-Production runs a static ARM64 Rust binary under `starter-api.service`. Caddy handles HTTPS; journald keeps logs. AWS Systems Manager provides shell access, with no SSH port exposed. PostgreSQL and IAM credentials are loaded from Secrets Manager into a root-only systemd environment file.
+Production runs a static ARM64 Rust binary under `starter-api.service`. Caddy handles HTTPS; journald keeps logs. AWS Systems Manager provides shell access, with no SSH port exposed. PostgreSQL and IAM credentials are loaded from Secrets Manager into a root-only systemd environment file. Database credentials come from RDS’s authoritative managed secret at deployment. The hourly `starter-db-refresh.timer` refreshes a rotated password and restarts the API only when it changes.
 
 Build and manually deploy from this repository (requires Rust's ARM64 Linux target, cargo-zigbuild, Zig, and an authorized AWS CLI):
 

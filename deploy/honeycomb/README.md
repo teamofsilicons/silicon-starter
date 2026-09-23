@@ -10,7 +10,7 @@ Read the current configuration revision before upload:
 
 ```sh
 honeycomb apps get 'tos>starter' --json
-honeycomb --idempotency-key <unique-release-key> releases upload 'tos>starter' target/cli-release/starter-honeycomb-<version>.tar.gz --revision <current-revision>
+honeycomb --idempotency-key <unique-release-key> releases upload 'tos>starter' target/cli-release/starter-honeycomb-<version>.tar.gz --channel prod --revision <current-revision>
 honeycomb install 'tos>starter' --version <version>
 honeycomb publication get 'tos>starter' --json
 ```
@@ -32,7 +32,9 @@ The complete configuration, including the existing deployed webhook signing secr
 
 ## Release status
 
-Version `0.1.3` is publicly available. It fixes false merge-conflict reports from ordinary equals-sign dividers and binary content while retaining detection of real conflict markers. It includes the `0.1.2` fix for pulling without an explicit ID from an existing checkout or subdirectory. Its six-platform archive is 11,144,409 bytes with SHA-256 `3d40ea7454530ac68ca276c85c8193db44d5cf8efb927a283d0369945743bd56`.
+Version `0.2.0` is publicly available on the `prod` channel. It adds `.starterbase` recipes, `starter seed`, typed questions, generated-file merges, default publication previews, and private instance state. Failed template updates disable automatic updates; downloaded histories remain unpushable.
+
+The six-platform archive is 20,562,932 bytes with SHA-256 `f5bb055963db9de2d733ed67dea50620e3194764cd952f19aeadd2444e7129f5`. Honeycomb release ID: `c3112648-0c2a-498d-9d23-c83b8ecb3cec`. GitHub release: [v0.2.0](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.2.0).
 
 Public review `04dcce57-78fc-44ba-b481-4c1adf98b723` completed for configuration revision 2. The application is active and public; subsequent release uploads under this accepted revision publish directly.
 

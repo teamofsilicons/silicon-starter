@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Starter managed database credential hourly
+
+[Timer]
+OnBootSec=2min
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target

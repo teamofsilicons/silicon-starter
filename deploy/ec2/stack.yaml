@@ -41,6 +41,7 @@ Resources:
                 Resource:
                   - arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-starter/production/runtime-Qxvmn2
                   - arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-starter/production/database-url-GQf2fq
+                  - arn:aws:secretsmanager:us-east-1:234951665042:secret:rds!db-ce5cfadb-b038-43fc-a7c3-a6c0663cf3ad-UxnQ83
   Profile:
     Type: AWS::IAM::InstanceProfile
     Properties:

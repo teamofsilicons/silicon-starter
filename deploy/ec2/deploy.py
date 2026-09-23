@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory() as tmp:
     archive = pathlib.Path(tmp) / 'release.tar.gz'
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(args.binary, arcname='starter-api')
-        for name in ['install.sh', 'starter-api.service']:
+        for name in ['install.sh', 'starter-api.service', 'refresh-database.py', 'starter-db-refresh.service', 'starter-db-refresh.timer']:
             tar.add(base / name, arcname=name)
     checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
     release = checksum[:16]
