@@ -289,6 +289,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "silicon_id",
+                "silicon_org_id",
                 "silicon_token",
                 "timezone",
                 "purpose",
@@ -297,12 +298,12 @@ mod tests {
             ]
         );
         assert!(
-            variables[2]["default"]
+            variables[3]["default"]
                 .as_str()
                 .unwrap()
                 .starts_with("! touch")
         );
-        assert_eq!(variables[5]["when"], "{var.waveform}");
+        assert_eq!(variables[6]["when"], "{var.waveform}");
         assert_eq!(preview["build"][0], "! sh build.sh");
         assert!(!marker.exists());
         files[0].content = Some("schema: invalid".into());

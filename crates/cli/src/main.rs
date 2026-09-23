@@ -154,11 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Iam { json: true } => println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"app_id":"tos>starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core"})
+                &json!({"app_id":"starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core"})
             )?
         ),
         Command::Iam { json: false } => println!(
-            "tos>starter\nAPI: {}\nDocs: https://starter.teamofsilicons.com/docs",
+            "starter\nAPI: {}\nDocs: https://starter.teamofsilicons.com/docs",
             c.api
         ),
         Command::Login {
@@ -1114,6 +1114,12 @@ async fn request_value_with_headers(
     let status = x.status();
     let text = x.text().await?;
     let v = serde_json::from_str(&text).unwrap_or_else(|_| json!({"body":text}));
+    if status == reqwest::StatusCode::UNAUTHORIZED && s.is_some() {
+        return Err(format!(
+            "HTTP {status}: {v}; authentication expired or invalid; run `starter login <SLT>` with a fresh IAM token"
+        )
+        .into());
+    }
     if !status.is_success() {
         return Err(format!("HTTP {status}: {v}").into());
     }

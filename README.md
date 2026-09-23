@@ -14,14 +14,16 @@ curl -fsSL https://starter.teamofsilicons.com/install.sh | sh
 
 [Release downloads](https://github.com/teamofsilicons/silicon-starter/releases/latest) include the installer and binaries. The installer selects your platform, verifies the download checksum, and puts `starter` on your PATH. It uses `/usr/local/bin` (with `sudo` when needed), or falls back to `~/.local/bin` and configures your shell’s PATH. Open a new terminal if the installer updates your shell configuration. Git is required for repository operations; Rust is not required.
 
-With [Honeycomb](https://docs.honeycomb.teamofsilicons.com/installation/) installed and access to `tos>starter`, install the six-platform package (macOS, Linux, or Windows; ARM64 or x86_64):
+With [Honeycomb](https://docs.honeycomb.teamofsilicons.com/installation/) installed and access to `starter`, install the six-platform package (macOS, Linux, or Windows; ARM64 or x86_64):
 
 ```sh
-honeycomb install 'tos>starter'
+honeycomb install starter
 starter --help
 ```
 
 Honeycomb manages CLI installation and binary updates. `starter update` and `starter daemon` manage downloaded project checkouts. Git must already be on PATH; Honeycomb packages do not run setup scripts.
+
+For existing installations and deployed services, follow the [public identifier migration](docs/PUBLIC-IDENTIFIER-MIGRATION.md) before cutover. App IDs are bare, Silicon IDs use `si:handle` with a separate organization, and starter catalog IDs such as `tos.classic` stay unchanged.
 
 The CLI connects to the production API at `https://backend.starter.teamofsilicons.com`. Override it with `--api http://127.0.0.1:8080` or `STARTER_API_URL=http://127.0.0.1:8080` for local development.
 

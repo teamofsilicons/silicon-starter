@@ -16,7 +16,12 @@ auto_update: true
 variables:
   silicon_id:
     type: string
-    prompt: What is this silicon's ID?
+    prompt: What is this silicon's ID (si:handle)?
+    default: ""
+
+  silicon_org_id:
+    type: string
+    prompt: What is this silicon's organization ID?
     default: ""
 
   silicon_token:

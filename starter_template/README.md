@@ -38,7 +38,8 @@ testing $ starter pull tos.classic-sample
 Pulling tos.classic-sample...
 
 Folder name: research-assistant
-What is this silicon's ID? [empty] research:tos
+What is this silicon's ID (si:handle)? [empty] si:research
+What is this silicon's organization ID? [empty] tos
 What is this silicon's token? [empty] ********
 What should this silicon focus on?
   [Help the team research, plan, and finish its work.] Research for the team.
@@ -60,9 +61,13 @@ your terminal's working directory.
 Every recipe question can be skipped with Enter to accept its resolved
 default. The timezone has no `prompt`, so it resolves silently; this example
 assumes its command detects `Asia/Kolkata`.
-The ID and token default to empty strings: the sample can generate files
+The ID, organization ID, and token default to empty strings: the sample can generate files
 without them, but those defaults do not create an identity or working login.
 Creators can supply command defaults to resolve those values in their setup.
+Use the complete IAM Silicon ID (`si:research`) and its separately verified
+organization (`tos`); an ID no longer contains or selects an organization.
+Application IDs are bare (`dm`, `briefcase`, `waveform`). Starter catalog IDs
+such as `tos.classic-sample` and bundle IDs such as `tos>interface` are unchanged.
 
 The folder question belongs to Starter and appears for every new instance
 unless a destination was already supplied. An occupied name needs a different
@@ -78,7 +83,7 @@ omitted so the source ingredients and generated files are easy to see.
 ```text
 testing/
   research-assistant/
-    silicon.yaml                    rendered with your ID, token, and timezone
+    silicon.yaml                    rendered with your ID, organization, token, and timezone
     prompts/
       silicon.md                    rendered with your chosen focus
       tools.md                      common instructions plus Waveform section
@@ -106,7 +111,7 @@ testing/
 
 The installed `silicon.yaml` includes `prompts/tools.md` in DNA regardless of
 the Waveform answer. With `waveform: true`, that file contains the Waveform
-section, the app list contains `tos>waveform`, and its app config sets
+section, the app list contains `waveform`, and its app config sets
 `default_tts_provider: google`. With `false`, the section, app entry, and app
 config are absent. The source fragment in `.starterbase/optional/`
 remains available for later reconfiguration; there is no separate installed
@@ -246,7 +251,7 @@ waveform_tts_provider:
 ```
 
 Google is a **provider** in Stemcell's Waveform config. The template writes the
-answer into `silicon.app_configs.tos>waveform.default_tts_provider`. A recipe
+answer into `silicon.app_configs.waveform.default_tts_provider`. A recipe
 could add a model question after that, depending on the selected provider.
 
 For each variable, the sequence is: evaluate `when` (omitted means true),
@@ -310,7 +315,7 @@ source state are committed only after the complete build and merge succeed.
    the instance's `auto_update` setting; discard temporary output.
 
 Starter's validation checks generated YAML structure and known output
-references. It permits the sample's intentionally empty ID/token defaults;
+references. It permits the sample's intentionally empty ID/organization/token defaults;
 Stemcell checks runtime readiness when the user connects the silicon. This
 generation check leaves runtime expressions deferred. Stemcell's `compile`
 command evaluates compile-time commands such as `SILICON_HOME`, so it is not
@@ -363,16 +368,17 @@ For YAML scalars, `tojson` provides a quoted JSON value that is also valid YAML:
 ```jinja
 silicon:
   id: {{ var.silicon_id | tojson }}
+  org_id: {{ var.silicon_org_id | tojson }}
   timezone: {{ var.timezone | tojson }}
   SILICON_HOME: ! pwd
   apps:
-    - tos>dm
-    - tos>briefcase
+    - dm
+    - briefcase
 {% if var.waveform %}
-    - tos>waveform
+    - waveform
 
   app_configs:
-    tos>waveform:
+    waveform:
       default_tts_provider: {{ var.waveform_tts_provider | tojson }}
 {% endif %}
 ```

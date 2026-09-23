@@ -298,14 +298,16 @@ function App() {
       try {
         const url = new URL(location.href);
         let slt = url.searchParams.get('slt') || '';
-        if (!slt && url.hash.startsWith('#slts=')) {
+        const hasSlts = url.hash.startsWith('#slts=');
+        if (!slt && hasSlts) {
           const entries = JSON.parse(decodeURIComponent(url.hash.slice(6))) as { app_id?: string; slt?: string }[];
-          slt = entries.find(entry => entry.app_id === 'tos>starter')?.slt || '';
+          slt = entries.find(entry => entry.app_id === 'starter')?.slt || '';
         }
-        if (slt) {
+        if (slt || hasSlts) {
           const state = url.searchParams.get('state') || undefined;
           url.searchParams.delete('slt'); url.searchParams.delete('state'); url.hash = '';
           history.replaceState({}, '', url.pathname === '/auth/callback' ? '/' : url.pathname + url.search); updateLocation();
+          if (!slt) throw new Error('No login token for starter; log in again with IAM.');
           await api('/auth/callback', { method: 'POST', body: JSON.stringify({ slt, state }) });
         }
         setSession(await api<Session>('/auth/session'));

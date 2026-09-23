@@ -50,7 +50,9 @@ def secret(name):
 
 env = json.loads(secret('silicon-starter/production/runtime'))
 env['STARTER_DATABASE_URL'] = secret('silicon-starter/production/database-url').strip()
-env.update(STARTER_BIND='127.0.0.1:8080', STARTER_FRONTEND_URL='https://starter.teamofsilicons.com', STARTER_AUTH_FILE='/var/lib/starter/auth.json')
+env.update(STARTER_BIND='127.0.0.1:8080', STARTER_FRONTEND_URL='https://starter.teamofsilicons.com')
+# Identifier cutover requires fresh logins; retain the old auth.json for coordinated rollback.
+env.setdefault('STARTER_AUTH_FILE', '/var/lib/starter/auth-identifiers-v1.json')
 # systemd EnvironmentFile double quotes require escaping backslash and quote.
 def quote(value):
     if '\n' in value or '\r' in value or '\0' in value:

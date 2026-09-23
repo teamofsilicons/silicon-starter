@@ -600,7 +600,8 @@ async fn publish_to_briefcase(
     }
     let session_id = session_id(headers)?;
     let session = s.auth.get(&session_id).await?;
-    let Ok(storage) = briefcase::BriefcaseStorage::from_env(session.access_token) else {
+    let Ok(storage) = briefcase::BriefcaseStorage::from_env(session.access_token, &starter.owner)
+    else {
         return None;
     };
     let bundle = s.bundles.read().await.get(id).cloned()?;
@@ -854,7 +855,7 @@ fn frontend_url() -> String {
         .to_owned()
 }
 fn app_id() -> String {
-    std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "tos>starter".into())
+    std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "starter".into())
 }
 fn secure_cookie() -> &'static str {
     if std::env::var("STARTER_FRONTEND_URL")
@@ -903,6 +904,10 @@ async fn iam_webhook(
     StatusCode::NO_CONTENT
 }
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    auth::validate_app_id(&app_id())?;
+    if let Ok(id) = std::env::var("BRIEFCASE_APP_ID") {
+        auth::validate_app_id(&id)?;
+    }
     let mut state = seeded_state();
     if let Some(store) = store::Store::connect_from_env().await? {
         let store = Arc::new(store);
@@ -929,7 +934,15 @@ async fn restore_state(
         *s.versions.write().await = serde_json::from_value(value.clone())?;
     }
     if let Some(value) = object.get("discussions") {
-        *s.discussions.write().await = serde_json::from_value(value.clone())?;
+        let discussions: HashMap<String, Vec<Discussion>> = serde_json::from_value(value.clone())?;
+        if discussions.values().flatten().any(|discussion| {
+            discussion.author != "authenticated-user"
+                && !auth::valid_actor_id("carbon", &discussion.author)
+                && !auth::valid_actor_id("silicon", &discussion.author)
+        }) {
+            return Err("legacy discussion authors require the offline IAM mapping migration; see docs/PUBLIC-IDENTIFIER-MIGRATION.md".into());
+        }
+        *s.discussions.write().await = discussions;
     }
     if let Some(value) = object.get("bundle_commits") {
         *s.bundle_commits.write().await = serde_json::from_value(value.clone())?;
@@ -969,6 +982,43 @@ mod webhook_tests {
 mod auth_and_organization_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn restored_discussions_require_canonical_authors_and_preserve_content() {
+        let s = AppState::default();
+        for author in [
+            "alice",
+            "assistant:tos",
+            "c:alice",
+            "si:assistant",
+            "authenticated-user",
+        ] {
+            let discussion = json!({
+                "id": "unchanged-id", "starter_id": "tos.example", "parent_id": null,
+                "author": author, "body": "Keep assistant:tos and tos>starter in historical text.",
+                "created_at": "2026-09-23T00:00:00Z"
+            });
+            let result = restore_state(
+                &s,
+                json!({"discussions": {"tos.example": [discussion.clone()]}}),
+            )
+            .await;
+            if ["alice", "assistant:tos"].contains(&author) {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("offline IAM mapping")
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&s.discussions.read().await["tos.example"][0]).unwrap(),
+                    discussion
+                );
+            }
+        }
+    }
+
     async fn session(s: &AppState, orgs: &[&str]) -> HeaderMap {
         let id = s
             .auth
@@ -977,7 +1027,7 @@ mod auth_and_organization_tests {
                 refresh_token: "test-refresh".into(),
                 expires_in: 1800,
                 expires_at: Some(Utc::now().timestamp() + 1800),
-                actor: Some(json!({"public_id":"test-user"})),
+                actor: Some(json!({"type":"carbon","public_id":"c:test-user"})),
                 org_id: None,
                 org_ids: orgs.iter().map(|org| (*org).into()).collect(),
             })

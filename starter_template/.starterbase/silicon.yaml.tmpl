@@ -1,6 +1,7 @@
 {# Jinja renders the file; Stemcell evaluates runtime commands and CEL later. #}
 silicon:
   id: {{ var.silicon_id | tojson }}
+  org_id: {{ var.silicon_org_id | tojson }}
   token: {{ var.silicon_token | tojson }}
   timezone: {{ var.timezone | tojson }}
   SILICON_HOME: ! pwd
@@ -9,13 +10,13 @@ silicon:
     - all-available-providers
 
   apps:
-    - tos>dm
-    - tos>briefcase
+    - dm
+    - briefcase
 {% if var.waveform %}
-    - tos>waveform
+    - waveform
 
   app_configs:
-    tos>waveform:
+    waveform:
       default_tts_provider: {{ var.waveform_tts_provider | tojson }}
 {% endif %}
 

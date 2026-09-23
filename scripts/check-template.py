@@ -35,6 +35,10 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
     assert not (author / "silicon.yaml").exists()
     run(str(binary), "seed", "--defaults", cwd=author)
     assert (author / "silicon.yaml").is_file()
+    default_config = (author / "silicon.yaml").read_text()
+    assert '  id: ""\n' in default_config and '  org_id: ""\n' in default_config
+    assert "    - dm\n" in default_config and "    - briefcase\n" in default_config
+    assert "tos>" not in default_config
     assert (author / "workspace").is_dir()
     assert (author / "memories").is_dir()
     assert "waveform" in (author / "prompts/tools.md").read_text().lower()
@@ -75,13 +79,16 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
     command = (str(binary), "--api", api)
     env["TZ"] = "Pacific/Honolulu"
     try:
-        run(*command, "download", "tos.sample", "--dir", "instance", "--defaults", "--set", "purpose=Team research", "--set", "waveform=false")
+        run(*command, "download", "tos.sample", "--dir", "instance", "--defaults", "--set", "purpose=Team research", "--set", "waveform=false", "--set", "silicon_id=si:research", "--set", "silicon_org_id=tos")
         instance = root / "instance"
         state_file = instance / ".starterbase/.state/state.json"
         state = json.loads(state_file.read_text())
         assert state["answers"]["timezone"] == "Pacific/Honolulu", state["answers"]
         assert state["answers"]["waveform"] is False and state["answers"]["purpose"] == "Team research"
-        assert "tos>waveform" not in (instance / "silicon.yaml").read_text()
+        config = (instance / "silicon.yaml").read_text()
+        assert '  id: "si:research"\n' in config and '  org_id: "tos"\n' in config
+        assert state["answers"]["silicon_id"] == "si:research" and state["answers"]["silicon_org_id"] == "tos"
+        assert "waveform" not in config
         assert not (instance / "README.md").exists() and not (instance / "variables.yaml").exists()
         assert (instance / "workspace/.siliconkeep").is_file()
         assert not (instance / ".starterbase/.state/generated/workspace/.siliconkeep").exists()
@@ -90,7 +97,8 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         run(*command, "seed", "--defaults", cwd=instance)
         assert (instance / "silicon.yaml").read_bytes() == first
         run(*command, "seed", "--defaults", "--set", "waveform=true", cwd=instance)
-        assert "tos>waveform" in (instance / "silicon.yaml").read_text()
+        assert "    - waveform\n" in (instance / "silicon.yaml").read_text()
+        assert "    waveform:\n" in (instance / "silicon.yaml").read_text()
         assert "google" in (instance / "silicon.yaml").read_text()
         run(*command, "pull", "tos.sample", "--dir", "dev", "--defaults", "--set", "silicon_token=PRIVATE_INSTANCE_TOKEN")
         development = json.loads((root / "dev/.git/starter.json").read_text())

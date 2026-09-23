@@ -914,7 +914,7 @@ mod tests {
         )
         .unwrap();
         write_tree(&project, &inventory(&published).unwrap()).unwrap();
-        let answers = serde_json::json!({"timezone":"Installer/Timezone", "silicon_id":"research:tos", "silicon_token":"private-token"}).as_object().unwrap().clone();
+        let answers = serde_json::json!({"timezone":"Installer/Timezone", "silicon_id":"si:research", "silicon_org_id":"tos", "silicon_token":"private-token"}).as_object().unwrap().clone();
         let state = install(
             &project,
             &installed_source,

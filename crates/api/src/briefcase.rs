@@ -20,26 +20,32 @@ pub struct BriefcaseStorage {
     briefcase_base: String,
     pub app_id: String,
     app_secret: String,
-    org_id: Option<String>,
+    org_id: String,
     subject_token: String,
 }
 
 impl BriefcaseStorage {
     /// Build from deployment environment and the caller's IAM access token.
-    pub fn from_env(subject_token: impl Into<String>) -> Result<Self, String> {
+    pub fn from_env(subject_token: impl Into<String>, org_id: &str) -> Result<Self, String> {
         let required =
             |name: &str| std::env::var(name).map_err(|_| format!("{name} is not configured"));
+        // BRIEFCASE_APP_ID is the calling application's credential ID, not its audience.
+        let app_id = std::env::var("BRIEFCASE_APP_ID")
+            .or_else(|_| std::env::var("STARTER_IAM_APP_ID"))
+            .unwrap_or_else(|_| "starter".into());
+        crate::auth::validate_app_id(&app_id)?;
+        if org_id.is_empty() {
+            return Err("Briefcase requires an explicitly authorized organization".into());
+        }
         Ok(Self {
             http: Client::new(),
             iam_base: std::env::var("IAM_URL").unwrap_or_else(|_| IAM_DEFAULT.into()),
             briefcase_base: std::env::var("BRIEFCASE_URL")
                 .unwrap_or_else(|_| BRIEFCASE_DEFAULT.into()),
-            app_id: std::env::var("BRIEFCASE_APP_ID")
-                .or_else(|_| std::env::var("STARTER_IAM_APP_ID"))
-                .unwrap_or_else(|_| "tos>starter".into()),
+            app_id,
             app_secret: std::env::var("BRIEFCASE_APP_SECRET")
                 .or_else(|_| required("STARTER_IAM_APP_SECRET"))?,
-            org_id: std::env::var("BRIEFCASE_ORG_ID").ok(),
+            org_id: org_id.into(),
             subject_token: subject_token.into(),
         })
     }
@@ -93,15 +99,13 @@ impl BriefcaseStorage {
                 metadata,
             )
             .await?;
-        let mut request = self
+        let request = self
             .http
             .post(self.url("/api/v1/obo/files"))
             .header("X-App-ID", &self.app_id)
+            .header("X-Org-ID", &self.org_id)
             .header("X-IAM-OBO-Access-Proof", proof)
             .body(bytes);
-        if let Some(org) = &self.org_id {
-            request = request.header("X-Org-ID", org);
-        }
         let response = request
             .send()
             .await
@@ -122,15 +126,13 @@ impl BriefcaseStorage {
                 json!({}),
             )
             .await?;
-        let mut request = self
+        let request = self
             .http
             .post(self.url("/api/v1/obo/files/read"))
             .header("X-App-ID", &self.app_id)
+            .header("X-Org-ID", &self.org_id)
             .header("X-IAM-OBO-Access-Proof", proof)
             .json(&body);
-        if let Some(org) = &self.org_id {
-            request = request.header("X-Org-ID", org);
-        }
         let response = request
             .send()
             .await
@@ -178,16 +180,14 @@ impl BriefcaseStorage {
                 json!({}),
             )
             .await?;
-        let mut request = self
+        let request = self
             .http
             .post(self.url(path))
             .header("X-App-ID", &self.app_id)
+            .header("X-Org-ID", &self.org_id)
             .header("X-IAM-OBO-Access-Proof", proof)
             .header("Content-Type", "application/json")
             .body(bytes);
-        if let Some(org) = &self.org_id {
-            request = request.header("X-Org-ID", org);
-        }
         self.json_response(
             request
                 .send()
@@ -213,7 +213,7 @@ impl BriefcaseStorage {
             .map_err(|_| "invalid Briefcase app secret".to_string())?;
         mac.update(signing.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
-        let body = json!({"subject_token": self.subject_token, "audience": "tos>briefcase", "endpoint_id": endpoint, "metadata": metadata, "request": {"method": method, "body_sha256": body_sha256}});
+        let body = json!({"subject_token": self.subject_token, "audience": "briefcase", "org_id": self.org_id, "endpoint_id": endpoint, "metadata": metadata, "request": {"method": method, "body_sha256": body_sha256}});
         let response = self
             .http
             .post(format!(
@@ -256,5 +256,106 @@ impl BriefcaseStorage {
             .json()
             .await
             .map_err(|_| "Briefcase response was invalid".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, body::Bytes, http::HeaderMap, routing::post};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn canonical_obo_binds_selected_organization_and_exact_downstream_bytes() {
+        let exchanges = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let received = exchanges.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/obo-access/exchanges",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let received = received.clone();
+                    async move {
+                        assert_eq!(
+                            headers["authorization"],
+                            format!("Basic {}", STANDARD.encode("starter:secret"))
+                        );
+                        assert!(!headers.contains_key("x-org-id"));
+                        assert_eq!(body["audience"], "briefcase");
+                        assert_eq!(body["endpoint_id"], "briefcase.link_access.update");
+                        assert_eq!(body["request"]["method"], "POST");
+                        let signature = format!(
+                            "{}.POST./api/v1/obo/link-access.{}.{}",
+                            headers["x-obo-timestamp"].to_str().unwrap(),
+                            body["request"]["body_sha256"].as_str().unwrap(),
+                            headers["idempotency-key"].to_str().unwrap()
+                        );
+                        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+                        mac.update(signature.as_bytes());
+                        mac.verify_slice(
+                            &hex::decode(headers["x-obo-signature"].to_str().unwrap()).unwrap(),
+                        )
+                        .unwrap();
+                        received.lock().await.push(body);
+                        Json(json!({"access_proof":"single-use-proof"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/obo/link-access",
+                post({
+                    let exchanges = exchanges.clone();
+                    move |headers: HeaderMap, bytes: Bytes| {
+                        let exchanges = exchanges.clone();
+                        async move {
+                            let records = exchanges.lock().await;
+                            let exchange = records.last().unwrap();
+                            assert_eq!(headers["x-app-id"], "starter");
+                            assert_eq!(headers["x-iam-obo-access-proof"], "single-use-proof");
+                            assert_eq!(
+                                headers["x-org-id"].to_str().unwrap(),
+                                exchange["org_id"].as_str().unwrap()
+                            );
+                            assert_eq!(
+                                exchange["request"]["body_sha256"],
+                                format!("{:x}", Sha256::digest(&bytes))
+                            );
+                            let body: Value = serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(body["enabled"], true);
+                            Json(body)
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for org in ["tos", "lab"] {
+            let storage = BriefcaseStorage {
+                http: Client::new(),
+                iam_base: base.clone(),
+                briefcase_base: base.clone(),
+                app_id: "starter".into(),
+                app_secret: "secret".into(),
+                org_id: org.into(),
+                subject_token: "opaque-token".into(),
+            };
+            let entry = Uuid::now_v7();
+            assert_eq!(
+                storage.set_public_link(entry).await.unwrap()["entry_id"],
+                entry.to_string()
+            );
+        }
+        let exchanges = exchanges.lock().await;
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0]["org_id"], "tos");
+        assert_eq!(exchanges[1]["org_id"], "lab");
+        assert!(
+            exchanges
+                .iter()
+                .all(|body| body["subject_token"] == "opaque-token")
+        );
+        server.abort();
     }
 }

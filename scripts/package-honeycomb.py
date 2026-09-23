@@ -16,7 +16,7 @@ targets = {
     "windows-aarch64": "aarch64-pc-windows-msvc",
     "windows-x86_64": "x86_64-pc-windows-msvc",
 }
-manifest = f"format_version: 1\napp_id: tos>starter\nversion: {version}\nbin:\n  starter: main\ntargets:\n"
+manifest = f"format_version: 1\napp_id: starter\nversion: {version}\nbin:\n  starter: main\ntargets:\n"
 payloads = []
 for platform, triple in targets.items():
     name = "starter.exe" if platform.startswith("windows-") else "starter"

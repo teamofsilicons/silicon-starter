@@ -17,7 +17,8 @@ let authenticated = false;
 let registryError = false;
 let created;
 const requests = [];
-const starter = { id: 'test.repo', name: 'Example architecture', owner: 'test', description: 'An organization-published architecture with real repository files.', visibility: 'public', version: '1.2', downloads: 12, stars: 3, updated_at: new Date().toISOString(), tags: ['rust', 'agents'], yaml: 'silicon:\n  id: example:test\n' };
+const callbacks = [];
+const starter = { id: 'test.repo', name: 'Example architecture', owner: 'test', description: 'An organization-published architecture with real repository files.', visibility: 'public', version: '1.2', downloads: 12, stars: 3, updated_at: new Date().toISOString(), tags: ['rust', 'agents'], yaml: 'silicon:\n  id: si:example\n  org_id: test\n' };
 const files = [
   { path: 'README.md', content: '# Example architecture\n\nBuild an organization-owned silicon.\n\n## Getting started\n\n- [Source](src/main.rs)\n- [Unsafe link](javascript:alert(1))\n\n```sh\nstarter pull test.repo\n```\n' },
   { path: 'src/main.rs', content: 'fn main() {\n    println!("hello");\n}\n' },
@@ -58,6 +59,10 @@ const server = createServer(async (request, response) => {
     requests.push(path);
     const json = (data, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(data)); };
     if (path === '/auth/session') return json(authenticated ? { authenticated: true, org_id: 'test', org_ids: ['test', 'other'], actor: { name: 'Test member' } } : { authenticated: false });
+    if (path === '/auth/callback' && request.method === 'POST') {
+      let body = ''; for await (const chunk of request) body += chunk;
+      callbacks.push(JSON.parse(body)); authenticated = true; return json({ authenticated: true });
+    }
     if (path === '/api/v1/starters' && request.method === 'POST') {
       let body = ''; for await (const chunk of request) body += chunk;
       created = JSON.parse(body); return json({ ...starter, ...created, owner: created.org_id }, 201);
@@ -183,7 +188,7 @@ try {
   await browser('wait', '--fn', 'location.pathname.endsWith("/releases")');
   await check('document.querySelector(".release")', 'Forward restores tab');
   await click('.repository-tabs a[href$="/architecture"]');
-  await check('document.querySelector(".architecture-source").textContent.includes("example:test")', 'Architecture tab');
+  await check('document.querySelector(".architecture-source").textContent.includes("si:example")', 'Architecture tab');
   await click('.repository-tabs a[href$="/discussions"]');
   await browser('wait', '--text', 'How can I customize this?');
   await check('document.querySelector(".comment").textContent.includes("test-member")', 'Discussion tab');
@@ -244,18 +249,27 @@ try {
   await check('document.querySelector("[role=alert]").textContent.includes("registry could not be loaded") && !document.querySelector(".starter-card")', 'Registry failure shows no fabricated fallback');
   await open('/new');
   await check('document.body.innerText.includes("Log in with an organization") && !document.querySelector(".create-form")', 'Guest cannot create');
+  const slt = 'oac_starter:opaque+value/=';
+  const entries = [{ app_id: 'tos>starter', slt: 'oac_legacy' }, { app_id: 'iam', slt: 'oac_other' }, { app_id: 'starter', slt }];
+  await send('Page.navigate', { url: `${origin}/?state=opaque-state#slts=${encodeURIComponent(JSON.stringify(entries))}` });
+  await browser('wait', '--fn', 'location.search === "" && location.hash === "" && !!document.querySelector(".account-name")');
+  assert.deepEqual(callbacks, [{ slt, state: 'opaque-state' }], 'Select the bare starter app and preserve its opaque SLT');
+  await send('Page.navigate', { url: `${origin}/?state=legacy-state#slts=${encodeURIComponent(JSON.stringify(entries.slice(0, 2)))}` });
+  await browser('wait', '--text', 'No login token for starter; log in again with IAM.');
+  assert.equal(callbacks.length, 1, 'Legacy and unrelated app tokens must never be exchanged for Starter');
+  await check('location.search === "" && location.hash === "" && !document.querySelector(".account-name")', 'Rejected login clears the fragment and does not fall back to an existing session');
   authenticated = true;
   await open('/new');
   await check('document.querySelectorAll(".create-form select:first-of-type option").length >= 2 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');
   await evaluate('document.querySelector(".create-form select").value = "other"; document.querySelector(".create-form select").dispatchEvent(new Event("change", {bubbles:true}));');
   await browser('fill', '.starter-id-field input', 'new');
   await browser('fill', '.create-form > label:nth-of-type(3) input', 'New starter');
-  await browser('fill', '.create-form textarea', 'silicon:\n  id: new:other\n');
+  await browser('fill', '.create-form textarea', 'silicon:\n  id: si:new\n  org_id: other\n');
   await click('.create-form button[type=submit], .create-form .primary');
   await browser('wait', '--url', '**/starters/other.new');
   assert.equal(created.org_id, 'other');
   assert.equal(created.id, 'other.new');
-  console.log('PASS: Code default, root/tree/file links, reload, Back/Forward, all tabs, template order/types/conditions/flow/source links/safe rendering, encoded paths, binary/empty/draft/error states, mobile, View code, empty registry, verified org creation.');
+  console.log('PASS: Code default, root/tree/file links, reload, Back/Forward, all tabs, template order/types/conditions/flow/source links/safe rendering, encoded paths, binary/empty/draft/error states, mobile, View code, empty registry, canonical IAM app selection, legacy login rejection, verified org creation.');
   console.log('Screenshots: /tmp/starter-code-desktop.png and /tmp/starter-code-mobile.png');
 } finally {
   socket?.close();

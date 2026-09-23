@@ -649,7 +649,7 @@ mod tests {
         assert!(compile(&source).unwrap().auto_update);
         for enabled in [false, true] {
             let output = tempfile::tempdir().unwrap();
-            let answers = json!({"silicon_id":"a\"b\nc:tos","silicon_token":"secret","waveform":enabled,"timezone":"UTC","purpose":"{{ var.silicon_token }}"});
+            let answers = json!({"silicon_id":"a\"b\nc:tos","silicon_org_id":"lab","silicon_token":"secret","waveform":enabled,"timezone":"UTC","purpose":"{{ var.silicon_token }}"});
             let result = build(
                 &source,
                 &source.join("project"),
@@ -664,7 +664,8 @@ mod tests {
             assert!(silicon.contains("{make_readable(request.tings)}"));
             let yaml = parse_yaml(&silicon).unwrap();
             assert_eq!(yaml["silicon"]["id"].as_str(), Some("a\"b\nc:tos"));
-            assert_eq!(silicon.contains("tos>waveform"), enabled);
+            assert_eq!(yaml["silicon"]["org_id"].as_str(), Some("lab"));
+            assert_eq!(silicon.contains("waveform"), enabled);
             assert_eq!(
                 result.answers.contains_key("waveform_tts_provider"),
                 enabled

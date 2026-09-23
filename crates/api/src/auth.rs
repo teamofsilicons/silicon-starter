@@ -1,5 +1,4 @@
-//! Small, deliberately stateless IAM boundary helpers.
-//! Secrets and refresh/session persistence belong to the application store.
+//! IAM boundary helpers and application sessions. Tokens remain opaque.
 
 use axum::http::HeaderMap;
 use chrono::Utc;
@@ -63,8 +62,13 @@ impl AuthState {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("cannot read session store: {error}")),
         };
-        let sessions =
+        let saved: Value =
             serde_json::from_str(&text).map_err(|e| format!("session store is invalid: {e}"))?;
+        if saved["identifier_schema"] != 1 {
+            return Err("session store predates the IAM identifier migration or has an unsupported schema; back it up, select a new empty STARTER_AUTH_FILE, and log in again".into());
+        }
+        let sessions = serde_json::from_value(saved["sessions"].clone())
+            .map_err(|e| format!("session store is invalid: {e}"))?;
         *self.sessions.write().await = sessions;
         Ok(())
     }
@@ -78,7 +82,11 @@ impl AuthState {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let text = serde_json::to_vec(&*self.sessions.read().await).map_err(|e| e.to_string())?;
+        let text = serde_json::to_vec(&serde_json::json!({
+            "identifier_schema": 1,
+            "sessions": &*self.sessions.read().await,
+        }))
+        .map_err(|e| e.to_string())?;
         let tmp = path.with_extension("tmp");
         tokio::fs::write(&tmp, text)
             .await
@@ -152,7 +160,47 @@ pub fn valid_login_state(expected: Option<&str>, supplied: Option<&str>) -> bool
     matches!((expected, supplied), (Some(expected), Some(supplied)) if !expected.is_empty() && expected == supplied)
 }
 
+pub(crate) fn validate_app_id(app_id: &str) -> Result<(), String> {
+    if (1..=80).contains(&app_id.len())
+        && app_id.as_bytes()[0].is_ascii_lowercase()
+        && app_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err("application ID must be a bare IAM handle (1–80 lowercase letters, digits, underscores or hyphens, starting with a letter); migrate legacy org>app IDs using the authoritative IAM mapping".into())
+    }
+}
+
+pub(crate) fn valid_actor_id(kind: &str, id: &str) -> bool {
+    let (prefix, max_len) = match kind {
+        "carbon" => ("c:", 30),
+        "silicon" => ("si:", 50),
+        _ => return false,
+    };
+    id.strip_prefix(prefix).is_some_and(|handle| {
+        (3..=max_len).contains(&handle.len())
+            && handle
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    })
+}
+
+fn introspected_actor(value: &Value) -> Result<Option<Value>, String> {
+    if value["actor_type"].is_null() && value["public_id"].is_null() {
+        return Ok(None);
+    }
+    let kind = value["actor_type"].as_str().unwrap_or_default();
+    let id = value["public_id"].as_str().unwrap_or_default();
+    if !valid_actor_id(kind, id) {
+        return Err("IAM returned an invalid or legacy actor identity; complete the identifier migration and log in again".into());
+    }
+    Ok(Some(serde_json::json!({"type": kind, "public_id": id})))
+}
+
 fn authorized_organizations(value: &Value, app_id: &str) -> Result<Vec<String>, String> {
+    validate_app_id(app_id)?;
     if value["active"] != true || value["client_id"].as_str() != Some(app_id) {
         return Err("IAM session is inactive or belongs to another application".into());
     }
@@ -183,6 +231,7 @@ pub async fn exchange_slt_with_key(
     app_secret: &str,
     idempotency_key: &str,
 ) -> Result<IamTokens, String> {
+    validate_app_id(app_id)?;
     if !slt.starts_with("oac_") {
         return Err("credential is not an IAM short-lived token".into());
     }
@@ -206,6 +255,7 @@ pub async fn exchange_slt_with_key(
         serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid token JSON: {e}"))?;
     let authorization = introspect(&tokens.access_token, app_id, app_secret, None).await?;
     tokens.org_ids = authorized_organizations(&authorization, app_id)?;
+    tokens.actor = introspected_actor(&authorization)?;
     tokens.expires_at = Some(
         authorization["expires_at"]
             .as_i64()
@@ -224,6 +274,7 @@ pub async fn refresh_tokens(
     app_secret: &str,
     idempotency_key: &str,
 ) -> Result<IamTokens, String> {
+    validate_app_id(app_id)?;
     let response = reqwest::Client::new()
         .post("https://backend.iam.teamofsilicons.com/api/v1/app-auth/tokens")
         .basic_auth(app_id, Some(app_secret))
@@ -249,6 +300,7 @@ pub async fn introspect(
     app_secret: &str,
     org: Option<&str>,
 ) -> Result<Value, String> {
+    validate_app_id(app_id)?;
     let client = reqwest::Client::new();
     let mut request = client
         .post("https://backend.iam.teamofsilicons.com/api/v1/oauth/introspect")
@@ -364,6 +416,122 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn identifier_cutover_rejects_old_stores_and_preserves_current_tokens() {
+        let path = std::env::temp_dir().join(format!("starter-auth-{}.json", Uuid::now_v7()));
+        let legacy = serde_json::json!({"old-session": {
+            "access_token": "opaque-access-with-old-identity-text",
+            "refresh_token": "opaque-refresh-with-old-identity-text",
+            "expires_at": Utc::now().timestamp() + 1800,
+            "actor": {"type": "silicon", "public_id": "assistant:tos"},
+            "org_ids": ["tos"]
+        }})
+        .to_string();
+        tokio::fs::write(&path, &legacy).await.unwrap();
+        let state = AuthState {
+            file: Some(path.clone()),
+            ..AuthState::default()
+        };
+        assert!(
+            state
+                .load()
+                .await
+                .unwrap_err()
+                .contains("STARTER_AUTH_FILE")
+        );
+        assert!(state.get("old-session").await.is_none());
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), legacy);
+
+        let new_path = path.with_extension("canonical.json");
+        let fresh = AuthState {
+            file: Some(new_path.clone()),
+            ..AuthState::default()
+        };
+        fresh.load().await.unwrap();
+        let tokens: IamTokens = serde_json::from_value(serde_json::json!({
+            "access_token": "opaque-access-with-old-identity-text",
+            "refresh_token": "opaque-refresh-with-old-identity-text",
+            "expires_at": Utc::now().timestamp() + 1800,
+            "actor": {"type": "silicon", "public_id": "si:assistant"},
+            "org_ids": ["tos"]
+        }))
+        .unwrap();
+        let id = fresh.insert(tokens.clone()).await.unwrap();
+        let restarted = AuthState {
+            file: Some(new_path.clone()),
+            ..AuthState::default()
+        };
+        restarted.load().await.unwrap();
+        let loaded = restarted.get(&id).await.unwrap();
+        assert_eq!(loaded.access_token, tokens.access_token);
+        assert_eq!(loaded.refresh_token, tokens.refresh_token);
+        assert_eq!(loaded.actor, tokens.actor);
+        assert_eq!(loaded.organizations(), ["tos"]);
+        tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_file(new_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_apps_before_contacting_iam_and_checks_explicit_actor_kind() {
+        for app in ["starter", "a", &"a".repeat(80), "a_0-b"] {
+            assert!(validate_app_id(app).is_ok());
+        }
+        for app in [
+            "tos>starter",
+            "starter>test@1.0.0",
+            "",
+            "0app",
+            "App",
+            &"a".repeat(81),
+        ] {
+            assert!(validate_app_id(app).is_err());
+            assert!(
+                exchange_slt_with_key("oac_test", app, "secret", "key")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                refresh_tokens("opaque", app, "secret", "key")
+                    .await
+                    .is_err()
+            );
+            assert!(introspect("opaque", app, "secret", None).await.is_err());
+        }
+        for (kind, id) in [("carbon", "c:alice0"), ("silicon", "si:assistant")] {
+            assert!(valid_actor_id(kind, id));
+            let actor =
+                introspected_actor(&serde_json::json!({"actor_type":kind,"public_id":id})).unwrap();
+            assert_eq!(actor, Some(serde_json::json!({"type":kind,"public_id":id})));
+        }
+        for undisclosed in [
+            serde_json::json!({}),
+            serde_json::json!({"actor_type":null,"public_id":null}),
+        ] {
+            assert_eq!(introspected_actor(&undisclosed).unwrap(), None);
+        }
+        for partial in [
+            serde_json::json!({"actor_type":"carbon"}),
+            serde_json::json!({"public_id":"c:alice"}),
+            serde_json::json!({"actor_type":false,"public_id":null}),
+        ] {
+            assert!(introspected_actor(&partial).is_err());
+        }
+        for (kind, id) in [
+            ("carbon", "alice"),
+            ("silicon", "assistant:tos"),
+            ("silicon", "c:alice"),
+            ("carbon", "si:assistant"),
+            ("carbon", "c:al"),
+            ("silicon", "si:assistant:tos"),
+            ("application", "starter"),
+        ] {
+            assert!(!valid_actor_id(kind, id));
+            assert!(
+                introspected_actor(&serde_json::json!({"actor_type":kind,"public_id":id})).is_err()
+            );
+        }
+    }
     #[test]
     fn browser_state_requires_both_values_and_an_exact_match() {
         assert!(valid_login_state(
@@ -384,25 +552,25 @@ mod tests {
     #[test]
     fn organizations_come_from_active_application_authorizations() {
         let mut response = serde_json::json!({
-            "active":true,"client_id":"tos>starter",
+            "active":true,"client_id":"starter",
             "authorizations":[{"org_id":"tos"},{"org_id":"lab"},{"org_id":"tos"}]
         });
         assert_eq!(
-            authorized_organizations(&response, "tos>starter").unwrap(),
+            authorized_organizations(&response, "starter").unwrap(),
             ["lab", "tos"]
         );
-        assert!(authorized_organizations(&response, "another>app").is_err());
+        assert!(authorized_organizations(&response, "another-app").is_err());
         response["active"] = false.into();
-        assert!(authorized_organizations(&response, "tos>starter").is_err());
-        response = serde_json::json!({"active":true,"client_id":"tos>starter","authorization":{"org_id":"tos"}});
+        assert!(authorized_organizations(&response, "starter").is_err());
+        response = serde_json::json!({"active":true,"client_id":"starter","authorization":{"org_id":"tos"}});
         assert_eq!(
-            authorized_organizations(&response, "tos>starter").unwrap(),
+            authorized_organizations(&response, "starter").unwrap(),
             ["tos"]
         );
         response["authorization"] = Value::Null;
         response["org_id"] = "unverified".into();
         assert!(
-            authorized_organizations(&response, "tos>starter")
+            authorized_organizations(&response, "starter")
                 .unwrap()
                 .is_empty()
         );

@@ -23,6 +23,8 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
         return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, check=True).stdout
 
     metadata = json.loads(run(str(binary), "iam", "--json"))
+    assert metadata["app_id"] == "starter", metadata
+    assert run(str(binary), "iam").splitlines()[0] == "starter"
     assert metadata["base_url"] == "https://backend.starter.teamofsilicons.com", metadata
     # Check native home resolution (including Windows without HOME) separately
     # from SILICON_HOME, then restore the isolated app home for the API checks.
@@ -58,7 +60,8 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
 
         def do_GET(self):
             requests.append((self.path, self.headers.get("x-starter-session")))
-            payload = {
+            unauthorized = self.headers.get("x-starter-session") == "opaque:legacy>session"
+            payload = {"error": "session expired"} if unauthorized else {
                 "/api/v1/starters": [],
                 "/api/v1/starters/tos.example": {"id": "tos.example", "owner": "tos"},
                 "/api/v1/starters/tos.example/archive": {
@@ -66,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
                 },
             }[self.path]
             body = json.dumps(payload).encode()
-            self.send_response(200)
+            self.send_response(401 if unauthorized else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -93,6 +96,12 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
             ("/api/v1/starters/tos.example", "test-session"),
             ("/api/v1/starters/tos.example/archive", "test-session"),
         ], requests
+        (root / ".starter/session").write_text("opaque:legacy>session\n")
+        expired = subprocess.run([str(binary), "--api", api, "list"], cwd=root, env=env, text=True, capture_output=True)
+        assert expired.returncode != 0 and "starter login <SLT>" in expired.stderr, expired
+        assert requests[-1] == ("/api/v1/starters", "opaque:legacy>session"), requests
+        assert (root / ".starter/session").read_text() == "opaque:legacy>session\n"
+        (root / ".starter/session").write_text("test-session\n")
         assert (root / "example/README.md").read_text() == "starter content\n"
         assert json.loads((root / "example/.git/starter.json").read_text())["id"] == "tos.example"
         checkout = root / "example"
@@ -131,4 +140,4 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
         server.shutdown()
         server.server_close()
         thread.join()
-print("CLI checks passed: native/SILICON_HOME paths, production default, API override, anonymous/authenticated reads, first download, bound/nested pull, unbound pull error, divider/binary content, conflict rollback.")
+print("CLI checks passed: canonical IAM app metadata, native/SILICON_HOME paths, production default, API override, anonymous/authenticated reads, opaque sessions and re-login errors, first download, bound/nested pull, unbound pull error, divider/binary content, conflict rollback.")

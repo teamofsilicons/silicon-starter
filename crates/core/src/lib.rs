@@ -119,7 +119,7 @@ pub fn validate_directory(path: &Path) -> Result<(), String> {
         &fs::read_to_string(&yaml).map_err(|e| format!("cannot read {}: {e}", yaml.display()))?,
     )
 }
-pub const SEED_YAML: &str = "silicon:\n  id: starter:tos\n  token: local-development-token\n  timezone: UTC\n  SILICON_HOME: .\n  inference_providers: [all-available-providers]\nisi:\n  registry:\n    model: fast\n    primary_send_mode: global\n    session_type: persistent\n    dna:\n      assemble: []\naccess:\n  registry: []\nflow: []\n";
+pub const SEED_YAML: &str = "silicon:\n  id: si:starter\n  org_id: tos\n  token: local-development-token\n  timezone: UTC\n  SILICON_HOME: .\n  inference_providers: [all-available-providers]\nisi:\n  registry:\n    model: fast\n    primary_send_mode: global\n    session_type: persistent\n    dna:\n      assemble: []\naccess:\n  registry: []\nflow: []\n";
 #[cfg(test)]
 mod tests {
     use super::*;
