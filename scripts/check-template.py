@@ -111,15 +111,65 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         tools.write_text("Local team guidance.\n\n" + tools.read_text())
         upstream = author / ".starterbase/prompts/silicon.md.tmpl"
         upstream.write_text(upstream.read_text() + "\nNew upstream instruction.\n")
+        build = author / ".starterbase/build.sh"
+        build.write_text(build.read_text() + '\nmkdir -p "$STARTER_OUTPUT/new-output"\n')
         git("add", "-A", cwd=author)
         git("commit", "-m", "New instruction", cwd=author)
         commit = git("rev-parse", "HEAD", cwd=author).strip()
         git("bundle", "create", str(bundle), "main", cwd=author)
-        run(*command, "update", "now", cwd=instance)
+        run(*command, "update", "off", cwd=instance)
+        run(*command, "daemon", "--once")
+        assert json.loads(state_file.read_text())["revision"] != commit
+        recipe = instance / ".starterbase/starter.yaml"
+        assert "auto_update: false" in recipe.read_text()
+        recipe.write_text(recipe.read_text().replace("auto_update: false", "auto_update: true"))
+
+        # Git history is part of the update: a failed commit must roll back too.
+        git("add", "-A", cwd=instance)
+        git("commit", "-m", "Local instance configuration", cwd=instance)
+        old_head = git("rev-parse", "HEAD", cwd=instance)
+        old_index = git("ls-files", "--stage", cwd=instance)
+        old_state = state_file.read_bytes()
+        baseline = instance / ".starterbase/.state/generated"
+        old_baseline = {p.relative_to(baseline): p.read_bytes() for p in baseline.rglob("*") if p.is_file()}
+        old_source = (instance / ".starterbase/prompts/silicon.md.tmpl").read_bytes()
+        old_prompt = (instance / "prompts/silicon.md").read_bytes()
+        hook = instance / ".git/hooks/pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        error = run(*command, "update", "now", cwd=instance, ok=False)
+        assert "automatic updates are off" in error, error
+        assert git("rev-parse", "HEAD", cwd=instance) == old_head
+        assert git("ls-files", "--stage", cwd=instance) == old_index
+        assert state_file.read_bytes() == old_state
+        assert {p.relative_to(baseline): p.read_bytes() for p in baseline.rglob("*") if p.is_file()} == old_baseline
+        assert (instance / ".starterbase/prompts/silicon.md.tmpl").read_bytes() == old_source
+        assert (instance / "prompts/silicon.md").read_bytes() == old_prompt
+        assert not (instance / "new-output").exists()
+        hook.unlink()
+        # Editing the recipe must work even while the older binding flag is off.
+        recipe.write_text(recipe.read_text().replace("auto_update: false", "auto_update: true"))
+        assert not git("status", "--porcelain", cwd=instance).strip()
+        run(*command, "daemon", "--once")
         assert tools.read_text().startswith("Local team guidance.")
         assert "New upstream instruction." in (instance / "prompts/silicon.md").read_text()
         assert json.loads(state_file.read_text())["revision"] == commit
         assert not (instance / ".starterbase/.state/generated/prompts/tools.md").read_text().startswith("Local")
+        assert (instance / "new-output/.siliconkeep").is_file()
+        assert git("rev-list", "--count", old_head.strip() + "..HEAD", cwd=instance).strip() == "1"
+        new_head = git("rev-parse", "HEAD", cwd=instance)
+        run(*command, "update", "now", cwd=instance)
+        assert git("rev-parse", "HEAD", cwd=instance) == new_head
+
+        # Even a source-only revision gets a local update-history entry.
+        (author / "README.md").write_text("Updated documentation only.\n")
+        git("add", "README.md", cwd=author)
+        git("commit", "-m", "Documentation revision", cwd=author)
+        commit = git("rev-parse", "HEAD", cwd=author).strip()
+        git("bundle", "create", str(bundle), "main", cwd=author)
+        run(*command, "update", "now", cwd=instance)
+        assert json.loads(state_file.read_text())["revision"] == commit
+        assert git("rev-list", "--count", new_head.strip() + "..HEAD", cwd=instance).strip() == "1"
 
         # A conflicting generated edit leaves the entire installed revision alone.
         prompt = instance / "prompts/silicon.md"
@@ -161,4 +211,4 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         server.shutdown()
         server.server_close()
         worker.join()
-print("Template checks passed: compile, seed, install, saved answers, pins, developer isolation, generated merge, conflict rollback, pause, default push preview.")
+print("Template checks passed: compile, seed, install, saved answers, pins, developer isolation, generated merge, commit/conflict rollback, update history, recipe toggle, pause, default push preview.")

@@ -50,6 +50,32 @@ pub fn apply(
     source_id: &str,
     revision: &str,
 ) -> Result<State, String> {
+    apply_finalized(
+        project,
+        source,
+        explicit,
+        reset,
+        interactive,
+        source_id,
+        revision,
+        |_| Ok(()),
+    )
+}
+
+/// Apply the build and finalize caller-owned bookkeeping before releasing the
+/// instance lock. A failed finalizer restores every generated/source/state file;
+/// the finalizer must restore its own side effects before returning an error.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_finalized(
+    project: &Path,
+    source: &Path,
+    explicit: &Map<String, Value>,
+    reset: &[String],
+    interactive: bool,
+    source_id: &str,
+    revision: &str,
+    finalize: impl FnOnce(&State) -> Result<(), String>,
+) -> Result<State, String> {
     apply_inner(
         project,
         source,
@@ -59,6 +85,7 @@ pub fn apply(
         source_id,
         revision,
         false,
+        finalize,
     )
 }
 
@@ -81,6 +108,7 @@ pub fn install(
         source_id,
         revision,
         true,
+        |_| Ok(()),
     )
 }
 
@@ -94,6 +122,7 @@ fn apply_inner(
     source_id: &str,
     revision: &str,
     fresh_install: bool,
+    finalize: impl FnOnce(&State) -> Result<(), String>,
 ) -> Result<State, String> {
     let project = std::path::absolute(project).map_err(err)?;
     let _lock = lock_project(&project)?;
@@ -221,7 +250,7 @@ fn apply_inner(
         &serde_json::to_vec_pretty(&state).map_err(err)?,
         false,
     )?;
-    commit(
+    commit_finalized(
         &project,
         &old,
         &new,
@@ -229,6 +258,7 @@ fn apply_inner(
         Some(&staged_source),
         Some(&observed),
         &scratch.0,
+        || finalize(&state),
     )?;
     Ok(state)
 }
@@ -486,6 +516,22 @@ fn commit(
     observed: Option<&Observed>,
     scratch: &Path,
 ) -> Result<(), String> {
+    commit_finalized(project, old, new, merged, source, observed, scratch, || {
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_finalized(
+    project: &Path,
+    old: &Tree,
+    new: &Tree,
+    merged: &Tree,
+    source: Option<&Path>,
+    observed: Option<&Observed>,
+    scratch: &Path,
+    finalize: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     if let Some(observed) = observed {
         for (path, expected) in observed {
             if live_file(project, path)?.as_ref() != expected.as_ref() {
@@ -549,7 +595,7 @@ fn commit(
             fs::rename(source, &target).map_err(err)?;
             installed.push(PathBuf::from(".starterbase"));
         }
-        Ok(())
+        finalize()
     })();
     if let Err(failure) = result {
         let mut rollback_errors = Vec::new();
@@ -927,6 +973,43 @@ mod tests {
         );
         let recipe = fs::read(project.join(".starterbase/starter.yaml")).unwrap();
         let saved = fs::read(project.join(".starterbase/.state/state.json")).unwrap();
+        let prompt_before = fs::read(project.join("prompts/silicon.md")).unwrap();
+        let explicit = serde_json::json!({"purpose":"new purpose"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let rejected = apply_finalized(
+            &project,
+            &upgrade,
+            &explicit,
+            &[],
+            false,
+            "sample",
+            "rejected-revision",
+            |state| {
+                assert_eq!(state.revision, "rejected-revision");
+                assert!(lock_project(&project).is_err());
+                Err("history commit rejected".into())
+            },
+        );
+        assert_eq!(rejected.unwrap_err(), "history commit rejected");
+        assert_eq!(
+            fs::read(project.join("prompts/silicon.md")).unwrap(),
+            prompt_before
+        );
+        assert_eq!(
+            fs::read(project.join(".starterbase/starter.yaml")).unwrap(),
+            recipe
+        );
+        assert_eq!(
+            fs::read(project.join(".starterbase/.state/state.json")).unwrap(),
+            saved
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(".starterbase/.state/generated/prompts/tools.md"))
+                .unwrap(),
+            baseline
+        );
         let template = upgrade.join("prompts/tools.md.tmpl");
         let changed = fs::read_to_string(&template)
             .unwrap()

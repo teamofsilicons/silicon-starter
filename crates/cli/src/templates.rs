@@ -2,8 +2,9 @@ use clap::Args;
 use serde_json::{Map, Value};
 use silicon_starter_core::{local, seed, template};
 use std::{
+    collections::BTreeMap,
     fs,
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -152,22 +153,136 @@ pub fn seed(options: &SeedOptions, check: bool) -> Result<()> {
 }
 
 pub fn commit(project: &Path, message: &str) -> Result<()> {
-    local::stage(project)?;
-    if !local::run_git(project, &["status", "--porcelain"])?.is_empty() {
-        local::run_git(
-            project,
-            &[
-                "-c",
-                "user.name=Starter",
-                "-c",
-                "user.email=starter@localhost",
-                "commit",
-                "-m",
-                message,
-            ],
-        )?;
+    commit_history(project, message, false)
+}
+
+fn commit_history(project: &Path, message: &str, allow_empty: bool) -> Result<()> {
+    let head = local::head(project)?;
+    let index = PathBuf::from(local::run_git(
+        project,
+        &["rev-parse", "--git-path", "index"],
+    )?);
+    let index = if index.is_absolute() {
+        index
+    } else {
+        project.join(index)
+    };
+    let saved_index = match fs::read(&index) {
+        Ok(bytes) => Some((bytes, fs::metadata(&index)?.permissions())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let markers = keep_files(project)?;
+    let result = (|| -> Result<()> {
+        local::stage(project)?;
+        if allow_empty || !local::run_git(project, &["status", "--porcelain"])?.is_empty() {
+            // This is the final fallible operation: once HEAD advances, apply is complete.
+            local::run_git(
+                project,
+                &[
+                    "-c",
+                    "user.name=Starter",
+                    "-c",
+                    "user.email=starter@localhost",
+                    "commit",
+                    if allow_empty {
+                        "--allow-empty"
+                    } else {
+                        "--no-allow-empty"
+                    },
+                    "-m",
+                    message,
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(failure) = result {
+        let rollback = (|| -> Result<()> {
+            for path in keep_files(project)?
+                .keys()
+                .filter(|path| !markers.contains_key(*path))
+            {
+                fs::remove_file(path)?;
+            }
+            for (path, (bytes, permissions)) in &markers {
+                restore_file(path, bytes, permissions.clone())?;
+            }
+            match saved_index {
+                Some((bytes, permissions)) => restore_file(&index, &bytes, permissions)?,
+                None => match fs::remove_file(&index) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
+            let current = local::head(project)?;
+            if current != head {
+                local::run_git(project, &["update-ref", "HEAD", &head, &current])?;
+            }
+            Ok(())
+        })();
+        return match rollback {
+            Ok(()) => Err(failure),
+            Err(error) => {
+                Err(format!("{failure}; Git history rollback needs attention: {error}").into())
+            }
+        };
     }
     Ok(())
+}
+
+// local::stage creates/empties these files even in existing directories. Keep
+// their prior bytes and permissions so a rejected Git hook leaves no artifacts.
+fn keep_files(root: &Path) -> Result<BTreeMap<PathBuf, (Vec<u8>, fs::Permissions)>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == ".git"
+            || name == ".starter"
+            || (name == ".state" && root.ends_with(".starterbase"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if name == ".siliconkeep" {
+            if !kind.is_file() {
+                return Err(format!("{} must be a regular file", path.display()).into());
+            }
+            files.insert(
+                path.clone(),
+                (fs::read(&path)?, entry.metadata()?.permissions()),
+            );
+        } else if kind.is_dir() {
+            files.extend(keep_files(&path)?);
+        }
+    }
+    Ok(files)
+}
+
+fn restore_file(path: &Path, bytes: &[u8], permissions: fs::Permissions) -> Result<()> {
+    let temporary = path.with_extension(format!("restore-{}", local::unique()));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.set_permissions(permissions)?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 pub fn update(project: &Path, archive: &Path, revision: &str, id: &str) -> Result<()> {
@@ -179,17 +294,23 @@ pub fn update(project: &Path, archive: &Path, revision: &str, id: &str) -> Resul
                 .into(),
         );
     }
-    apply(
+    seed::apply_finalized(
         project,
         &source.0.join(".starterbase"),
-        &SeedOptions {
-            defaults: true,
-            ..Default::default()
-        },
+        &Map::new(),
+        &[],
+        false,
         id,
         revision,
+        |_| {
+            commit_history(
+                project,
+                &format!("Update Starter recipe to {revision}"),
+                true,
+            )
+            .map_err(|e| e.to_string())
+        },
     )?;
-    commit(project, &format!("Update Starter recipe to {revision}"))?;
     Ok(())
 }
 

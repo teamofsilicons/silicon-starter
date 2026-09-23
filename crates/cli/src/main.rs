@@ -729,12 +729,15 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
             let Ok(binding) = local::load_binding(&entry.path) else {
                 continue;
             };
+            let auto_update = if templates::exists(&entry.path) {
+                silicon_starter_core::seed::auto_update(&entry.path).unwrap_or(false)
+            } else {
+                binding.auto_update
+            };
             if binding.api != api
                 || binding.mode != Mode::Download
-                || !binding.auto_update
+                || !auto_update
                 || binding.pinned.is_some()
-                || (templates::exists(&entry.path)
-                    && !silicon_starter_core::seed::auto_update(&entry.path).unwrap_or(false))
             {
                 continue;
             }
