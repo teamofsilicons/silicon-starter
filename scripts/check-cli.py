@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
             assert requests[-1] == ("/api/v1/starters/tos.example/archive", "test-session"), requests
         assert not list(nested.iterdir()), list(nested.iterdir())
         binding = json.loads((checkout / ".git/starter.json").read_text())
-        assert binding["id"] == "tos.example" and binding["mode"] == "development" and not binding["auto_update"], binding
+        assert binding["id"] == "tos.example" and binding["mode"] == "download" and binding["auto_update"], binding
         previous_commit = commit
         previous_content = (checkout / "README.md").read_text()
         for content in (

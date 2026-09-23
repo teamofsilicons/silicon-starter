@@ -115,7 +115,27 @@ pub fn head(dir: impl AsRef<Path>) -> Result<String, String> {
     ensure_main(&dir)?;
     run_git(dir, ["rev-parse", "HEAD"].as_ref())
 }
+pub fn ensure_publishable_history(dir: impl AsRef<Path>) -> Result<(), String> {
+    if !run_git(&dir, &["ls-files", "--", ".starterbase/.state"])?.is_empty()
+        || !run_git(
+            &dir,
+            &[
+                "log",
+                "-1",
+                "--format=%H",
+                "main",
+                "--",
+                ".starterbase/.state",
+            ],
+        )?
+        .is_empty()
+    {
+        return Err(".starterbase/.state contains private answers and must not appear in publishable Git history; create a clean starter from the ingredients without instance state".into());
+    }
+    Ok(())
+}
 pub fn bundle(dir: impl AsRef<Path>) -> Result<(PathBuf, String), String> {
+    ensure_publishable_history(&dir)?;
     let commit = head(&dir)?;
     let path = std::env::temp_dir().join(format!(
         "starter-{}-{}.bundle",
@@ -214,15 +234,19 @@ pub fn stage_and_commit(dir: impl AsRef<Path>, message: &str) -> Result<String, 
     if message.trim().is_empty() {
         return Err("commit message must not be empty".into());
     };
-    ensure_main(&dir)?;
-    add_keep_files(dir.as_ref())?;
-    run_git(&dir, ["add", "-A"].as_ref())?;
+    stage(&dir)?;
     let status = run_git(&dir, ["status", "--porcelain"].as_ref())?;
     if status.is_empty() {
         return Err("nothing to commit".into());
     };
     run_git(&dir, ["commit", "-m", message].as_ref())?;
     head(dir)
+}
+pub fn stage(dir: impl AsRef<Path>) -> Result<(), String> {
+    ensure_main(&dir)?;
+    add_keep_files(dir.as_ref())?;
+    run_git(&dir, &["add", "-A"])?;
+    Ok(())
 }
 fn add_keep_files(dir: &Path) -> Result<(), String> {
     let entries: Vec<_> = fs::read_dir(dir)
@@ -232,7 +256,12 @@ fn add_keep_files(dir: &Path) -> Result<(), String> {
     let mut content = false;
     for entry in &entries {
         let name = entry.file_name();
-        if name == ".git" || name == ".starter" || name == ".siliconkeep" || name == ".DS_Store" {
+        if name == ".git"
+            || name == ".starter"
+            || name == ".siliconkeep"
+            || name == ".DS_Store"
+            || (name == ".state" && dir.ends_with(".starterbase"))
+        {
             continue;
         }
         content = true;

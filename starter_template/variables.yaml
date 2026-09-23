@@ -1,0 +1,81 @@
+# Variable catalog: every supported type, not an additional recipe.
+# Copy useful declarations into .starterbase/starter.yaml. This file is neither
+# loaded nor installed. All questions are optional; every variable needs a default.
+# Omit prompt to resolve a variable silently. when, if present, must be an
+# expression returning a boolean; omitting when means the variable is active.
+variables:
+  display_name:
+    type: string
+    prompt: What should this silicon be called?
+    default: Research assistant
+
+  api_token:
+    type: secret
+    prompt: What API token should it use?
+    default: ""
+
+  waveform:
+    type: boolean
+    prompt: Include Waveform for voice messages?
+    default: true
+
+  daily_summary_count:
+    type: number
+    prompt: How many summaries should it prepare each day?
+    default: 1
+
+  speaking_rate:
+    type: float
+    prompt: What speaking rate should it use?
+    default: 1.0
+
+  tts_provider:
+    type: select
+    when: '{var.waveform}'
+    prompt: Which default TTS provider would you like?
+    choices: [google, amazon, azure, ibm, openai]
+    default: google
+    # The main recipe demonstrates command-driven choices with its own script:
+    # choices: ! sh waveform-providers.sh !>> ["google"]
+
+  working_days:
+    type: multiselect
+    prompt: Which days should it prepare summaries?
+    choices: [monday, tuesday, wednesday, thursday, friday, saturday, sunday]
+    default: [monday, tuesday, wednesday, thursday, friday]
+
+  topics:
+    # A free-form JSON list, unlike multiselect's fixed choices.
+    type: list
+    prompt: Which topics should it follow? (JSON array)
+    default: [research, planning]
+
+  preferences:
+    # A free-form JSON object; nested lists and objects are allowed.
+    type: object
+    prompt: What extra preferences should it use? (JSON object)
+    default:
+      tone: concise
+      summaries:
+        enabled: true
+        max_items: 5
+
+  timezone:
+    # No prompt: resolve this command default silently, then save its value.
+    type: string
+    default: ! node -p 'Intl.DateTimeFormat().resolvedOptions().timeZone' !>> "UTC"
+
+  summary_heading:
+    # No prompt: a literal value is resolved and saved in exactly the same way.
+    type: string
+    default: Team summary
+
+  introduction:
+    # No prompt: earlier values are available to the CEL default expression.
+    # Like every default, it is resolved only if no explicit/saved value exists.
+    type: string
+    default: '{var.display_name + " is here to help."} !>> "Here to help."'
+
+# Paths, URLs, email addresses, dates, and multiline text are string values.
+# They do not need separate storage types. Their validation/editor behavior
+# can be specified separately if a starter needs more than plain text input.

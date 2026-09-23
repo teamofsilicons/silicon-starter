@@ -1,10 +1,21 @@
 [package]
 name = "silicon-starter-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Core types, template generation, and local lifecycle for Silicon Starter"
+repository = "https://github.com/teamofsilicons/silicon-starter"
+readme = "../../README.md"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+indexmap = { version = "2", features = ["serde"] }
+cel-interpreter = { version = "0.10", features = ["json"] }
+cel-parser = "0.10"
+minijinja = { version = "=2.24.0", features = ["loader", "json", "fuel", "unstable_machinery"] }
+rpassword = "7"
+
+[dev-dependencies]
+tempfile = "3"

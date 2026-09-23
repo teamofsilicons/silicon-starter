@@ -1,0 +1,40 @@
+{# Jinja renders the file; Stemcell evaluates runtime commands and CEL later. #}
+silicon:
+  id: {{ var.silicon_id | tojson }}
+  token: {{ var.silicon_token | tojson }}
+  timezone: {{ var.timezone | tojson }}
+  SILICON_HOME: ! pwd
+
+  inference_providers:
+    - all-available-providers
+
+  apps:
+    - tos>dm
+    - tos>briefcase
+{% if var.waveform %}
+    - tos>waveform
+
+  app_configs:
+    tos>waveform:
+      default_tts_provider: {{ var.waveform_tts_provider | tojson }}
+{% endif %}
+
+isi:
+  intuit:
+    model: fast
+    primary_send_mode: global
+    session_type: persistent
+    dna:
+      assemble:
+        - prompts/silicon.md
+        - prompts/tools.md
+      next_refresh: 30min
+
+access:
+  intuit: []
+
+# A small Ting batch route. Single-brace CEL survives Jinja unchanged.
+flow:
+  - send:
+      isi: intuit
+      message: '{make_readable(request.tings)}'

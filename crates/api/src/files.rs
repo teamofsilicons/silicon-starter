@@ -20,6 +20,8 @@ pub struct RepositoryFiles {
     pub draft: bool,
     pub truncated: bool,
     pub files: Vec<RepositoryFile>,
+    pub template: Option<serde_json::Value>,
+    pub template_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +48,46 @@ pub fn draft(yaml: String) -> RepositoryFiles {
             content: (!large).then_some(yaml),
             reason: large.then_some("large"),
         }],
+        template: None,
+        template_error: None,
+    }
+}
+
+// Parse author-supplied metadata only. Viewing a starter must never resolve answers or run scripts.
+fn template_preview(files: &[RepositoryFile]) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(file) = files
+        .iter()
+        .find(|file| file.path == ".starterbase/starter.yaml")
+    else {
+        return (None, None);
+    };
+    let Some(content) = &file.content else {
+        return (
+            None,
+            Some(format!(
+                "starter.yaml cannot be read as text ({})",
+                file.reason.unwrap_or("unavailable")
+            )),
+        );
+    };
+    let result = silicon_starter_core::template::parse_recipe(content).and_then(|recipe| {
+        let mut preview = serde_json::to_value(&recipe).map_err(|error| error.to_string())?;
+        let variables = recipe
+            .variables
+            .iter()
+            .map(|(name, variable)| {
+                let mut value =
+                    serde_json::to_value(variable).map_err(|error| error.to_string())?;
+                value["name"] = serde_json::Value::String(name.clone());
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        preview["variables"] = serde_json::Value::Array(variables);
+        Ok(preview)
+    });
+    match result {
+        Ok(preview) => (Some(preview), None),
+        Err(error) => (None, Some(error)),
     }
 }
 
@@ -206,17 +248,71 @@ pub fn read_bundle(bundle: Vec<u8>, commit: String) -> Result<RepositoryFiles, &
             reason,
         });
     }
+    let (template, template_error) = template_preview(&files);
     Ok(RepositoryFiles {
         commit: Some(commit),
         draft: false,
         truncated,
         files,
+        template,
+        template_error,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_preview_preserves_order_and_expressions_without_running_them() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.0.join("must-not-exist");
+        let content = include_str!("../../../starter_template/.starterbase/starter.yaml").replace(
+            "node -p 'Intl.DateTimeFormat().resolvedOptions().timeZone'",
+            &format!("touch '{}'", marker.display()),
+        );
+        let mut files = vec![RepositoryFile {
+            path: ".starterbase/starter.yaml".into(),
+            size: content.len() as u64,
+            kind: "file",
+            content: Some(content),
+            reason: None,
+        }];
+        let (preview, error) = template_preview(&files);
+        assert!(error.is_none(), "{error:?}");
+        let preview = preview.unwrap();
+        let variables = preview["variables"].as_array().unwrap();
+        assert_eq!(
+            variables
+                .iter()
+                .map(|value| value["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "silicon_id",
+                "silicon_token",
+                "timezone",
+                "purpose",
+                "waveform",
+                "waveform_tts_provider"
+            ]
+        );
+        assert!(
+            variables[2]["default"]
+                .as_str()
+                .unwrap()
+                .starts_with("! touch")
+        );
+        assert_eq!(variables[5]["when"], "{var.waveform}");
+        assert_eq!(preview["build"][0], "! sh build.sh");
+        assert!(!marker.exists());
+        files[0].content = Some("schema: invalid".into());
+        let (preview, error) = template_preview(&files);
+        assert!(preview.is_none() && error.is_some());
+        files[0].content = None;
+        files[0].reason = Some("large");
+        assert!(template_preview(&files).1.unwrap().contains("large"));
+        assert_eq!(template_preview(&[]), (None, None));
+    }
 
     #[test]
     fn reads_real_bundle_at_exact_commit_without_checkout() {

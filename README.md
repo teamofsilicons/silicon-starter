@@ -53,6 +53,32 @@ starter revert <commit>
 
 The CLI reads `STARTER_API_URL` (default `https://backend.starter.teamofsilicons.com`) and stores its IAM session, checkout registry, and webhook settings below `SILICON_HOME` (or the operating system's user home) in `.starter`. `starter update on` clears a release pin so a downloaded checkout can resume tracking the latest archive. Set `SPACE_STATION_TELEMETRY=0` to disable optional telemetry.
 
+## Template starters
+
+A starter can optionally include `.starterbase/starter.yaml` and its ingredients. `starter pull` and `starter download` seed a new checkout automatically; starters without `.starterbase` keep their existing behavior.
+
+```sh
+starter pull tos.example --dir my-silicon
+starter download tos.example --dir installed-silicon --defaults
+starter seed                         # reconfigure using saved answers
+starter seed --set waveform=false    # change a typed answer
+starter seed --answers answers.json --defaults
+starter seed --reset timezone --defaults
+starter seed --check                 # validate without running commands
+```
+
+Interactive installs ask for a destination unless `--dir` is supplied. Occupied folders are rejected. Noninteractive runs use saved answers and defaults; `--defaults` also suppresses terminal questions. `--set` accepts JSON values or plain strings. Put secret answers in a private JSON file passed with `--answers` to avoid shell history.
+
+Recipes support typed, conditional questions; CEL and Bash defaults with literal fallbacks; Jinja templates and includes; copied files; and ordered build commands. All preparation runs without terminal input. Build scripts receive `STARTER_SOURCE`, `STARTER_OUTPUT`, `STARTER_PROJECT`, `STARTER_INTERACTIVE`, and active `STARTER_VAR_*` answers. Recipe scripts are trusted local code and require Bash (on Windows, install Git Bash and put `bash` on PATH). Only generated output is managed transactionally; scripts own any external side effects.
+
+Answers and the pure generated baseline live in private, Git-ignored `.starterbase/.state`. Reseeding and downloaded updates merge the old generated baseline, local edits, and newly generated files. Unrelated files remain intact. A failed build or unresolved update conflict leaves the installed revision intact and disables automatic updates; fix the problem and use `starter update on` to resume. Missing state in an existing instance requires recovery or reconciliation.
+
+The recipe's `auto_update` initializes downloads and defaults to `false`. Local settings survive upgrades. Pinned downloads and developer pulls never auto-update. Checkout modes remain fixed: create a separate `--dir` when moving between development and downloaded instances. First developer seeding leaves personal configuration uncommitted; review generated files before committing credentials to any publishable Git history.
+
+`starter push` validates the committed recipe and builds a default preview in a disposable checkout. Only after that succeeds does it add the default-preview commit to the author checkout and upload. Saved personal answers stay local and can be restored with `starter seed`. Commit source changes before pushing. The website's Template tab shows questions, conditions, defaults, build flow, and source ingredients without executing scripts.
+
+See [the working authoring example](starter_template/README.md) and [the variable catalog](starter_template/variables.yaml). Run `python3 scripts/check-template.py target/debug/starter` for the isolated template lifecycle check.
+
 ## Build CLI releases
 
 On macOS with Xcode command-line tools, Rust, Zig, cargo-zigbuild, cargo-xwin, LLVM/lld, Python 3.11+, and Honeycomb on PATH, run `bash scripts/build-cli-release.sh`. It builds all six native targets and writes the four standalone macOS/Linux archives, installer, validated `starter-honeycomb-<version>.tar.gz`, and `SHA256SUMS` to `target/cli-release`. Windows binaries use the static MSVC runtime. The packager reads the version from `crates/cli/Cargo.toml` and includes only the manifest and six binaries.

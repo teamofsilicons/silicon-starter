@@ -18,5 +18,6 @@ for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-mus
 done
 python3 scripts/package-honeycomb.py
 cp install.sh "$output/install.sh"
-(cd "$output" && shasum -a 256 starter-*.tar.gz install.sh > SHA256SUMS)
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/cli/Cargo.toml", "rb"))["package"]["version"])')
+(cd "$output" && shasum -a 256 starter-{aarch64,x86_64}-{apple-darwin,unknown-linux-musl}.tar.gz "starter-honeycomb-$version.tar.gz" install.sh > SHA256SUMS)
 printf 'Release assets: %s\n' "$output"

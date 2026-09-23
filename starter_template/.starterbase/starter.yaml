@@ -1,0 +1,69 @@
+# Starter recipe schema 1. Validate without execution: starter seed --check.
+schema: 1
+name: Classic sample
+description: A small silicon with optional voice support.
+
+# Initial update preference. The installed instance can change this boolean;
+# updates preserve its local value. false still allows explicit updates.
+auto_update: true
+
+# The installer always asks for an available destination folder when creating
+# an instance. Folder name and silicon identity are independent.
+# Every variable is optional to answer and must declare a default. Automatic
+# updates reuse saved answers and resolve defaults for newly added variables.
+# A variable without prompt resolves silently. when is an optional expression
+# returning a boolean; omit it to keep the variable active on every run.
+variables:
+  silicon_id:
+    type: string
+    prompt: What is this silicon's ID?
+    default: ""
+
+  silicon_token:
+    # Masks terminal input; the value is still saved and passed to scripts.
+    type: secret
+    prompt: What is this silicon's token?
+    default: ""
+
+  timezone:
+    type: string
+    # No question: detect the timezone silently, with a literal fallback.
+    default: ! node -p 'Intl.DateTimeFormat().resolvedOptions().timeZone' !>> "UTC"
+
+  purpose:
+    type: string
+    prompt: What should this silicon focus on?
+    default: Help the team research, plan, and finish its work.
+
+  waveform:
+    type: boolean
+    prompt: Include Waveform for voice messages?
+    default: true
+
+  waveform_tts_provider:
+    type: select
+    when: '{var.waveform}'
+    prompt: Which default TTS provider would you like?
+    # Prepare choices only after Waveform is enabled, before asking this question.
+    # The script returns a JSON array; the fallback is a literal list.
+    choices: ! sh waveform-providers.sh !>> ["google"]
+    default: google
+
+# Paths are relative to this recipe. Destinations are relative to the fresh
+# build output folder. .tmpl files use Jinja-style rendering; other files copy
+# unchanged. Only declared outputs and script outputs are installed.
+files:
+  - from: silicon.yaml.tmpl
+    to: silicon.yaml
+  - from: prompts/silicon.md.tmpl
+    to: prompts/silicon.md
+  - from: prompts/tools.md.tmpl
+    to: prompts/tools.md
+
+# Runs after rendering with every active answer, including secrets. Commands can call
+# APIs, write files, and modify the rendered files in place.
+# Write generated files into STARTER_OUTPUT for Starter to track and merge.
+# Terminal input is available when STARTER_INTERACTIVE=true. Automatic updates
+# set STARTER_INTERACTIVE=false; scripts must proceed without asking questions.
+build:
+  - ! sh build.sh

@@ -9,9 +9,12 @@ use silicon_starter_core::{
 };
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command as Process,
 };
+
+mod templates;
 
 #[derive(Parser)]
 #[command(
@@ -55,9 +58,26 @@ enum Command {
     },
     Pull {
         id: Option<String>,
+        /// Destination for a new checkout; must not already be occupied.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[command(flatten)]
+        seed: templates::SeedOptions,
     },
     Download {
         id: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[command(flatten)]
+        seed: templates::SeedOptions,
+    },
+    /// Rebuild .starterbase with saved answers, optionally changing or resetting them.
+    Seed {
+        #[command(flatten)]
+        options: templates::SeedOptions,
+        /// Validate the recipe and templates without executing commands or changing files.
+        #[arg(long)]
+        check: bool,
     },
     Publish {
         selector: Option<String>,
@@ -169,8 +189,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: starter commit \"message\" | starter commit history".into());
         }
         Command::Push { id } => push(&c.api, id.as_deref()).await?,
-        Command::Pull { id } => pull(&c.api, id.as_deref(), false).await?,
-        Command::Download { id } => pull(&c.api, Some(&id), true).await?,
+        Command::Pull { id, dir, seed } => {
+            pull(&c.api, id.as_deref(), false, dir.as_deref(), &seed).await?
+        }
+        Command::Download { id, dir, seed } => {
+            pull(&c.api, Some(&id), true, dir.as_deref(), &seed).await?
+        }
+        Command::Seed { options, check } => templates::seed(&options, check)?,
         Command::Publish {
             selector,
             version,
@@ -279,7 +304,7 @@ fn init() -> Result<(), Box<dyn std::error::Error>> {
         run_git(&["init", "-b", "main"])?;
     }
     if !Path::new(".gitignore").exists() {
-        fs::write(".gitignore", ".starter/\n*.tmp\n")?;
+        fs::write(".gitignore", ".starter/\n.starterbase/.state/\n*.tmp\n")?;
     }
     println!("Initialized Starter repository on main.");
     Ok(())
@@ -376,7 +401,17 @@ async fn login_status(api: &str, j: bool) -> Result<(), Box<dyn std::error::Erro
 }
 async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let root = local::repo_root()?;
-    let mut b = local::load_binding(&root)?;
+    let mut b = match local::load_binding(&root) {
+        Ok(binding) => binding,
+        Err(_) if id.is_some() => Binding {
+            id: id.unwrap().into(),
+            api: api.into(),
+            mode: Mode::Development,
+            auto_update: false,
+            pinned: None,
+        },
+        Err(error) => return Err(error.into()),
+    };
     if b.mode != Mode::Development {
         return Err(
             "downloaded starters are read-only; use `starter pull` for an editable checkout".into(),
@@ -385,6 +420,11 @@ async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Err
     if let Some(i) = id {
         b.id = i.into();
     }
+    if !silicon_starter_core::valid_id(&b.id) {
+        return Err("invalid starter id".into());
+    }
+    local::ensure_publishable_history(&root)?;
+    templates::prepare_push(&root, &b.id)?;
     let yaml = local::validate_checkout(&root)?;
     let (path, commit) = local::bundle(&root)?;
     let body = json!({"commit":commit,"bundle_base64":B64.encode(fs::read(&path)?),"yaml":yaml,"message":"local main"});
@@ -421,74 +461,157 @@ async fn pull(
     api: &str,
     spec: Option<&str>,
     download: bool,
+    destination: Option<&Path>,
+    options: &templates::SeedOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = local::repo_root().unwrap_or_else(|_| PathBuf::from("."));
     let current_binding = local::load_binding(&root).ok();
+    let bound_spec = current_binding.as_ref().map(|binding| {
+        binding
+            .pinned
+            .as_ref()
+            .map_or_else(|| binding.id.clone(), |pin| format!("{}@{pin}", binding.id))
+    });
     let spec = spec
-        .or_else(|| current_binding.as_ref().map(|b| b.id.as_str()))
+        .or(bound_spec.as_deref())
         .ok_or("pull requires a starter id on first use")?;
-    let (id, rf) = spec
+    let (id, reference) = spec
         .split_once('@')
         .map_or((spec, None), |(a, b)| (a, Some(b)));
-    let q = rf.map_or(String::new(), |r| format!("?ref={}", encode(r)));
-    let v = request_value(
+    if !silicon_starter_core::valid_id(id) || reference == Some("") {
+        return Err("invalid starter id or empty version reference".into());
+    }
+    let existing = destination.is_none() && current_binding.as_ref().is_some_and(|b| b.id == id);
+    let target = if existing {
+        root
+    } else if let Some(path) = destination {
+        path.to_path_buf()
+    } else {
+        let default = id.rsplit('.').next().unwrap_or(id);
+        if options.interactive() {
+            print!("Folder name [{default}]: ");
+            io::stdout().flush()?;
+            let mut name = String::new();
+            io::stdin().read_line(&mut name)?;
+            PathBuf::from(if name.trim().is_empty() {
+                default
+            } else {
+                name.trim()
+            })
+        } else {
+            PathBuf::from(default)
+        }
+    };
+    if !existing && target.exists() && fs::read_dir(&target)?.next().is_some() {
+        return Err(format!(
+            "destination {} is occupied; choose another folder with --dir",
+            target.display()
+        )
+        .into());
+    }
+    let query = reference.map_or(String::new(), |r| format!("?ref={}", encode(r)));
+    let archive = request_value(
         api,
-        &format!("/api/v1/starters/{id}/archive{q}"),
+        &format!("/api/v1/starters/{id}/archive{query}"),
         Method::GET,
         None,
     )
     .await?;
-    let b = v
-        .get("bundle_base64")
-        .and_then(Value::as_str)
-        .ok_or("archive response omitted bundle_base64")?;
-    let response_commit = v
+    let temp = templates::Temporary::new("archive.bundle");
+    fs::write(
+        &temp.0,
+        B64.decode(
+            archive
+                .get("bundle_base64")
+                .and_then(Value::as_str)
+                .ok_or("archive response omitted bundle_base64")?,
+        )?,
+    )?;
+    let response_commit = archive
         .get("commit")
         .and_then(Value::as_str)
         .ok_or("archive response omitted commit")?;
-    let temp = std::env::temp_dir().join(format!(
-        "starter-{}-{}.bundle",
-        std::process::id(),
-        local::unique()
-    ));
-    fs::write(&temp, B64.decode(b)?)?;
     let commit = if local::is_hex_commit(response_commit) {
-        response_commit.to_owned()
+        response_commit.into()
     } else {
-        local::bundle_head(&temp)?
+        local::bundle_head(&temp.0)?
     };
-    let target = if current_binding.as_ref().is_some_and(|b| b.id == id) {
-        root
-    } else {
-        PathBuf::from(id.rsplit('.').next().unwrap_or(id))
-    };
-    if local::is_repo(&target) {
-        let target = target
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve Starter checkout: {e}"))?;
-        let mut binding = local::load_binding(&target)
-            .map_err(|_| "target is an existing non-Starter git repository")?;
+    if existing {
+        let target = target.canonicalize()?;
+        let mut binding = local::load_binding(&target)?;
         local::ensure_main(&target)?;
-        if !run_git_dir(&target, ["status", "--porcelain"].as_ref())?.is_empty() {
-            local::stage_and_commit(&target, "Local changes before Starter update")?;
+        if download && binding.mode == Mode::Development {
+            return Err(
+                "this is a developer checkout; use --dir to create a separate, unpushable download"
+                    .into(),
+            );
         }
-        let merged = merge_transaction(&target, &temp);
-        let _ = fs::remove_file(&temp);
-        merged?;
-        binding.mode = if download {
-            Mode::Download
+        let previous = if binding.mode == Mode::Download && templates::exists(&target) {
+            match silicon_starter_core::seed::load_state(&target) {
+                Ok(state) => state.map(|s| s.revision),
+                Err(error) => {
+                    pause_updates(&target, &mut binding)?;
+                    return Err(format!(
+                        "update was not applied; automatic updates are off: {error}"
+                    )
+                    .into());
+                }
+            }
         } else {
-            Mode::Development
+            Some(local::head(&target)?)
         };
-        binding.auto_update = download;
-        binding.pinned = rf.map(str::to_owned);
+        if previous.as_deref() != Some(&commit) {
+            if !run_git_dir(&target, &["status", "--porcelain"])?.is_empty() {
+                if binding.mode == Mode::Development {
+                    return Err(
+                        "commit your source changes before pulling into a developer checkout"
+                            .into(),
+                    );
+                }
+                templates::commit(&target, "Local changes before Starter update")?;
+            }
+            let result = if binding.mode == Mode::Download && templates::exists(&target) {
+                templates::update(&target, &temp.0, &commit, id)
+            } else {
+                merge_transaction(&target, &temp.0).map(|_| ())
+            };
+            if let Err(error) = result {
+                pause_updates(&target, &mut binding)?;
+                return Err(
+                    format!("update was not applied; automatic updates are off: {error}").into(),
+                );
+            }
+        }
+        // Checkout modes are permanent: downloaded history may contain private
+        // instance configuration and must never become pushable.
+        binding.pinned = reference.map(str::to_owned);
+        if binding.pinned.is_some() {
+            binding.auto_update = false;
+        }
         local::save_binding(&target, &binding)?;
         local::register_checkout(&target, &binding)?;
         println!("updated {id} at {commit}");
         return Ok(());
     }
-    local::clone_bundle(&temp, &target, &commit)?;
-    let _ = fs::remove_file(temp);
+    local::clone_bundle(&temp.0, &target, &commit)?;
+    let installed = (|| -> Result<bool, Box<dyn std::error::Error>> {
+        if !templates::exists(&target) {
+            return Ok(download && reference.is_none());
+        }
+        let state = templates::install(&target, options, id, &commit)?;
+        templates::trim_install(&target, &state)?;
+        if download {
+            templates::commit(&target, "Seed Starter instance")?;
+        }
+        Ok(download && reference.is_none() && state.auto_update)
+    })();
+    let auto_update = match installed {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&target);
+            return Err(error);
+        }
+    };
     let binding = Binding {
         id: id.into(),
         api: api.into(),
@@ -497,14 +620,30 @@ async fn pull(
         } else {
             Mode::Development
         },
-        auto_update: download,
-        pinned: rf.map(str::to_owned),
+        auto_update,
+        pinned: reference.map(str::to_owned),
     };
     local::save_binding(&target, &binding)?;
     local::register_checkout(&target, &binding)?;
-    println!("installed {id} at {commit}");
+    println!(
+        "installed {id} at {commit} in {} (automatic updates {})",
+        target.display(),
+        if auto_update { "on" } else { "off" }
+    );
     Ok(())
 }
+
+fn pause_updates(target: &Path, binding: &mut Binding) -> Result<(), Box<dyn std::error::Error>> {
+    binding.auto_update = false;
+    local::save_binding(target, binding)?;
+    local::register_checkout(target, binding)?;
+    if templates::exists(target) {
+        // An invalid recipe may not be editable; the saved binding still pauses it.
+        let _ = silicon_starter_core::seed::set_auto_update(target, false);
+    }
+    Ok(())
+}
+
 async fn publish(
     api: &str,
     sel: &str,
@@ -534,31 +673,50 @@ async fn publish(
     Ok(())
 }
 async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut b = local::load_binding(".")?;
+    let root = local::repo_root()?;
+    let mut binding = local::load_binding(&root)?;
     match mode {
         "on" => {
-            if b.mode == Mode::Development {
+            if binding.mode == Mode::Development {
                 return Err("developer pull checkouts never auto-update".into());
             }
-            b.auto_update = true;
-            b.pinned = None;
+            binding.auto_update = true;
+            binding.pinned = None;
         }
-        "off" => b.auto_update = false,
+        "off" => binding.auto_update = false,
         "now" => {
-            if b.mode == Mode::Development {
+            if binding.mode == Mode::Development {
                 return Err("developer pull checkouts never auto-update".into());
             }
-            if let Some(pin) = &b.pinned {
-                return Err(format!("starter is pinned to {pin}; turn the pin off by downloading the unqualified starter" ).into());
+            if let Some(pin) = &binding.pinned {
+                return Err(format!(
+                    "starter is pinned to {pin}; use `starter update on` to resume latest releases"
+                )
+                .into());
             }
-            return pull(api, Some(&b.id), true).await;
+            return pull(
+                api,
+                Some(&binding.id),
+                true,
+                None,
+                &templates::SeedOptions::unattended(),
+            )
+            .await;
         }
         _ => return Err("update expects on, off, or now".into()),
     }
-    local::save_binding(".", &b)?;
-    println!("auto-update {}", if b.auto_update { "on" } else { "off" });
+    if templates::exists(&root) {
+        silicon_starter_core::seed::set_auto_update(&root, binding.auto_update)?;
+    }
+    local::save_binding(&root, &binding)?;
+    local::register_checkout(&root, &binding)?;
+    println!(
+        "auto-update {}",
+        if binding.auto_update { "on" } else { "off" }
+    );
     Ok(())
 }
+
 async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let file = local::registry_path();
@@ -568,10 +726,15 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
             .unwrap_or_default();
         let mut active = 0;
         for entry in entries {
-            if entry.binding.api != api
-                || entry.binding.mode != Mode::Download
-                || !entry.binding.auto_update
-                || entry.binding.pinned.is_some()
+            let Ok(binding) = local::load_binding(&entry.path) else {
+                continue;
+            };
+            if binding.api != api
+                || binding.mode != Mode::Download
+                || !binding.auto_update
+                || binding.pinned.is_some()
+                || (templates::exists(&entry.path)
+                    && !silicon_starter_core::seed::auto_update(&entry.path).unwrap_or(false))
             {
                 continue;
             }
@@ -580,6 +743,7 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
                 Process::new(exe)
                     .current_dir(&entry.path)
                     .args(["--api", api, "update", "now"])
+                    .stdin(std::process::Stdio::null())
                     .status()
             });
             match result {

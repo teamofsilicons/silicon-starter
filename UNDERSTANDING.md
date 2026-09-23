@@ -121,6 +121,30 @@ app name: tos>starter (make an app if not already, iam cli is installed and logg
 
 for other iam apps like briefcase that you rely upon, get its scopes in⠄as well.
 
+# templates
+starters are essentially templates that can be seeded into functioning silicons.
+for this inside .starterbase/ folder is used to store all the things, raw materials, scripts and state.
+this is idempotent. and outputs the final silicon in the parent dir where silicon.yaml will be living.
+.starterbase/starter.yaml has all the configurations needed along with variables.
+
+everything needed to build this is inside ./starter_template/
+
+this should be run on its own when ran `starter pull ...` for the first time.
+or when ran `starter seed` should rerun this.
+
+if there is a merge conflict during auto updates that can not be resolved on it own, then dont merge that and turn off auto updates.
+
+when pushing the starter, do a compilation check to see if there are any problems with .starterbase
+
+btw, .starterbase is not required
+it may not even exist, and in that case it should just use whatever there is. this is for starters that want to give a configuration.
+
+when uploading, run the seed once with all the defaults. this is what carbons & silicons will see and judge when they land on the starter. this also fulfills the req. that there should be a silicon.yaml when pushing.
+
+on the website we should also show all the questions it has, flow of it. and .starterbase for anyone who wants to see what all can they do in this starter.
+
+
+
 # testing
 IAM supports making a testing env so starter can be passed a app secret at times which means its in testing.
 

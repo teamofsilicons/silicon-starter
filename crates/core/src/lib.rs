@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 pub mod local;
+pub mod seed;
+pub mod template;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Starter {
