@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 def migrate(snapshot, mapping, scope_key):
@@ -66,12 +67,53 @@ def migrate(snapshot, mapping, scope_key):
     return result, changed
 
 
-def psql(sql):
-    env = os.environ.copy()
+def connection_env(source):
+    env = source.copy()
     database = env.get("STARTER_DATABASE_URL") or env.get("DATABASE_URL") or env.get("PGDATABASE")
     if not database:
         raise ValueError("set STARTER_DATABASE_URL, DATABASE_URL, or PGDATABASE explicitly")
-    env["PGDATABASE"] = database
+    if "://" not in database:
+        if env.get("STARTER_DATABASE_URL") or env.get("DATABASE_URL") or "=" in database:
+            raise ValueError("database URL must use postgresql:// or postgres://")
+        return env
+    options = {
+        "host": "PGHOST", "hostaddr": "PGHOSTADDR", "port": "PGPORT", "dbname": "PGDATABASE",
+        "user": "PGUSER", "password": "PGPASSWORD", "sslmode": "PGSSLMODE",
+        "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY", "sslrootcert": "PGSSLROOTCERT",
+        "sslcrl": "PGSSLCRL", "sslcrldir": "PGSSLCRLDIR", "channel_binding": "PGCHANNELBINDING",
+        "connect_timeout": "PGCONNECT_TIMEOUT", "client_encoding": "PGCLIENTENCODING",
+        "options": "PGOPTIONS", "application_name": "PGAPPNAME",
+        "target_session_attrs": "PGTARGETSESSIONATTRS",
+    }
+    try:
+        if re.search(r"%(?![0-9a-fA-F]{2})|[\x00-\x1f\x7f]", database):
+            raise ValueError()
+        url = urlsplit(database)
+        query = parse_qsl(url.query.replace("+", "%2B"), keep_blank_values=True, strict_parsing=True, errors="strict")
+        if url.scheme not in ("postgres", "postgresql") or url.fragment:
+            raise ValueError()
+        if len(dict(query)) != len(query) or any(key not in options for key, _ in query):
+            raise ValueError()
+        env.pop("PGSERVICE", None)
+        env.pop("PGHOSTADDR", None)
+        env.update(PGHOST=unquote(url.hostname or "", errors="strict"), PGPORT=str(url.port if url.port is not None else 5432),
+                   PGDATABASE=unquote(url.path.removeprefix("/"), errors="strict"))
+        if url.username is not None:
+            env["PGUSER"] = unquote(url.username, errors="strict")
+        if url.password is not None:
+            env["PGPASSWORD"] = unquote(url.password, errors="strict")
+        env.update((options[key], value) for key, value in query)
+        if not (env.get("PGHOST") or env.get("PGHOSTADDR")) or not env.get("PGDATABASE"):
+            raise ValueError()
+        if any("\0" in value for value in env.values()):
+            raise ValueError()
+    except ValueError:
+        raise ValueError("invalid PostgreSQL URL, missing host/database, or unsupported query option") from None
+    return env
+
+
+def psql(sql):
+    env = connection_env(os.environ)
     result = subprocess.run(
         ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-qAt", "--no-password"],
         input="SET standard_conforming_strings = on;\n" + sql,

@@ -9,10 +9,27 @@ from pathlib import Path
 import runpy
 import subprocess
 import tempfile
+from urllib.parse import quote
 
 script = Path(__file__).with_name("migrate-identifiers.py").resolve()
 module = runpy.run_path(str(script))
 migrate = module["migrate"]
+connection_env = module["connection_env"]
+connection = connection_env({"STARTER_DATABASE_URL": "postgresql://user:p%40ss%3Aword@[::1]:5433/db%20name?sslmode=require&connect_timeout=9", "PGHOSTADDR": "wrong", "PGSERVICE": "wrong"})
+assert connection["PGHOST"] == "::1" and connection["PGPORT"] == "5433"
+assert connection["PGUSER"] == "user" and connection["PGPASSWORD"] == "p@ss:word"
+assert connection["PGDATABASE"] == "db name" and connection["PGSSLMODE"] == "require"
+assert connection["PGCONNECT_TIMEOUT"] == "9" and "PGHOSTADDR" not in connection and "PGSERVICE" not in connection
+assert connection_env({"PGDATABASE": "postgres", "PGHOST": "/tmp"}) == {"PGDATABASE": "postgres", "PGHOST": "/tmp"}
+assert connection_env({"DATABASE_URL": "postgresql://host/db?password=a+b%26c"})["PGPASSWORD"] == "a+b&c"
+assert connection_env({"DATABASE_URL": "postgresql://host:0/db"})["PGPORT"] == "0"
+for invalid in ("mysql://user:secret@host/db", "postgresql://user:secret@host/db?unsupported=yes", "postgresql://user:secret@host/db?sslmode=require&sslmode=disable", "postgresql://user:secret@host:bad/db", "postgresql:///db", "postgresql://user:%FF@host/db", "postgresql://user:secret%ZZ@host/db"):
+    try:
+        connection_env({"DATABASE_URL": invalid})
+    except ValueError as error:
+        assert "secret" not in str(error) and invalid not in str(error)
+    else:
+        raise AssertionError("invalid PostgreSQL URL accepted")
 mapping = {
     "scope_key": "production",
     "actors": [
@@ -109,6 +126,7 @@ if args.postgres_bin:
             mapfile = root / "map.json"
             mapfile.write_text(json.dumps(mapping))
             command = ("python3", str(script), "--scope-key", "production", "--map", str(mapfile))
+            env["STARTER_DATABASE_URL"] = f"postgresql:///postgres?host={quote(str(root), safe='')}&port=5432"
             assert "Preview: 2" in run(*command)
             before = sql("SELECT payload::text FROM starter_state WHERE id=1;")
             assert json.loads(before, parse_float=Decimal) == json.loads(original, parse_float=Decimal)
