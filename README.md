@@ -2,6 +2,8 @@
 
 A CLI-first registry for versioned silicon architectures. The repository ships a Rust API/CLI and a SolidJS web client.
 
+The reusable Rust library, [silicon-starter-core](https://crates.io/crates/silicon-starter-core), is licensed under [Apache-2.0](crates/core/LICENSE).
+
 ## Install
 
 Install on macOS (Apple Silicon or Intel) or Linux (ARM64 or x86_64):
