@@ -21,6 +21,16 @@ Keep the exact accepted archive for retries; a release version is immutable. Inc
 
 Existing release archives keep their original bytes, manifest IDs, versions, and checksums. Honeycomb's migrated catalog supplies the exact verified legacy manifest alias for those releases; do not repack an old version merely to replace `tos>starter`. Migrate existing local `installed.json` registries with Honeycomb's mapping tool and the approved IAM mapping while maintenance workers are stopped; retain package paths and command wrappers.
 
+## Identifier release 0.2.2 (24 September 2026 IST)
+
+[GitHub v0.2.2](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.2.2) is published from source commit `a0e4402ad0b6a4cc9f3c953577c633ebad648fdf`. The six-platform Honeycomb archive is 20,768,539 bytes, SHA-256 `fae2024770d29f3fef9b75e13de033943c27b214a928b68c7a2e26e40927797c`; accepted release ID `c2407fbb-d8fb-4073-9870-9b6fe61005c5` on `prod`.
+
+The API identifier cutover is live in release directory `/opt/starter/releases/57d0c3509be89dea` on the existing Starter host. Its binary SHA-256 is `d278f85dfda67c33560111b72ab8f4b56b215be714a9fcaa77ea140a175f25e0`. The private backup at `/var/lib/starter/backups/identifier-cutover/20260923T202652Z` contains the full PostgreSQL dump, exact old environment/auth store, snapshot, and evidence. The database contained one repository and no discussions; its snapshot hash remained `dbd6244f892dda82ee10cf764169845a4bc57953e929773a3d6f2bc8b3f52d49`. Existing credentials and repository bytes were preserved; fresh Carbon login and organization-denial checks passed.
+
+Vercel's project root is now `frontend`, so main-branch pushes deploy the website correctly. The production site serves the canonical login flow.
+
+Honeycomb configuration revision 3 / IAM revision 27 corrects the API base URL to `https://backend.starter.teamofsilicons.com` and requests public visibility, preserving stored secrets and approved scopes. Public publication request `01fa936f-b2ff-476a-97a6-4a7e204b701a` awaits the sole Honeycomb validator gate; the current account cannot decide that gate. Until an authorized validator approves it in the [Honeycomb Console](https://console.honeycomb.teamofsilicons.com), Honeycomb distribution remains private; GitHub downloads are public. Do not describe this request as approved based on the historical 0.2.1 review below.
+
 ## Historical registration recovery
 
 This records the pre-cutover recovery under `tos>starter`; operation IDs, revisions, paths, and receipts below are historical evidence, not current configuration claims.
