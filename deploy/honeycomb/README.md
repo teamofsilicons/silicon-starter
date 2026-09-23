@@ -32,9 +32,9 @@ The complete configuration, including the existing deployed webhook signing secr
 
 ## Release status
 
-Version `0.2.0` is publicly available on the `prod` channel. It adds `.starterbase` recipes, `starter seed`, typed questions, generated-file merges, default publication previews, and private instance state. Failed template updates disable automatic updates; downloaded histories remain unpushable.
+Version `0.2.1` is publicly available on the `prod` channel. The 0.2 release adds `.starterbase` recipes, `starter seed`, typed questions, generated-file merges, default publication previews, and private instance state. The patch makes local recipe update preferences authoritative and rolls back generated updates when their Git history commit fails. Failed template updates disable automatic updates; downloaded histories remain unpushable.
 
-The six-platform archive is 20,562,932 bytes with SHA-256 `f5bb055963db9de2d733ed67dea50620e3194764cd952f19aeadd2444e7129f5`. Honeycomb release ID: `c3112648-0c2a-498d-9d23-c83b8ecb3cec`. GitHub release: [v0.2.0](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.2.0).
+The six-platform archive is 20,768,494 bytes with SHA-256 `5c8854b12f211bd977bdefc712779c0c52c09358fe245faf737e9d5c4d48db62`. Honeycomb release ID: `318ff11a-7ca9-42e8-aaec-15ceeb164f60`. GitHub release: [v0.2.1](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.2.1).
 
 Public review `04dcce57-78fc-44ba-b481-4c1adf98b723` completed for configuration revision 2. The application is active and public; subsequent release uploads under this accepted revision publish directly.
 
