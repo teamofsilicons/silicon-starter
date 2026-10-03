@@ -860,3 +860,70 @@ async fn popup_callback_returns_status_only_and_fullpage_uses_stored_safe_return
     }
     assert!(crate::auth_routes::validated_return(Some("/starters?q=hello#top")).is_ok());
 }
+
+#[tokio::test]
+async fn anonymous_boot_expires_obsolete_browser_cookie_without_weakening_context_fencing() {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let app = crate::router(crate::AppState::default());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/session")
+                .header("cookie", "starter_session=stale-before-iam5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let expired = response.headers()["set-cookie"].to_str().unwrap();
+    assert!(expired.starts_with("starter_session=;"));
+    assert!(expired.contains("Max-Age=0"));
+    assert!(expired.contains("Path=/"));
+    let status: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, json!({"authenticated":false}));
+    // The browser applies the expiration before its anonymous catalog request.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/starters")
+                .header("x-starter-context", "anonymous")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    for cookie in [None, Some("starter_session=stale-before-iam5")] {
+        let mut request = Request::builder()
+            .uri("/api/v1/starters")
+            .header("x-starter-context", "old-account-context");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/auth/cli/status")
+                .header("x-starter-session", "stale-cli-session")
+                .header("cookie", "starter_session=browser-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("set-cookie"));
+}

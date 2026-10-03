@@ -360,6 +360,14 @@ pub(super) async fn auth_cli_status(headers: HeaderMap, State(s): State<AppState
 }
 pub(super) async fn auth_session(headers: HeaderMap, State(s): State<AppState>) -> Response {
     match s.auth.status(session_id(&headers).as_deref()).await {
+        Ok(status)
+            if status["authenticated"] == false
+                && !headers.contains_key("x-starter-session")
+                && cookie_value(&headers, "starter_session").is_some() =>
+        {
+            // Anonymous boot must also remove the obsolete browser credential.
+            (session_cookies(""), Json(status)).into_response()
+        }
         Ok(status) => Json(status).into_response(),
         Err(e) => unavailable(e).into_response(),
     }
