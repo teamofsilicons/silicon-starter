@@ -14,6 +14,9 @@ let chrome;
 let socket;
 let listed = false;
 let authenticated = false;
+let selectedContext = 'test-context';
+const contexts = [{context_id:'test-context',org_id:'test',actor:{type:'carbon',public_id:'c:test_member',name:'Test member'}},{context_id:'other-context',org_id:'other',actor:{type:'carbon',public_id:'c:test_member',name:'Test member'}}];
+const selected = () => contexts.find(c=>c.context_id===selectedContext);
 let registryError = false;
 let created;
 const requests = [];
@@ -58,7 +61,12 @@ const server = createServer(async (request, response) => {
     const path = new URL(request.url, 'http://localhost').pathname;
     requests.push(path);
     const json = (data, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(data)); };
-    if (path === '/auth/session') return json(authenticated ? { authenticated: true, org_id: 'test', org_ids: ['test', 'other'], actor: { name: 'Test member' } } : { authenticated: false });
+    if (path === '/auth/session') return json(authenticated ? {authenticated:true,...selected(),org_ids:[selected().org_id]} : {authenticated:false});
+    if(path === '/auth/contexts') return json({contexts:contexts.map(c=>({...c,selected:c.context_id===selectedContext}))});
+    if(path === '/auth/context') {
+      assert.equal(request.headers['x-starter-context'],selectedContext);
+      let body=''; for await(const chunk of request) body+=chunk; selectedContext=JSON.parse(body).context_id; return json({});
+    }
     if (path === '/auth/callback' && request.method === 'POST') {
       let body = ''; for await (const chunk of request) body += chunk;
       callbacks.push(JSON.parse(body)); authenticated = true; return json({ authenticated: true });
@@ -115,8 +123,9 @@ const waitFor = async expression => {
 const browser = async (...args) => {
   const [command, ...rest] = args;
   if (command === 'open') {
+    const previous = await execute('performance.timeOrigin');
     await send('Page.navigate', { url: rest[0] });
-    return waitFor(`location.href === ${JSON.stringify(rest[0])} && document.readyState === 'complete' && !!document.querySelector('.app')`);
+    return waitFor(`performance.timeOrigin !== ${previous} && location.href === ${JSON.stringify(rest[0])} && document.readyState === 'complete' && !!document.querySelector('.app')`);
   }
   if (command === 'eval') return execute(rest[0]);
   if (command === 'wait') {
@@ -135,7 +144,7 @@ const browser = async (...args) => {
 };
 const evaluate = async code => browser('eval', `(() => { ${code} })()`);
 const check = async (condition, label) => evaluate(`if (!(${condition})) throw new Error(${JSON.stringify(label)}); return ${JSON.stringify(label)};`);
-const open = async path => { await browser('open', origin + path); await browser('wait', '--fn', '!document.body.innerText.includes("Loading starter") && !document.body.innerText.includes("Reading repository") && !document.body.innerText.includes("Reading template") && !document.body.innerText.includes("Checking session")'); };
+const open = async path => { await browser('open', origin + path); await browser('wait', '--fn', '!!document.querySelector(".app") && !document.body.innerText.includes("Loading starter") && !document.body.innerText.includes("Reading repository") && !document.body.innerText.includes("Reading template") && !document.body.innerText.includes("Checking session")'); };
 const click = async selector => { await evaluate(`document.querySelector(${JSON.stringify(selector)}).click();`); };
 
 try {
@@ -177,7 +186,7 @@ try {
   await click('.file-view header button');
   await browser('wait', '--text', 'File copied.');
   assert.equal(await execute('navigator.clipboard.readText()'), files[1].content);
-  await browser('open', origin + '/starters/test.repo/blob/src/main.rs');
+  await open('/starters/test.repo/blob/src/main.rs');
   await check('document.querySelector(".source-code").textContent.includes("println!")', 'File deep link reload');
   await click('.repository-tabs a[href$="/releases"]');
   await check('document.querySelector(".repository-tabs a[aria-current=page]").textContent.includes("Releases") && document.querySelector(".release")', 'Releases tab');
@@ -260,8 +269,11 @@ try {
   await check('location.search === "" && location.hash === "" && !document.querySelector(".account-name")', 'Rejected login clears the fragment and does not fall back to an existing session');
   authenticated = true;
   await open('/new');
-  await check('document.querySelectorAll(".create-form select:first-of-type option").length >= 2 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');
-  await evaluate('document.querySelector(".create-form select").value = "other"; document.querySelector(".create-form select").dispatchEvent(new Event("change", {bubbles:true}));');
+  await check('document.querySelectorAll(".create-form select")[0].options.length === 1 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');
+  await evaluate('document.querySelector(".account-controls select").value = "other-context"; document.querySelector(".account-controls select").dispatchEvent(new Event("change", {bubbles:true}));');
+  await browser('wait','--url',origin+'/');
+  await open('/new');
+  await check('document.querySelector(".create-form select").value === "other"', 'Saved context selects an independent organization login');
   await browser('fill', '.starter-id-field input', 'new');
   await browser('fill', '.create-form > label:nth-of-type(3) input', 'New starter');
   await browser('fill', '.create-form textarea', 'silicon:\n  id: si:new\n  org_id: other\n');

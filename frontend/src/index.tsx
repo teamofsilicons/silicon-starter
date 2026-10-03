@@ -2,27 +2,20 @@ import { render } from 'solid-js/web';
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
 import type { JSX } from 'solid-js';
 import './styles.css';
+import { StoragePermissions } from './permissions';
+import { createApi, sessionOf, contextsOf, type Session, type SavedContext } from './api';
 
 type Starter = { id: string; name: string; description: string; owner: string; visibility: 'public' | 'private'; version: string; downloads: number; stars: number; updated_at: string; tags: string[]; yaml: string };
 type Version = { version: string; commit: string; notes: string; published_at: string };
 type Discussion = { id: string; parent_id?: string; author: string; body: string; created_at: string };
-type Session = { authenticated: boolean; org_id?: string | null; org_ids?: string[]; actor?: { name?: string; display_name?: string; id?: string } | string | null };
 type RepoFile = { path: string; content: string | null; size?: number; reason?: string };
 type Recipe = { schema: number; name?: string; description?: string; auto_update: boolean; variables: { name: string; type: string; prompt?: string; default: unknown; when?: string; choices?: unknown }[]; files: { from: string; to: string }[]; build: string[] };
 type Repository = { commit: string | null; files: RepoFile[]; draft?: boolean; truncated?: boolean; template?: Recipe | null; template_error?: string | null };
 type Route = { page: string; id: string; tab: string; path: string };
 const API = (import.meta as ImportMeta & { env: { VITE_API_URL?: string } }).env.VITE_API_URL || '';
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-  const response = await fetch(`${API}${path}`, { credentials: 'include', ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } });
-  if (!response.ok) {
-    const body = await response.text();
-    let detail = body;
-    try { detail = JSON.parse(body).error || body; } catch { /* A proxy may return plain text. */ }
-    throw new Error(detail || `Request failed (${response.status})`);
-  }
-  return response.json();
-};
+const client = createApi(API);
+const api = client.request;
 const repoUrl = (id: string, tab = 'code', path = '') => `/starters/${encodeURIComponent(id)}${tab === 'code' ? '' : `/${tab}`}${path ? `/${path.split('/').map(encodeURIComponent).join('/')}` : ''}`;
 const parseRoute = (): Route => {
   try {
@@ -246,7 +239,7 @@ function Explore(props: { session: Session; search: string }) {
 
 function CreateStarter(props: { session: Session; login: () => void; navigate: (path: string) => void }) {
   const [id, setId] = createSignal('');
-  const organizations = () => props.session.org_ids?.length ? props.session.org_ids : props.session.org_id ? [props.session.org_id] : [];
+  const organizations = () => props.session.org_id ? [props.session.org_id] : [];
   const [organization, setOrganization] = createSignal(props.session.org_id || organizations()[0] || '');
   const [name, setName] = createSignal('');
   const [description, setDescription] = createSignal('');
@@ -273,12 +266,14 @@ function App() {
   const [session, setSession] = createSignal<Session>({ authenticated: false });
   const [authLoading, setAuthLoading] = createSignal(true);
   const [authError, setAuthError] = createSignal('');
+  const [contexts, setContexts] = createSignal<SavedContext[]>([]);
+  const [switching, setSwitching] = createSignal(false);
   const updateLocation = () => { setRoute(parseRoute()); setSearch(location.search); };
   const navigate = (path: string) => { history.pushState({}, '', path); updateLocation(); window.scrollTo(0, 0); };
   const login = () => { location.href = `${API}/auth/login?return_to=${encodeURIComponent(location.href)}`; };
   const accountName = () => {
     const actor = session().actor;
-    return typeof actor === 'string' ? actor : actor?.display_name || actor?.name || (session().authenticated ? 'Signed in' : 'Guest');
+    return actor?.display_name || actor?.name || actor?.public_id || (session().authenticated ? 'Signed in' : 'Guest');
   };
   onMount(() => {
     const click = (event: MouseEvent) => {
@@ -310,14 +305,30 @@ function App() {
           if (!slt) throw new Error('No login token for starter; log in again with IAM.');
           await api('/auth/callback', { method: 'POST', body: JSON.stringify({ slt, state }) });
         }
-        setSession(await api<Session>('/auth/session'));
+        const selected = sessionOf(await api<Session>('/auth/session'));
+        client.establish(selected); setSession(selected);
+        if (selected.authenticated) {
+          try { setContexts(contextsOf(await api('/auth/contexts'))); }
+          catch (error) { setAuthError(message(error)); }
+        }
       } catch (error) { setAuthError(`Could not verify your session. ${message(error)}`); }
       finally { setAuthLoading(false); }
     })();
   });
-  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<button class="button" onClick={login}>Log in</button>}><span class="account-name" title={session().org_id || undefined}>{accountName()}</span></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
+  const selectContext = async (id: string) => {
+    if (!id || id === session().context_id || switching()) return;
+    setSwitching(true); setAuthError('');
+    try { await api('/auth/context', { method: 'POST', body: JSON.stringify({context_id: id}) }); location.assign('/'); }
+    catch (error) { setAuthError(message(error)); setSwitching(false); }
+  };
+  const logout = async () => {
+    setSwitching(true); setAuthError('');
+    try { await api('/auth/logout', {method:'POST'}); location.assign('/'); }
+    catch (error) { setAuthError(message(error)); setSwitching(false); }
+  };
+  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<button class="button" onClick={login}>Log in</button>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><button class="button" onClick={login}>Add account</button><button class="button" disabled={switching()} onClick={logout}>Sign out</button></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
     <Show when={authError()}><div class="page-width"><ErrorMessage error={authError()} /></div></Show>
-    <main><Show when={route().page === 'starters' && route().id} fallback={<Show when={route().page === 'explore'} fallback={<Show when={route().page === 'docs'} fallback={<Show when={route().page === 'new'} fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Show>}><Docs /></Show>}><Explore session={session()} search={search()} /></Show>}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Show></main>
+    <main><Show when={!authLoading()} fallback={<div class="page-width loading">Checking session…</div>}><Show when={route().page !== 'permissions'} fallback={<StoragePermissions session={session()} api={api} apiBase={API} login={login} />}><Show when={route().page === 'starters' && route().id} fallback={<Show when={route().page === 'explore'} fallback={<Show when={route().page === 'docs'} fallback={<Show when={route().page === 'new'} fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Show>}><Docs /></Show>}><Explore session={session()} search={search()} /></Show>}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Show></Show></Show></main>
     <footer class="site-footer"><span>✦ Silicon Starter</span><a href="/docs">Documentation</a><a href="https://github.com/teamofsilicons/silicon-starter">GitHub ↗</a></footer>
   </div>;
 }

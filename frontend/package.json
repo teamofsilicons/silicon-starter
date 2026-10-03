@@ -1,1 +1,21 @@
-{"name":"starter-web","private":true,"version":"0.1.0","type":"module","scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"solid-js":"^1.9.5"},"devDependencies":{"vite":"^6.1.0","typescript":"^5.7.2","vite-plugin-solid":"^2.11.8"}}
+{
+  "name": "starter-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/*.test.mjs"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.5"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0",
+    "typescript": "^5.7.2",
+    "vite-plugin-solid": "^2.11.8"
+  }
+}
