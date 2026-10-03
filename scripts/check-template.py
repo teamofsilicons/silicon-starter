@@ -16,7 +16,7 @@ sample = Path(__file__).resolve().parents[1] / "starter_template"
 with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
     root = Path(directory)
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(HOME=str(root), SILICON_HOME=str(root), GIT_CONFIG_NOSYSTEM="1")
+    env.update(HOME=str(root), SILICON_HOME=str(root), GIT_CONFIG_NOSYSTEM="1", STARTER_NO_DAEMON="1")
     env.pop("STARTER_API_URL", None)
     env["TZ"] = "UTC"
 
@@ -27,6 +27,9 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
 
     def git(*args, cwd):
         return run("git", "-c", "user.name=Test", "-c", "user.email=test@localhost", *args, cwd=cwd)
+
+    def enabled(path):
+        return any(Path(entry["path"]) == path.resolve() for entry in json.loads((root / ".starter/registry.json").read_text()))
 
     author = root / "author"
     shutil.copytree(sample, author)
@@ -92,7 +95,9 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         assert not (instance / "README.md").exists() and not (instance / "variables.yaml").exists()
         assert (instance / "workspace/.siliconkeep").is_file()
         assert not (instance / ".starterbase/.state/generated/workspace/.siliconkeep").exists()
-        assert json.loads((instance / ".git/starter.json").read_text())["auto_update"] is True
+        assert enabled(instance)
+        assert "auto_update" not in json.loads((instance / ".git/starter.json").read_text())
+        assert "auto_update" not in state
         first = (instance / "silicon.yaml").read_bytes()
         run(*command, "seed", "--defaults", cwd=instance)
         assert (instance / "silicon.yaml").read_bytes() == first
@@ -100,9 +105,10 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         assert "    - waveform\n" in (instance / "silicon.yaml").read_text()
         assert "    waveform:\n" in (instance / "silicon.yaml").read_text()
         assert "google" in (instance / "silicon.yaml").read_text()
+        (root / ".starter/session").write_text("test-session")
         run(*command, "pull", "tos.sample", "--dir", "dev", "--defaults", "--set", "silicon_token=PRIVATE_INSTANCE_TOKEN")
         development = json.loads((root / "dev/.git/starter.json").read_text())
-        assert development["mode"] == "development" and development["auto_update"] is False
+        assert development["mode"] == "development" and not enabled(root / "dev")
         assert "PRIVATE_INSTANCE_TOKEN" not in git("show", "HEAD:silicon.yaml", cwd=root / "dev")
         run(*command, "download", "tos.sample", "--defaults", cwd=root / "dev", ok=False)
         run(*command, "pull", cwd=instance)
@@ -111,7 +117,7 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         occupied = run(*command, "pull", "tos.sample", "--dir", "dev", "--defaults", ok=False)
         assert "occupied" in occupied
         run(*command, "download", "tos.sample@1.0", "--dir", "pinned", "--defaults")
-        assert json.loads((root / "pinned/.git/starter.json").read_text())["auto_update"] is False
+        assert not enabled(root / "pinned")
         run(*command, "push", cwd=instance, ok=False)
 
         # An independent local edit survives an upstream template edit.
@@ -129,8 +135,13 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         run(*command, "daemon", "--once")
         assert json.loads(state_file.read_text())["revision"] != commit
         recipe = instance / ".starterbase/starter.yaml"
-        assert "auto_update: false" in recipe.read_text()
-        recipe.write_text(recipe.read_text().replace("auto_update: false", "auto_update: true"))
+        assert "auto_update" not in recipe.read_text()
+        # A legacy key no longer overrides the central to-update list.
+        recipe.write_text(recipe.read_text() + "\nauto_update: true\n")
+        run(*command, "daemon", "--once")
+        assert json.loads(state_file.read_text())["revision"] != commit
+        assert not enabled(instance)
+        run(*command, "update", "on", cwd=instance)
 
         # Git history is part of the update: a failed commit must roll back too.
         git("add", "-A", cwd=instance)
@@ -155,8 +166,8 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         assert (instance / "prompts/silicon.md").read_bytes() == old_prompt
         assert not (instance / "new-output").exists()
         hook.unlink()
-        # Editing the recipe must work even while the older binding flag is off.
-        recipe.write_text(recipe.read_text().replace("auto_update: false", "auto_update: true"))
+        assert not enabled(instance)
+        run(*command, "update", "on", cwd=instance)
         assert not git("status", "--porcelain", cwd=instance).strip()
         run(*command, "daemon", "--once")
         assert tools.read_text().startswith("Local team guidance.")
@@ -191,7 +202,7 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         error = run(*command, "update", "now", cwd=instance, ok=False)
         assert "automatic updates are off" in error, error
         assert (prompt.read_bytes(), state_file.read_bytes()) == before
-        assert not json.loads((instance / ".git/starter.json").read_text())["auto_update"]
+        assert not enabled(instance)
         assert not git("ls-files", "-u", cwd=instance).strip()
         run(*command, "daemon", "--once")
 
@@ -219,4 +230,4 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
         server.shutdown()
         server.server_close()
         worker.join()
-print("Template checks passed: compile, seed, install, saved answers, pins, developer isolation, generated merge, commit/conflict rollback, update history, recipe toggle, pause, default push preview.")
+print("Template checks passed: compile, seed, install, saved answers, pins, developer isolation, generated merge, commit/conflict rollback, update history, central update preferences, pause, default push preview.")

@@ -1,6 +1,6 @@
 [package]
 name = "silicon-starter-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Core types, template generation, and local lifecycle for Silicon Starter"
@@ -12,6 +12,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 indexmap = { version = "2", features = ["serde"] }
 cel-interpreter = { version = "0.10", features = ["json"] }
 cel-parser = "0.10"

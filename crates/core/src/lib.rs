@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+pub mod blocks;
 pub mod local;
 pub mod seed;
 pub mod template;
@@ -64,11 +65,22 @@ pub struct CreateDiscussion {
 }
 
 pub fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
+    id.len() <= 128
+        && id.split_once('.').is_some_and(|(org, name)| {
+            !org.is_empty()
+                && org
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                && valid_slug(name)
+        })
+}
+
+pub fn valid_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Parse the public `Y.X` release notation and return numeric components.
@@ -127,7 +139,20 @@ mod tests {
     fn validates_contract() {
         assert!(validate_silicon_yaml(SEED_YAML).is_ok());
         assert!(valid_id("tos.hello-world"));
-        assert!(!valid_id("../secret"));
+        assert!(valid_id("org_1.starter-2"));
+        for invalid in [
+            "../secret",
+            "hello",
+            "tos.",
+            ".hello",
+            "tos.hello.world",
+            "tos.Hello",
+            "tos.hello_world",
+            "tos.héllo",
+        ] {
+            assert!(!valid_id(invalid), "accepted {invalid}");
+        }
+        assert!(!valid_id(&format!("tos.{}", "a".repeat(125))));
         assert!(local::is_hex_commit(&"a".repeat(40)));
         assert!(!local::is_hex_commit("main"));
         assert_eq!(release_version("2.7"), Ok((2, 7)));

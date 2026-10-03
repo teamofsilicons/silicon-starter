@@ -16,9 +16,14 @@ let listed = false;
 let authenticated = false;
 let registryError = false;
 let created;
+let blocksListed = false;
+let blocksError = false;
+const publishedBlocks = [];
+const blockRequests = [];
 const requests = [];
 const callbacks = [];
 const starter = { id: 'test.repo', name: 'Example architecture', owner: 'test', description: 'An organization-published architecture with real repository files.', visibility: 'public', version: '1.2', downloads: 12, stars: 3, updated_at: new Date().toISOString(), tags: ['rust', 'agents'], yaml: 'silicon:\n  id: si:example\n  org_id: test\n' };
+const blocks = ['gene:creativity', 'isi:worker', 'function:format'].map(id => ({ id, kind: id.split(':')[0], name: id, description: `Reusable ${id}`, owner: 'test', visibility: 'public', version: 'a'.repeat(64), downloads: 2, updated_at: starter.updated_at }));
 const files = [
   { path: 'README.md', content: '# Example architecture\n\nBuild an organization-owned silicon.\n\n## Getting started\n\n- [Source](src/main.rs)\n- [Unsafe link](javascript:alert(1))\n\n```sh\nstarter pull test.repo\n```\n' },
   { path: 'src/main.rs', content: 'fn main() {\n    println!("hello");\n}\n' },
@@ -31,7 +36,7 @@ const files = [
   { path: 'empty.txt', content: '', size: 0 },
 ];
 const recipe = {
-  schema: 1, name: 'Configurable silicon', description: 'Choose how your silicon works.', auto_update: true,
+  schema: 1, name: 'Configurable silicon', description: 'Choose how your silicon works.',
   variables: [
     { name: 'silicon_token', type: 'secret', prompt: 'What is your token?', default: '' },
     { name: 'timezone', type: 'string', default: '! node timezone.js !>> "UTC"' },
@@ -55,7 +60,8 @@ const recipeFiles = [
 ];
 const server = createServer(async (request, response) => {
   try {
-    const path = new URL(request.url, 'http://localhost').pathname;
+    const url = new URL(request.url, 'http://localhost');
+    const path = url.pathname;
     requests.push(path);
     const json = (data, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(data)); };
     if (path === '/auth/session') return json(authenticated ? { authenticated: true, org_id: 'test', org_ids: ['test', 'other'], actor: { name: 'Test member' } } : { authenticated: false });
@@ -68,6 +74,37 @@ const server = createServer(async (request, response) => {
       created = JSON.parse(body); return json({ ...starter, ...created, owner: created.org_id }, 201);
     }
     if (path === '/api/v1/starters') return registryError ? json({ error: 'Mock registry unavailable' }, 503) : json(listed ? [starter] : []);
+    if (path === '/api/v1/search') {
+      blockRequests.push(request.url);
+      return registryError || blocksError ? json({ error: 'Mock registry unavailable' }, 503) : json([...(listed ? [starter] : []), ...(blocksListed ? blocks : [])]);
+    }
+    if (path === '/api/v1/blocks' && request.method === 'POST') {
+      let body = ''; for await (const chunk of request) body += chunk;
+      const published = JSON.parse(body); publishedBlocks.push(published);
+      const item = { ...blocks[0], ...published, kind: published.id.split(':')[0], owner: published.org_id, version: 'c'.repeat(64) };
+      const index = blocks.findIndex(block => block.id === item.id);
+      if (index < 0) blocks.push(item); else blocks[index] = item;
+      return json(item, 201);
+    }
+    if (path === '/api/v1/blocks') {
+      blockRequests.push(request.url);
+      return blocksError ? json({ error: 'Block search unavailable' }, 503) : json(blocksListed ? blocks : []);
+    }
+    const blockRoute = /^\/api\/v1\/blocks\/([^/]+)(?:\/(.+))?$/.exec(path);
+    if (blockRoute) {
+      blockRequests.push(request.url);
+      const [, encodedId, endpoint] = blockRoute;
+      const id = decodeURIComponent(encodedId);
+      const item = blocks.find(block => block.id === id);
+      if (!item) return json({ error: 'Block not found' }, 404);
+      if (!endpoint) return json(item);
+      if (endpoint === 'versions') return json([{ version: item.version, published_at: item.updated_at }, { version: 'b'.repeat(64), published_at: item.updated_at }]);
+      if (endpoint === 'content' || endpoint === 'download') {
+        const version = url.searchParams.get('version') === 'b'.repeat(64) ? 'b'.repeat(64) : item.version;
+        return json({ id, kind: item.kind, version, ...(item.kind === 'gene' ? { text: version === 'b'.repeat(64) ? '# Earlier creativity\n\nOld version.' : item.text || '# Creativity\n\nExplore new approaches.\n\n[Unsafe](javascript:alert(1))\n<img src=x onerror="window.geneExecuted=true">' } : { archive_base64: Buffer.from('zip fixture').toString('base64') }) });
+      }
+      return json({ error: 'Unmocked block API call' }, 400);
+    }
     const route = /^\/api\/v1\/starters\/([^/]+)(?:\/(.+))?$/.exec(path);
     if (route) {
       const [, id, endpoint] = route;
@@ -135,7 +172,7 @@ const browser = async (...args) => {
 };
 const evaluate = async code => browser('eval', `(() => { ${code} })()`);
 const check = async (condition, label) => evaluate(`if (!(${condition})) throw new Error(${JSON.stringify(label)}); return ${JSON.stringify(label)};`);
-const open = async path => { await browser('open', origin + path); await browser('wait', '--fn', '!document.body.innerText.includes("Loading starter") && !document.body.innerText.includes("Reading repository") && !document.body.innerText.includes("Reading template") && !document.body.innerText.includes("Checking session")'); };
+const open = async path => { await browser('open', origin + path); await browser('wait', '--fn', '!document.body.innerText.includes("Loading starter") && !document.body.innerText.includes("Loading block") && !document.body.innerText.includes("Loading gene") && !document.body.innerText.includes("Reading repository") && !document.body.innerText.includes("Reading template") && !document.body.innerText.includes("Checking session")'); };
 const click = async selector => { await evaluate(`document.querySelector(${JSON.stringify(selector)}).click();`); };
 
 try {
@@ -204,7 +241,7 @@ try {
   await open('/starters/test.template/template');
   await check('document.querySelector(".repository-tabs a[aria-current=page]").textContent === "Template"', 'Template deep link selects the template tab');
   assert.deepEqual(await execute('[...document.querySelectorAll(".template-question")].map(item => item.dataset.variable)'), recipe.variables.map(variable => variable.name));
-  await check('document.querySelectorAll(".template-flow > li").length === 5 && document.querySelector(".template-intro").textContent.includes("enabled")', 'Ordered setup and build flow');
+  await check('document.querySelectorAll(".template-flow > li").length === 5 && document.querySelector(".template-intro").textContent.includes("Downloads auto-update by default") && !document.querySelector(".template-intro").textContent.includes("Initial automatic updates")', 'Ordered setup and build flow uses download update policy');
   await check('document.querySelector("[data-variable=timezone]").textContent.includes("resolves silently") && document.querySelector("[data-variable=timezone]").textContent.includes("! node timezone.js")', 'Silent dynamic default is visible as source');
   await check('document.querySelector("[data-variable=provider]").textContent.includes("{var.waveform}") && document.querySelector("[data-variable=provider]").textContent.includes("! sh providers.sh")', 'Conditions and prepared choices remain visible');
   await check('document.querySelector("[data-variable=silicon_token]").textContent.includes("Input is masked") && document.querySelector("[data-variable=tasks]").textContent.includes("planning") && document.querySelector("[data-variable=style]").textContent.includes("concise")', 'Secret and structured answer types');
@@ -249,6 +286,39 @@ try {
   await check('document.querySelector("[role=alert]").textContent.includes("registry could not be loaded") && !document.querySelector(".starter-card")', 'Registry failure shows no fabricated fallback');
   await open('/new');
   await check('document.body.innerText.includes("Log in with an organization") && !document.querySelector(".create-form")', 'Guest cannot create');
+  await open('/blocks/new');
+  await check('document.body.innerText.includes("Log in with an organization") && !document.querySelector(".block-form")', 'Guest cannot publish blocks');
+  registryError = false;
+  await open('/blocks');
+  await check('document.body.innerText.includes("No matching blocks")', 'Empty block catalog');
+  blocksListed = true;
+  await open('/?q=creativity');
+  await browser('wait', '--text', 'gene:creativity');
+  assert(blockRequests.some(path => path.includes('/api/v1/search?q=creativity')), 'Main registry uses semantic search for starters and blocks');
+  await check('document.querySelector("select[aria-label]").value === "relevance"', 'Search preserves semantic ranking by default');
+  await open('/blocks');
+  await check('document.querySelectorAll(".starter-card").length === 3', 'All block types are browsable');
+  await click('.registry-filters button:nth-child(2)');
+  await check('document.querySelectorAll(".starter-card").length === 1 && document.querySelector(".starter-card").textContent.includes("gene:creativity")', 'Gene filter');
+  await click('.starter-card-heading a');
+  await browser('wait', '--fn', '!!document.querySelector(".markdown h1")');
+  await check('document.querySelector(".markdown h1").textContent === "Creativity" && !document.querySelector(".markdown img,a[href^=javascript]") && !window.geneExecuted', 'Gene renders safe Markdown');
+  await evaluate(`document.querySelector('#block-version').value = '${'b'.repeat(64)}'; document.querySelector('#block-version').dispatchEvent(new Event('change', {bubbles:true}));`);
+  await browser('wait', '--text', 'Earlier creativity');
+  await check(`document.querySelector('.block-command').textContent.includes('gene:creativity@${'b'.repeat(64)}')`, 'Version-specific CLI command');
+  await click('.block-toolbar button');
+  await browser('wait', '--fn', '!document.querySelector(".block-toolbar button").disabled');
+  assert(blockRequests.some(path => path.includes(`/download?version=${'b'.repeat(64)}`)), 'Download uses the chosen version hash');
+  await browser('screenshot', '/tmp/starter-gene-mobile.png');
+  await check('document.documentElement.scrollWidth <= innerWidth', 'Block detail has no mobile overflow');
+  await open('/blocks/function%3Aformat');
+  await check('document.body.innerText.includes("function.yaml") && document.querySelector(".block-toolbar button").textContent.includes("ZIP")', 'Function archive details');
+  await open('/blocks/gene%3Amissing');
+  await check('document.querySelector("[role=alert]").textContent.includes("Block not found")', 'Missing block error');
+  blocksError = true;
+  await open('/blocks');
+  await check('document.querySelector("[role=alert]").textContent.includes("Block search unavailable")', 'Block search failure offers retry');
+  blocksError = false;
   const slt = 'oac_starter:opaque+value/=';
   const entries = [{ app_id: 'tos>starter', slt: 'oac_legacy' }, { app_id: 'iam', slt: 'oac_other' }, { app_id: 'starter', slt }];
   await send('Page.navigate', { url: `${origin}/?state=opaque-state#slts=${encodeURIComponent(JSON.stringify(entries))}` });
@@ -262,6 +332,10 @@ try {
   await open('/new');
   await check('document.querySelectorAll(".create-form select:first-of-type option").length >= 2 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');
   await evaluate('document.querySelector(".create-form select").value = "other"; document.querySelector(".create-form select").dispatchEvent(new Event("change", {bubbles:true}));');
+  for (const invalid of ['New', 'new.name', 'new_name']) {
+    await browser('fill', '.starter-id-field input', invalid);
+    await check('!document.querySelector(".starter-id-field input").checkValidity()', `Starter ID rejects ${invalid}`);
+  }
   await browser('fill', '.starter-id-field input', 'new');
   await browser('fill', '.create-form > label:nth-of-type(3) input', 'New starter');
   await browser('fill', '.create-form textarea', 'silicon:\n  id: si:new\n  org_id: other\n');
@@ -269,7 +343,34 @@ try {
   await browser('wait', '--url', '**/starters/other.new');
   assert.equal(created.org_id, 'other');
   assert.equal(created.id, 'other.new');
-  console.log('PASS: Code default, root/tree/file links, reload, Back/Forward, all tabs, template order/types/conditions/flow/source links/safe rendering, encoded paths, binary/empty/draft/error states, mobile, View code, empty registry, canonical IAM app selection, legacy login rejection, verified org creation.');
+  await open('/blocks/gene%3Acreativity/edit');
+  await check('document.querySelector(".block-form textarea").value.startsWith("# Creativity") && document.querySelector(".starter-id-field input").disabled && document.querySelector(".block-form > label:nth-of-type(6) select").disabled', 'Gene editing preserves identity and visibility');
+  await browser('fill', '.block-form textarea', '# Updated creativity\n\nConsider alternatives.');
+  await click('.block-form button[type=submit], .block-form .primary');
+  await browser('wait', '--url', '**/blocks/gene%3Acreativity');
+  await browser('wait', '--text', 'Updated creativity');
+  assert.equal(publishedBlocks[0].id, 'gene:creativity');
+  assert.equal(publishedBlocks[0].text, '# Updated creativity\n\nConsider alternatives.');
+  assert.equal(publishedBlocks[0].org_id, 'test');
+  await open('/blocks/new');
+  await browser('fill', '.starter-id-field input', 'new-gene');
+  await browser('fill', '.block-form textarea', '# New gene');
+  await click('.block-form .primary');
+  await browser('wait', '--url', '**/blocks/gene%3Anew-gene');
+  assert.equal(publishedBlocks[1].text, '# New gene');
+  for (const kind of ['isi', 'function']) {
+    await open('/blocks/new');
+    await evaluate(`const input = document.querySelector('.block-form > label:nth-of-type(2) select'); input.value = '${kind}'; input.dispatchEvent(new Event('change', {bubbles:true}));`);
+    await browser('fill', '.starter-id-field input', `new-${kind}`);
+    await evaluate('const transfer = new DataTransfer(); transfer.items.add(new File(["zip fixture"], "block.zip", {type:"application/zip"})); const input = document.querySelector("input[type=file]"); input.files = transfer.files; input.dispatchEvent(new Event("change", {bubbles:true}));');
+    await check('!document.querySelector(".block-form textarea") && document.querySelector("input[type=file]")', `${kind} uses archive upload`);
+    await click('.block-form .primary');
+    await browser('wait', '--url', `**/blocks/${kind}%3Anew-${kind}`);
+    assert.equal(publishedBlocks.at(-1).id, `${kind}:new-${kind}`);
+    assert.equal(publishedBlocks.at(-1).archive_base64, Buffer.from('zip fixture').toString('base64'));
+    assert(!('text' in publishedBlocks.at(-1)), 'ZIP uploads omit gene text');
+  }
+  console.log('PASS: Repository browsing and history, template flow and download update policy, safe previews, error states, mobile layout, IAM login, starter ID validation, semantic block search, block type filters, versioned downloads, gene editing/publishing, ISI/function ZIP upload.');
   console.log('Screenshots: /tmp/starter-code-desktop.png and /tmp/starter-code-mobile.png');
 } finally {
   socket?.close();

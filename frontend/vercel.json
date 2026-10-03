@@ -17,6 +17,10 @@
       "destination": "/index.html"
     },
     {
+      "source": "/blocks/:path*",
+      "destination": "/index.html"
+    },
+    {
       "source": "/new",
       "destination": "/index.html"
     },

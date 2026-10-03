@@ -92,6 +92,9 @@ Web is a subset of all possible things and primarily caters to carbons.
 
 # all auth should happen via IAM. on both CLI and web.
 
+# starterid can not have a . in it
+# starterid is always lowercase with - allowed
+
 # updates
 all auto updates (via download) are not pushable (even if carbon/silicon has permissions). maintain a local version history before merging & updating. each update becomes a local commit.
 
@@ -99,11 +102,14 @@ even if local has changes, attempt to update it. commit before updating. & invok
 
 this is not codebase that will fail upon merge, and no one is looking at merges that closely. each download is more like an app on the phone. people will mostly just download and use it. updates are like updates to the app.
 
-NEVER AUTO UPDATE dev starts. i.e. ones that are pulled, and allows pushes.
+NEVER AUTO UPDATE dev starters. i.e. ones that are pulled, and allows pushes.
 
 # pull vs download
 downloads are auto-updated. downloads should not be pushable.
 pull are never auto-updated. they are pushable.
+
+dont let a user pull if they are not authenticated.
+download can happen with any starter. if its public, then no authentication is needed, and if not then authentication checks if the user has the correct permissions.
 
 # git
 all git operations are run locally on the device that is downloading/pulling the starter. no diff, merge etc happens on briefcase. Briefcase is just for storage.
@@ -143,6 +149,42 @@ when uploading, run the seed once with all the defaults. this is what carbons & 
 
 on the website we should also show all the questions it has, flow of it. and .starterbase for anyone who wants to see what all can they do in this starter.
 
+
+
+# Updates
+By default, all starters are set to auto update.
+When a starter is downloaded, its location is stored inside ~/.starter and checked for updates once an hour and an auto update is attempted. if a starter is not found at the location it should be in, it is removed from the list of to-update.
+
+this to-update list is what tells what to update. a auto_update key is not inside any starter itself.
+
+when a starter is downloaded with a specific version, or specifically marked as not to be auto updated, remove it from this list.
+
+
+# Genes, ISI & Functions.
+Along with starters, people can also publish raw blocks of code that is interpretted by the silicon interpretter.
+
+these include genes (prompts that go inside the DNA)
+ISI (internal silicons with all defaults that are overwrittable)
+Functions (that can be called inside other functions, or flow to simplify work, supports parameter)
+
+If not already, once starter has these functions, it uses the starter itself to get the values for these blocks and plugs it into the codebase during runtime.
+
+Genes are simple .md files. version controlled md files. no need to have proper git integration for it.
+ISIs are YAML (isi.yaml) + other files. with the isi block and the name of the isi and its defaults. the name of the isi in the yaml and the id of the isi saved must be the same.
+Fuctions are similar to ISIs, a yaml (function.yaml) with functions: block and a set of other supporting files if needed. the yaml is needed.
+
+each isi and function must contain one and only one isi and function.
+neither are needed to be given proper git support. just accept a zip file and maintain a content hash as version. when downloaded, by default it always downloads the latest one unless specified otherwise.
+
+there should be a way to download a specific version. say gene@versionhash or function@versionhash
+
+append the id of each gene with "gene:". so, a published gene for creativity will be gene:creativity
+functions are appended with function:
+and isi with isi:
+
+gene are simple files, allow people to write gene on the website itself, or silicon can directly submit text. and let them choose the id of their isi.
+
+embed these as well and surface them in searches.
 
 
 # testing

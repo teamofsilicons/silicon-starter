@@ -17,10 +17,11 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 mod auth;
+mod blocks;
 mod briefcase;
 mod files;
 mod semantic;
@@ -29,6 +30,9 @@ mod telemetry;
 
 #[derive(Clone, Default)]
 pub struct AppState {
+    pub blocks: Arc<RwLock<HashMap<String, blocks::StoredBlock>>>,
+    pub block_publish_lock: Arc<Mutex<()>>,
+    pub persist_lock: Arc<Mutex<()>>,
     pub starters: Arc<RwLock<HashMap<String, Starter>>>,
     pub versions: Arc<RwLock<HashMap<String, Vec<Version>>>>,
     pub discussions: Arc<RwLock<HashMap<String, Vec<Discussion>>>>,
@@ -84,6 +88,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/organizations", get(organizations))
         .route("/api/v1/starters", get(list).post(create))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/blocks", get(blocks::list).post(blocks::publish))
+        .route("/api/v1/blocks/{id}", get(blocks::show))
+        .route("/api/v1/blocks/{id}/versions", get(blocks::versions))
+        .route("/api/v1/blocks/{id}/content", get(blocks::content))
+        .route("/api/v1/blocks/{id}/download", get(blocks::download))
+        .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
         .route("/api/v1/starters/{id}", get(show))
         .route("/api/v1/starters/{id}/versions", get(versions))
         .route("/api/v1/starters/{id}/star", post(star))
@@ -130,8 +140,18 @@ pub fn router(state: AppState) -> Router {
         )
 }
 async fn persist_state(s: &AppState) {
-    let Some(store) = &s.store else { return };
+    if let Err(e) = save_state(s).await {
+        eprintln!("starter state persistence failed: {e}");
+    }
+}
+async fn save_state(s: &AppState) -> Result<(), String> {
+    let _snapshot = s.persist_lock.lock().await;
+    save_state_unlocked(s).await
+}
+async fn save_state_unlocked(s: &AppState) -> Result<(), String> {
+    let Some(store) = &s.store else { return Ok(()) };
     let value = json!({
+        "blocks": *s.blocks.read().await,
         "starters": *s.starters.read().await,
         "versions": *s.versions.read().await,
         "discussions": *s.discussions.read().await,
@@ -140,9 +160,10 @@ async fn persist_state(s: &AppState) {
         "iam_event_ids": *s.iam_event_ids.read().await,
         "briefcase_entries": *s.briefcase_entries.read().await,
     });
-    if let Err(e) = store.save(value).await {
-        eprintln!("starter state persistence failed: {e}");
-    }
+    store
+        .save(value)
+        .await
+        .map_err(|_| "starter state persistence failed".into())
 }
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status":"ok","service":"silicon-starter","api_version":"v1"}))
@@ -208,34 +229,68 @@ async fn search(
     State(s): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
-) -> Json<Vec<Starter>> {
-    let Json(mut items) = list(
-        State(s),
-        headers,
+) -> Json<Vec<serde_json::Value>> {
+    // Build the authorized candidate set before ranking; semantic matches need not contain the query.
+    let Json(starters) = list(
+        State(s.clone()),
+        headers.clone(),
         Query(ListQuery {
-            q: q.q.clone(),
+            q: None,
             org: None,
             visibility: None,
         }),
     )
     .await;
-    let Some(query) = q.q else { return Json(items) };
-    if std::env::var_os("GEMINI_API_KEY").is_none() || query.trim().is_empty() {
-        return Json(items);
+    let mut items: Vec<_> = starters
+        .into_iter()
+        .map(|item| {
+            let text = format!(
+                "{} {} {} {} {}",
+                item.id,
+                item.name,
+                item.description,
+                item.tags.join(" "),
+                item.yaml
+            );
+            (json!(item), text, None)
+        })
+        .collect();
+    items.extend(blocks::search_items(&s, &headers).await);
+    let query = q.q.unwrap_or_default();
+    let term = query.trim().to_lowercase();
+    if term.is_empty() {
+        return Json(items.into_iter().map(|(item, _, _)| item).collect());
     }
-    let Ok(query_embedding) = semantic::embed(&query, true).await else {
-        return Json(items);
+    let query_embedding = if std::env::var_os("GEMINI_API_KEY").is_some() {
+        semantic::embed(&query, true).await.ok()
+    } else {
+        None
     };
-    let mut scored = Vec::with_capacity(items.len());
-    for item in items.drain(..) {
-        let text = format!("{} {} {}", item.name, item.description, item.yaml);
-        if let Ok(embedding) = semantic::embed(&text, false).await {
-            scored.push((semantic::cosine(&query_embedding, &embedding), item));
+    let mut scored = Vec::new();
+    for (item, text, cached) in items {
+        let lexical = text.to_lowercase().contains(&term);
+        let score = if let Some(query_embedding) = &query_embedding {
+            let embedding = match cached {
+                Some(embedding) => Some(embedding),
+                None => semantic::embed(&text, false).await.ok(),
+            };
+            embedding.map(|embedding| semantic::cosine(query_embedding, &embedding))
+        } else {
+            None
+        };
+        if let Some(score) = score {
+            scored.push((score, item));
+        } else if lexical {
+            scored.push((0.0, item));
         }
     }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1["id"].as_str().cmp(&b.1["id"].as_str()))
+    });
     Json(scored.into_iter().map(|(_, item)| item).collect())
 }
+
 async fn show(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -397,6 +452,15 @@ async fn archive(
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if matches!(
+        headers.get("x-starter-mode").and_then(|v| v.to_str().ok()),
+        Some("pull" | "dev")
+    ) || q
+        .get("mode")
+        .is_some_and(|mode| mode == "pull" || mode == "dev")
+    {
+        authenticated_session(&s, &headers).await?;
+    }
     let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
     let mut starters = s.starters.write().await;
     let starter = starters.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
@@ -426,7 +490,7 @@ async fn archive(
             .cloned()
             .unwrap_or_default()
     };
-    if commit.is_empty() {
+    if !silicon_starter_core::local::is_hex_commit(&commit) {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(json!({
@@ -927,6 +991,9 @@ async fn restore_state(
     payload: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let object = payload.as_object().ok_or("invalid starter snapshot")?;
+    if let Some(value) = object.get("blocks") {
+        *s.blocks.write().await = serde_json::from_value(value.clone())?;
+    }
     if let Some(value) = object.get("starters") {
         *s.starters.write().await = serde_json::from_value(value.clone())?;
     }
@@ -1019,7 +1086,7 @@ mod auth_and_organization_tests {
         }
     }
 
-    async fn session(s: &AppState, orgs: &[&str]) -> HeaderMap {
+    pub(super) async fn session(s: &AppState, orgs: &[&str]) -> HeaderMap {
         let id = s
             .auth
             .insert(auth::IamTokens {
@@ -1051,6 +1118,90 @@ mod auth_and_organization_tests {
     }
 
     #[tokio::test]
+    async fn public_pulls_require_a_valid_session_but_downloads_do_not() {
+        let s = AppState::default();
+        let owner = session(&s, &["tos"]).await;
+        let _ = create(
+            State(s.clone()),
+            owner.clone(),
+            Json(CreateStarter {
+                visibility: Visibility::Public,
+                ..input("tos.public")
+            }),
+        )
+        .await
+        .unwrap();
+        s.bundles
+            .write()
+            .await
+            .insert("tos.public".into(), b"bundle".to_vec());
+        s.bundle_commits
+            .write()
+            .await
+            .insert("tos.public".into(), "a".repeat(40));
+        for mode in ["pull", "dev"] {
+            let q = HashMap::from([("mode".into(), mode.into())]);
+            assert_eq!(
+                archive(
+                    State(s.clone()),
+                    HeaderMap::new(),
+                    Path("tos.public".into()),
+                    Query(q.clone())
+                )
+                .await
+                .unwrap_err(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(
+                archive(
+                    State(s.clone()),
+                    owner.clone(),
+                    Path("tos.public".into()),
+                    Query(q)
+                )
+                .await
+                .is_ok()
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-starter-mode", mode.parse().unwrap());
+            assert_eq!(
+                archive(
+                    State(s.clone()),
+                    headers,
+                    Path("tos.public".into()),
+                    Query(HashMap::new())
+                )
+                .await
+                .unwrap_err(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for reference in ["9.9", "abcde", ""] {
+            assert_eq!(
+                archive(
+                    State(s.clone()),
+                    HeaderMap::new(),
+                    Path("tos.public".into()),
+                    Query(HashMap::from([("ref".into(), reference.into())]))
+                )
+                .await
+                .unwrap_err(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(
+            archive(
+                State(s),
+                HeaderMap::new(),
+                Path("tos.public".into()),
+                Query(HashMap::new())
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn organization_creation_and_private_access_are_enforced() {
         let s = AppState::default();
         assert!(s.starters.read().await.is_empty());
@@ -1078,6 +1229,15 @@ mod auth_and_organization_tests {
             StatusCode::FORBIDDEN
         );
         let owner = session(&s, &["tos"]).await;
+        for id in ["tos.Upper", "tos.under_score", "tos.extra.dot"] {
+            assert_eq!(
+                create(State(s.clone()), owner.clone(), Json(input(id)))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
         assert_eq!(
             create(State(s.clone()), owner.clone(), Json(input("lab.example")))
                 .await

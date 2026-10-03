@@ -47,13 +47,15 @@ The API loads saved starters from `STARTER_DATABASE_URL` (or `DATABASE_URL`). Wi
 ```sh
 starter download org.starter       # install with hourly updates
 starter download org.starter@2.1   # install and pin a published release
-starter pull org.starter            # editable checkout; never auto-updated
+starter pull org.starter            # requires login; editable, never auto-updated
 starter pull                        # update the current checkout using its saved starter id
 starter update on|off|now
 starter publish latest 2.1 --notes "release notes"
 starter publish history
 starter revert <commit>
 ```
+
+Starter IDs use `org.starter-name`: the starter name contains only lowercase ASCII letters, digits, and hyphens, with no additional dots. Pulls require a valid IAM session. Public downloads work anonymously; private downloads require membership in the owning organization.
 
 The CLI reads `STARTER_API_URL` (default `https://backend.starter.teamofsilicons.com`) and stores its IAM session, checkout registry, and webhook settings below `SILICON_HOME` (or the operating system's user home) in `.starter`. `starter update on` clears a release pin so a downloaded checkout can resume tracking the latest archive. Set `SPACE_STATION_TELEMETRY=0` to disable optional telemetry.
 
@@ -77,11 +79,56 @@ Recipes support typed, conditional questions; CEL and Bash defaults with literal
 
 Answers and the pure generated baseline live in private, Git-ignored `.starterbase/.state`. Reseeding and downloaded updates merge the old generated baseline, local edits, and newly generated files. Unrelated files remain intact. A failed build, failed history commit, or unresolved update conflict leaves the installed revision intact and disables automatic updates; fix the problem and use `starter update on` to resume. Each downloaded update gets a local history commit, including revisions with unchanged generated output. Missing state in an existing instance requires recovery or reconciliation.
 
-The recipe's `auto_update` initializes downloads and defaults to `false`. Local settings survive upgrades. Pinned downloads and developer pulls never auto-update. Checkout modes remain fixed: create a separate `--dir` when moving between development and downloaded instances. First developer seeding leaves personal configuration uncommitted; review generated files before committing credentials to any publishable Git history.
+Unpinned downloads enable automatic updates by default. Only the to-update list in `~/.starter/registry.json` controls eligibility; recipes and generated state do not contain an `auto_update` setting. Enabled downloads and `starter update on` start a single background daemon, which checks this list hourly and removes missing checkouts. `starter update off` removes a checkout, and `starter update on` adds it back. After a reboot, run `starter daemon`, download a starter, or use `starter update on` to resume the worker. Pinned downloads and developer pulls stay out of the list. Checkout modes remain fixed: create a separate `--dir` when moving between development and downloaded instances. First developer seeding leaves personal configuration uncommitted; review generated files before committing credentials to any publishable Git history.
 
 `starter push` validates the committed recipe and builds a default preview in a disposable checkout. Only after that succeeds does it add the default-preview commit to the author checkout and upload. Saved personal answers stay local and can be restored with `starter seed`. Commit source changes before pushing. The website's Template tab shows questions, conditions, defaults, build flow, and source ingredients without executing scripts.
 
 See [the working authoring example](starter_template/README.md) and [the variable catalog](starter_template/variables.yaml). Run `python3 scripts/check-template.py target/debug/starter` for the isolated template lifecycle check.
+
+## Genes, ISIs, and functions
+
+Blocks use IDs such as `gene:creativity`, `isi:researcher`, and `function:greet`.
+Publish them through the CLI or the website with an IAM session and an authorized
+organization. Genes accept Markdown text; ISIs and functions accept ZIP files
+with supporting files and a required root `isi.yaml` or `function.yaml`.
+
+```sh
+starter publish gene:creativity creativity.md --org tos
+starter publish gene:creativity --text "Explore several approaches before choosing." --org tos
+starter publish isi:researcher researcher.zip --org tos
+starter publish function:greet greet.zip --org tos
+starter download gene:creativity --dir creativity
+starter download gene:creativity@<sha256> --dir creativity-pinned
+starter history gene:creativity
+starter search creativity
+```
+
+An ISI archive defines exactly one ISI whose name matches its ID:
+
+```yaml
+isi:
+  researcher:
+    model: fast
+    dna:
+      assemble: [prompts/research.md]
+```
+
+A function archive defines exactly one function, including its parameters:
+
+```yaml
+functions:
+  greet:
+    params: [name]
+    do: []
+```
+
+Each publication has a SHA-256 version derived from its payload. Downloading
+without a version returns the latest publication; `@<sha256>` retrieves an exact
+version. An ID retains its owner and visibility across versions. Blocks have no Git checkout or automatic update registration. Public
+blocks are readable anonymously; private blocks require owning-organization
+access. Search includes block content and semantic ranking when Gemini is
+configured. Downloaded supporting files remain alongside their YAML for use by
+the interpreter.
 
 ## Build CLI releases
 

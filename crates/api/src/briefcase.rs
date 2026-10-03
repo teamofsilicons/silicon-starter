@@ -57,8 +57,12 @@ impl BriefcaseStorage {
         starter: &str,
         version: &str,
     ) -> Result<String, String> {
+        self.ensure_path(&["starters", org, starter, version]).await
+    }
+
+    pub async fn ensure_path(&self, components: &[&str]) -> Result<String, String> {
         let mut parent = "public".to_string();
-        for name in ["starters", org, starter, version] {
+        for name in components {
             let body = json!({
                 "operation_id": Uuid::now_v7(),
                 "parent_path": parent,

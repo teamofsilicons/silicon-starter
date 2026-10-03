@@ -124,22 +124,14 @@ files. Starter retains the ingredients for reruns. Runtime DNA should use the ex
 
 ## Automatic updates
 
-The creator sets a top-level boolean in `starter.yaml`, separate from questions:
+Unpinned downloads enable automatic updates by default. Starter records their
+locations in `~/.starter/registry.json` and checks for updates hourly, removing
+locations that no longer exist. Recipes do not contain an update preference.
 
-```yaml
-auto_update: true
-```
-
-`true` enables unattended builds and merges when the updater finds a new
-published revision. `false` disables those automatic actions; explicit updates
-and reconfiguration remain available. If omitted, it defaults to `false`.
-
-The creator's value initializes a downloaded instance. Developer pulls never
-auto-update, regardless of this recipe preference. After installation, the local
-`.starterbase/starter.yaml` controls that instance. An upgrade preserves its
-current `auto_update` value when replacing the recipe, so a local `false` is
-not reset by a creator's `true`. Saved answers and mandatory defaults let an
-enabled instance generate the next version without asking questions.
+Run `starter update off` inside a downloaded instance to remove it from the list,
+or `starter update on` to add it back and clear a version pin. Developer pulls
+and pinned downloads never enter the list. Saved answers and mandatory defaults
+let an enabled instance generate the next version without asking questions.
 
 ## Optional answers, required defaults
 
@@ -311,8 +303,8 @@ source state are committed only after the complete build and merge succeed.
 4. Validate the resulting configuration and apply the generated files. On a
    rerun, compare against the previous build and current project first.
 5. After a successful apply, save the answers, applied source revision, and
-   pure generated snapshot from before the merge. Retain the ingredients and
-   the instance's `auto_update` setting; discard temporary output.
+   pure generated snapshot from before the merge. Retain the ingredients;
+   the home-directory update registry stays unchanged. Discard temporary output.
 
 Starter's validation checks generated YAML structure and known output
 references. It permits the sample's intentionally empty ID/organization/token defaults;
