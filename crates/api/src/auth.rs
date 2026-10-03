@@ -1,163 +1,747 @@
-//! IAM boundary helpers and application sessions. Tokens remain opaque.
-
+//! IAM 5 ordinary sessions. Each encrypted row owns one immutable actor/org/world.
+use crate::iam::{Iam, World};
+use aes_gcm::{
+    Aes256Gcm, KeyInit,
+    aead::{Aead, AeadCore, OsRng},
+};
 use axum::http::HeaderMap;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::Sha256;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use silicon_iam_client::{Mutation, models};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+};
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
-
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IamTokens {
     pub access_token: String,
     pub refresh_token: String,
-    #[serde(default)]
     pub expires_in: i64,
-    #[serde(default)]
     pub expires_at: Option<i64>,
-    #[serde(default)]
     pub actor: Option<Value>,
-    #[serde(default)]
     pub org_id: Option<String>,
-    #[serde(default)]
     pub org_ids: Vec<String>,
+    pub context_id: String,
+    pub world: World,
 }
-
 impl IamTokens {
     pub fn organizations(&self) -> Vec<String> {
-        let mut orgs = self.org_ids.clone();
-        orgs.extend(self.org_id.iter().cloned());
-        orgs.retain(|org| !org.is_empty());
-        orgs.sort();
-        orgs.dedup();
-        orgs
+        self.org_id
+            .as_ref()
+            .filter(|org| valid_org(org) && self.org_ids == [org.as_str()])
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+    fn valid(&self) -> bool {
+        let Some(actor) = &self.actor else {
+            return false;
+        };
+        !self.context_id.is_empty()
+            && self.organizations().len() == 1
+            && valid_actor_id(
+                actor["type"].as_str().unwrap_or_default(),
+                actor["public_id"].as_str().unwrap_or_default(),
+            )
+            && !self.access_token.is_empty()
+            && !self.refresh_token.is_empty()
+    }
+    fn status(&self) -> Value {
+        json!({"authenticated":true,"context_id":self.context_id,"actor":self.actor,
+            "org_id":self.org_id,"org_ids":self.org_ids,"world":self.world.id,
+            "world_fingerprint":self.world.fingerprint()})
     }
 }
-
-#[derive(Clone, Default)]
-pub struct AuthState {
-    sessions: Arc<RwLock<HashMap<String, IamTokens>>>,
-    file: Option<PathBuf>,
+#[derive(Clone, Serialize, Deserialize)]
+struct Session {
+    secret: String,
+    tokens: IamTokens,
+    group: Option<String>,
+    pending_pair: bool,
 }
-
+#[derive(Clone, Serialize, Deserialize)]
+struct LoginReceipt {
+    binding: String,
+    expires_at: i64,
+    session: String,
+    candidate: Option<IamTokens>,
+    completed: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct LoginState {
+    group: String,
+    expires_at: i64,
+    slt_hash: Option<String>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Store {
+    sessions: HashMap<String, Session>,
+    groups: HashSet<String>,
+    logins: HashMap<String, LoginReceipt>,
+    states: HashMap<String, LoginState>,
+    #[serde(default)]
+    attempts: HashMap<String, String>,
+}
+#[derive(Clone)]
+pub struct AuthState {
+    inner: Arc<Mutex<Store>>,
+    file: Option<PathBuf>,
+    key: [u8; 32],
+    configuration_error: Option<String>,
+    iam: Arc<OnceCell<Iam>>,
+    #[cfg(test)]
+    fixture: bool,
+}
+impl Default for AuthState {
+    fn default() -> Self {
+        let key = Sha256::digest(random_secret().as_bytes()).into();
+        Self {
+            inner: Default::default(),
+            file: None,
+            key,
+            configuration_error: None,
+            iam: Default::default(),
+            #[cfg(test)]
+            fixture: true,
+        }
+    }
+}
 impl AuthState {
     pub fn from_env() -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+        let mut state = Self {
             file: std::env::var_os("STARTER_AUTH_FILE").map(PathBuf::from),
+            ..Self::default()
+        };
+        if state.file.is_some() {
+            match std::env::var("STARTER_AUTH_ENCRYPTION_KEY")
+                .ok()
+                .and_then(|k| hex::decode(k).ok())
+                .and_then(|k| k.try_into().ok())
+            {
+                Some(key) => state.key = key,
+                None => {
+                    state.configuration_error = Some(
+                        "STARTER_AUTH_ENCRYPTION_KEY must contain 64 hexadecimal characters".into(),
+                    )
+                }
+            }
         }
+        #[cfg(test)]
+        {
+            state.fixture = false;
+        }
+        state
     }
-
+    pub async fn iam(&self) -> Result<Iam, String> {
+        let iam = self.iam.get_or_try_init(Iam::from_env).await?.clone();
+        iam.assert_current().await?;
+        Ok(iam)
+    }
     pub async fn load(&self) -> Result<(), String> {
-        let Some(path) = &self.file else {
-            return Ok(());
-        };
-        let text = match tokio::fs::read_to_string(path).await {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("cannot read session store: {error}")),
-        };
-        let saved: Value =
-            serde_json::from_str(&text).map_err(|e| format!("session store is invalid: {e}"))?;
-        if saved["identifier_schema"] != 1 {
-            return Err("session store predates the IAM identifier migration or has an unsupported schema; back it up, select a new empty STARTER_AUTH_FILE, and log in again".into());
+        if self.file.is_none()
+            && (std::env::var_os("STARTER_IAM_APP_SECRET").is_some()
+                || std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_some())
+        {
+            return Err("Configure STARTER_AUTH_FILE and STARTER_AUTH_ENCRYPTION_KEY for durable IAM sessions".into());
         }
-        let sessions = serde_json::from_value(saved["sessions"].clone())
-            .map_err(|e| format!("session store is invalid: {e}"))?;
-        *self.sessions.write().await = sessions;
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        if std::env::var_os("STARTER_IAM_APP_SECRET").is_some()
+            || std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_some()
+        {
+            self.iam().await?;
+        }
         Ok(())
     }
-
-    async fn persist(&self) -> Result<(), String> {
+    async fn file_lock(&self) -> Result<Option<std::fs::File>, String> {
+        if let Some(error) = &self.configuration_error {
+            return Err(error.clone());
+        }
+        let Some(path) = self.file.clone() else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| "Cannot create session store directory")?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options
+                .open(path.with_extension("lock"))
+                .map_err(|_| "Cannot open session store lock")?;
+            fs2::FileExt::lock_exclusive(&file).map_err(|_| "Cannot lock session store")?;
+            Ok(Some(file))
+        })
+        .await
+        .map_err(|_| "Session store lock failed")?
+    }
+    fn reload(&self, data: &mut Store) -> Result<(), String> {
         let Some(path) = &self.file else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| e.to_string())?;
+        let bytes = match std::fs::read(path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                *data = Store::default();
+                return Ok(());
+            }
+            Err(_) => return Err("Cannot read session store".into()),
+        };
+        if !bytes.starts_with(b"STARTER-IAM5\0") || bytes.len() < 25 {
+            return Err("Legacy or invalid STARTER_AUTH_FILE; retain its backup and use a new encrypted session store, then sign in again".into());
         }
-        let text = serde_json::to_vec(&serde_json::json!({
-            "identifier_schema": 1,
-            "sessions": &*self.sessions.read().await,
-        }))
-        .map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, text)
-            .await
-            .map_err(|e| e.to_string())?;
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| "Invalid encryption key")?;
+        let clear = cipher
+            .decrypt(
+                (&bytes[13..25]).into(),
+                aes_gcm::aead::Payload {
+                    msg: &bytes[25..],
+                    aad: b"starter-iam5-session-store",
+                },
+            )
+            .map_err(|_| "Cannot decrypt session store")?;
+        *data = serde_json::from_slice(&clear).map_err(|_| "Invalid encrypted session store")?;
+        Ok(())
+    }
+    fn persist(&self, data: &Store) -> Result<(), String> {
+        let Some(path) = &self.file else {
+            return Ok(());
+        };
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| "Invalid encryption key")?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let clear = serde_json::to_vec(data).map_err(|_| "Cannot encode session store")?;
+        let encrypted = cipher
+            .encrypt(
+                &nonce,
+                aes_gcm::aead::Payload {
+                    msg: &clear,
+                    aad: b"starter-iam5-session-store",
+                },
+            )
+            .map_err(|_| "Cannot encrypt session store")?;
+        let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .await
-                .map_err(|e| e.to_string())?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        tokio::fs::rename(tmp, path)
-            .await
-            .map_err(|e| e.to_string())
+        let result = (|| {
+            let mut file = options
+                .open(&temp)
+                .map_err(|_| "Cannot create session store")?;
+            file.write_all(b"STARTER-IAM5\0")
+                .and_then(|_| file.write_all(&nonce))
+                .and_then(|_| file.write_all(&encrypted))
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "Cannot write session store")?;
+            std::fs::rename(&temp, path).map_err(|_| "Cannot commit session store")?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::File::open(parent)
+                    .and_then(|p| p.sync_all())
+                    .map_err(|_| "Cannot synchronize session store")?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
+        }
+        result
     }
-
-    pub async fn insert(&self, tokens: IamTokens) -> Result<String, String> {
-        let id = Uuid::now_v7().to_string();
-        self.sessions.write().await.insert(id.clone(), tokens);
-        self.persist().await?;
-        Ok(id)
+    fn receipt_key(&self, operation: &str, secret: &str) -> String {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.key).expect("HMAC key");
+        mac.update(operation.as_bytes());
+        mac.update(&[0]);
+        mac.update(secret.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        Uuid::from_bytes(digest[..16].try_into().expect("16 bytes")).to_string()
+    }
+    pub async fn begin_browser_login(
+        &self,
+        existing: Option<&str>,
+    ) -> Result<(String, String), String> {
+        self.iam().await?;
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        let group = existing
+            .filter(|v| data.groups.contains(&hash(v)))
+            .map(str::to_owned)
+            .unwrap_or_else(random_secret);
+        data.groups.insert(hash(&group));
+        let nonce = random_secret();
+        data.states
+            .retain(|_, s| s.expires_at > Utc::now().timestamp());
+        data.states.insert(
+            hash(&nonce),
+            LoginState {
+                group: hash(&group),
+                expires_at: Utc::now().timestamp() + 600,
+                slt_hash: None,
+            },
+        );
+        self.persist(&data)?;
+        Ok((nonce, group))
     }
     pub async fn login(
         &self,
         slt: &str,
-        expected_state: Option<&str>,
-        state: Option<&str>,
-        app_id: &str,
-        app_secret: &str,
+        browser: Option<(&str, &str)>,
+        cli_key: Option<&str>,
+        org: Option<&str>,
     ) -> Result<String, String> {
-        if !valid_login_state(expected_state, state) {
-            return Err("login state does not match the initiating browser".into());
+        let iam = self.iam().await?;
+        let is_actor = valid_actor_id("carbon", slt) || valid_actor_id("silicon", slt);
+        if !slt.starts_with("oac_")
+            && !(is_actor && iam.world.environment_id.is_some() && org.is_some_and(valid_org))
+        {
+            return Err("Login requires an IAM short-lived token; testing actors require a verified testing world and explicit organization".into());
         }
-        self.insert(exchange_slt(slt, app_id, app_secret).await?)
-            .await
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        let login_hash = if is_actor {
+            // A testing actor is reusable, but one CLI attempt still has an immutable request receipt.
+            self.receipt_key(
+                "test-login",
+                &format!(
+                    "{}|{}|{}|{}",
+                    iam.world.fingerprint(),
+                    cli_key.unwrap_or_default(),
+                    slt,
+                    org.unwrap_or_default()
+                ),
+            )
+        } else {
+            self.receipt_key("login", slt)
+        };
+        let (binding, group) = if let Some((nonce, group)) = browser {
+            let ticket = data
+                .states
+                .get_mut(&hash(nonce))
+                .ok_or("Login state is missing or expired")?;
+            if ticket.group != hash(group)
+                || ticket.expires_at <= Utc::now().timestamp()
+                || ticket.slt_hash.as_ref().is_some_and(|v| v != &login_hash)
+            {
+                return Err("Login state does not match the initiating browser".into());
+            }
+            ticket.slt_hash = Some(login_hash.clone());
+            (
+                format!("browser:{}:{}", hash(group), hash(nonce)),
+                Some(hash(group)),
+            )
+        } else {
+            let key = cli_key
+                .filter(|k| Uuid::parse_str(k).is_ok())
+                .ok_or("CLI login requires a UUID Idempotency-Key")?;
+            (format!("cli:{key}"), None)
+        };
+        let input_hash = self.receipt_key(
+            "login-input",
+            &format!(
+                "{}|{}|{}",
+                iam.world.fingerprint(),
+                slt,
+                org.unwrap_or_default()
+            ),
+        );
+        if data
+            .attempts
+            .get(&binding)
+            .is_some_and(|existing| existing != &input_hash)
+        {
+            return Err(
+                "This login attempt already belongs to different input; begin a new login".into(),
+            );
+        }
+        data.attempts.insert(binding.clone(), input_hash);
+        if let Some(receipt) = data.logins.get(&login_hash) {
+            if receipt.expires_at <= Utc::now().timestamp() {
+                return Err("Login recovery expired; begin a new IAM login".into());
+            }
+            if receipt.binding != binding {
+                return Err("Login credential belongs to another login attempt".into());
+            }
+            if receipt.completed {
+                return data
+                    .sessions
+                    .get(&hash(&receipt.session))
+                    .filter(|row| {
+                        row.tokens.world == iam.world
+                            && org.is_none_or(|org| row.tokens.org_id.as_deref() == Some(org))
+                    })
+                    .map(|_| receipt.session.clone())
+                    .ok_or("This login was signed out; start a new login".into());
+            }
+        } else {
+            data.logins.insert(
+                login_hash.clone(),
+                LoginReceipt {
+                    binding,
+                    expires_at: Utc::now().timestamp() + 600,
+                    session: random_secret(),
+                    candidate: None,
+                    completed: false,
+                },
+            );
+        }
+        self.persist(&data)?;
+        if data.logins[&login_hash].candidate.is_none() {
+            let mutation = mutation(&login_hash)?;
+            let pair = if is_actor {
+                iam.client
+                    .oauth()
+                    .login_testing_actor(&iam.app_id, slt, org.expect("checked"), &mutation)
+                    .await
+            } else {
+                iam.client.oauth().login(&iam.app_id, slt, &mutation).await
+            }
+            .map_err(|_| "IAM login could not complete; retry the same attempt")?;
+            let tokens = tokens_of(pair, &iam.world)?;
+            data.logins.get_mut(&login_hash).expect("receipt").candidate = Some(tokens);
+            self.persist(&data)?;
+        }
+        let mut tokens = data.logins[&login_hash]
+            .candidate
+            .clone()
+            .expect("candidate");
+        if is_actor
+            && tokens
+                .actor
+                .as_ref()
+                .and_then(|actor| actor["public_id"].as_str())
+                != Some(slt)
+        {
+            return Err("IAM testing login returned a different account".into());
+        }
+        if org.is_some_and(|org| tokens.org_id.as_deref() != Some(org)) {
+            return Err("The IAM login belongs to another organization".into());
+        }
+        if tokens.world != iam.world {
+            return Err("Login belongs to a previous IAM data world".into());
+        }
+        if !prove(&iam, &mut tokens).await? {
+            return Err("IAM login is no longer active; start a new login".into());
+        }
+        let receipt = data.logins.get_mut(&login_hash).expect("receipt");
+        receipt.completed = true;
+        receipt.candidate = None;
+        let id = receipt.session.clone();
+        data.sessions.insert(
+            hash(&id),
+            Session {
+                secret: id.clone(),
+                tokens,
+                group,
+                pending_pair: false,
+            },
+        );
+        self.persist(&data)?;
+        Ok(id)
     }
-    pub async fn get(&self, id: &str) -> Option<IamTokens> {
-        self.sessions
-            .read()
-            .await
-            .get(id)
-            .filter(|tokens| {
-                tokens
-                    .expires_at
-                    .is_some_and(|expiry| expiry > Utc::now().timestamp())
+    #[cfg(test)]
+    pub async fn insert(&self, tokens: IamTokens) -> Result<String, String> {
+        let id = random_secret();
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        data.sessions.insert(
+            hash(&id),
+            Session {
+                secret: id.clone(),
+                tokens,
+                group: None,
+                pending_pair: false,
+            },
+        );
+        self.persist(&data)?;
+        Ok(id)
+    }
+    pub async fn get(&self, id: &str) -> Result<Option<IamTokens>, String> {
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        let Some(mut row) = data.sessions.get(&hash(id)).cloned() else {
+            return Ok(None);
+        };
+        if !row.tokens.valid() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.fixture {
+            return Ok(row
+                .tokens
+                .expires_at
+                .filter(|t| *t > Utc::now().timestamp())
+                .map(|_| row.tokens));
+        }
+        let iam = self.iam().await?;
+        if row.tokens.world != iam.world {
+            return Ok(None);
+        }
+        if !row.pending_pair
+            && row
+                .tokens
+                .expires_at
+                .is_none_or(|t| t <= Utc::now().timestamp())
+        {
+            let mutation = mutation(&self.receipt_key("refresh", &row.tokens.refresh_token))?;
+            let pair = iam
+                .client
+                .oauth()
+                .refresh(&iam.app_id, &row.tokens.refresh_token, &mutation)
+                .await
+                .map_err(|_| "IAM refresh could not complete; retry in this account")?;
+            let mut next = tokens_of(pair, &iam.world)?;
+            if next.actor != row.tokens.actor || next.org_id != row.tokens.org_id {
+                return Err("IAM refresh changed the immutable account or organization".into());
+            }
+            next.context_id = row.tokens.context_id.clone();
+            row.tokens = next;
+            row.pending_pair = true;
+            // Persist the rotated credentials before making another network request. A failed
+            // introspection retries this exact pair, never the consumed refresh credential.
+            data.sessions.insert(hash(id), row.clone());
+            self.persist(&data)?;
+        }
+        if !prove(&iam, &mut row.tokens).await? {
+            return Ok(None);
+        }
+        row.pending_pair = false;
+        data.sessions.insert(hash(id), row.clone());
+        self.persist(&data)?;
+        Ok(Some(row.tokens))
+    }
+    pub async fn status(&self, id: Option<&str>) -> Result<Value, String> {
+        Ok(match id {
+            Some(id) => self
+                .get(id)
+                .await?
+                .map(|t| t.status())
+                .unwrap_or(json!({"authenticated":false})),
+            None => json!({"authenticated":false}),
+        })
+    }
+    pub async fn contexts(
+        &self,
+        group: Option<&str>,
+        selected: Option<&str>,
+    ) -> Result<Value, String> {
+        let iam = self.iam().await?;
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        let group = group.map(hash);
+        let mut rows: Vec<Value> = data
+            .sessions
+            .values()
+            .filter(|s| {
+                group.is_some()
+                    && s.group == group
+                    && s.tokens.world == iam.world
+                    && s.tokens.valid()
             })
-            .cloned()
+            .map(|s| {
+                let mut row = s.tokens.status();
+                row["selected"] = json!(selected.is_some_and(|id| hash(id) == hash(&s.secret)));
+                row
+            })
+            .collect();
+        rows.sort_by(|a, b| a["context_id"].as_str().cmp(&b["context_id"].as_str()));
+        Ok(json!({"contexts":rows}))
+    }
+    pub async fn select(&self, group: Option<&str>, context: &str) -> Result<String, String> {
+        let secret = {
+            let mut data = self.inner.lock().await;
+            let _lock = self.file_lock().await?;
+            self.reload(&mut data)?;
+            let group = group.map(hash);
+            data.sessions
+                .values()
+                .find(|s| group.is_some() && s.group == group && s.tokens.context_id == context)
+                .map(|s| s.secret.clone())
+                .ok_or("Account is not saved in this browser")?
+        };
+        self.get(&secret)
+            .await?
+            .ok_or("Saved account needs a new IAM login")?;
+        Ok(secret)
     }
     pub async fn remove(&self, id: &str) -> Result<bool, String> {
-        let removed = self.sessions.write().await.remove(id).is_some();
-        if removed {
-            self.persist().await?;
-        }
-        Ok(removed)
-    }
-    pub async fn status(&self, id: Option<&str>) -> Value {
-        match match id {
-            Some(id) => self.get(id).await,
-            None => None,
-        } {
-            Some(t) => {
-                let orgs = t.organizations();
-                serde_json::json!({"authenticated":true,"actor":t.actor,"org_id":if orgs.len() == 1 { orgs.first() } else { None },"org_ids":orgs})
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        let Some(row) = data.sessions.get(&hash(id)) else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let remote = !self.fixture;
+        #[cfg(not(test))]
+        let remote = true;
+        if remote {
+            let iam = self.iam().await?;
+            if row.tokens.world == iam.world {
+                let mutation = mutation(&self.receipt_key("logout", &row.tokens.refresh_token))?;
+                iam.client
+                    .oauth()
+                    .revoke(
+                        &models::OAuthRevocationRequest {
+                            token: row.tokens.refresh_token.clone(),
+                            token_type_hint: Some(
+                                models::OAuthRevocationRequestTokenTypeHint::RefreshToken,
+                            ),
+                        },
+                        &mutation,
+                    )
+                    .await
+                    .map_err(|_| "IAM logout could not complete; retry in this account")?;
             }
-            None => serde_json::json!({"authenticated":false}),
         }
+        data.sessions.remove(&hash(id));
+        self.persist(&data)?;
+        Ok(true)
     }
 }
-
+fn mutation(key: &str) -> Result<Mutation, String> {
+    Ok(Mutation::with_key(
+        silicon_iam_client::IdempotencyKey::parse(key).map_err(|_| "Invalid operation receipt")?,
+    ))
+}
+fn random_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+fn hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+pub fn valid_org(org: &str) -> bool {
+    (3..=50).contains(&org.len())
+        && org
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
 pub fn valid_login_state(expected: Option<&str>, supplied: Option<&str>) -> bool {
-    matches!((expected, supplied), (Some(expected), Some(supplied)) if !expected.is_empty() && expected == supplied)
+    matches!((expected,supplied),(Some(a),Some(b)) if a.len()==64 && a==b)
+}
+fn tokens_of(pair: models::OAuthTokenResponse, world: &World) -> Result<IamTokens, String> {
+    let actor = pair
+        .actor
+        .map(|a| serde_json::to_value(a).expect("actor serialization"));
+    let tokens = IamTokens {
+        access_token: pair.access_token,
+        refresh_token: pair.refresh_token,
+        expires_in: pair.expires_in,
+        expires_at: None,
+        actor,
+        org_ids: pair.org_id.iter().cloned().collect(),
+        org_id: pair.org_id,
+        context_id: Uuid::new_v4().to_string(),
+        world: world.clone(),
+    };
+    if !tokens.valid()
+        || pair.token_type != "Bearer"
+        || pair.expires_in <= 0
+        || pair.scope.split_whitespace().any(|s| s.starts_with("obo:"))
+    {
+        return Err("IAM 5 login requires one canonical account and organization with ordinary session credentials".into());
+    }
+    Ok(tokens)
+}
+async fn prove(iam: &Iam, tokens: &mut IamTokens) -> Result<bool, String> {
+    let seen = iam
+        .client
+        .oauth()
+        .introspect(
+            &models::TokenIntrospectionRequest {
+                token: tokens.access_token.clone(),
+                token_type_hint: Some(models::TokenIntrospectionRequestTokenTypeHint::AccessToken),
+            },
+            tokens.org_id.as_deref(),
+        )
+        .await
+        .map_err(|_| "IAM session verification is unavailable")?;
+    validate_proof(&seen, &iam.app_id, tokens)
+}
+fn validate_proof(
+    seen: &models::TokenIntrospection,
+    app: &str,
+    tokens: &mut IamTokens,
+) -> Result<bool, String> {
+    if !seen.active {
+        return Ok(false);
+    }
+    let a = seen
+        .authorization
+        .as_ref()
+        .ok_or("IAM 5 requires one authorization snapshot; sign in again")?;
+    let actor = tokens.actor.as_ref().ok_or("Missing session identity")?;
+    let kind = actor["type"].as_str().ok_or("Missing session identity")?;
+    let id = actor["public_id"]
+        .as_str()
+        .ok_or("Missing session identity")?;
+    let org = tokens
+        .org_id
+        .as_deref()
+        .ok_or("Missing session organization")?;
+    let membership = format!("{id}[{org}]");
+    if seen.authorizations.is_some()
+        || seen.public_id.as_deref() != Some(id)
+        || serde_json::to_value(&seen.actor_type)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_str)
+            != Some(kind)
+        || serde_json::to_value(&a.actor_type)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_str)
+            != Some(kind)
+        || a.public_id.as_deref() != Some(id)
+        || seen.org_id.as_deref() != Some(org)
+        || a.org_id != org
+        || seen.client_id.as_deref() != Some(app)
+        || seen.audience.as_deref() != Some(app)
+        || a.audience != app
+        || a.membership_id != membership
+        || seen.membership_id.as_deref() != Some(membership.as_str())
+        || a.organization_id.is_nil()
+        || a.membership_version < 1
+        || a.authorization_epoch < 1
+        || seen.authorization_epoch != Some(a.authorization_epoch)
+        || a.testing_environment_id != tokens.world.environment_id
+        || seen
+            .scope
+            .as_deref()
+            .is_some_and(|s| s.split_whitespace().any(|s| s.starts_with("obo:")))
+        || a.scopes.iter().any(|s| s.starts_with("obo:"))
+        || seen
+            .expires_at
+            .is_none_or(|expiry| expiry <= Utc::now().timestamp())
+    {
+        return Err(
+            "IAM returned a different or invalid ordinary account, organization, or data world"
+                .into(),
+        );
+    }
+    tokens.expires_at = seen.expires_at;
+    Ok(true)
 }
 
 pub(crate) fn validate_app_id(app_id: &str) -> Result<(), String> {
@@ -185,143 +769,6 @@ pub(crate) fn valid_actor_id(kind: &str, id: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     })
-}
-
-fn introspected_actor(value: &Value) -> Result<Option<Value>, String> {
-    if value["actor_type"].is_null() && value["public_id"].is_null() {
-        return Ok(None);
-    }
-    let kind = value["actor_type"].as_str().unwrap_or_default();
-    let id = value["public_id"].as_str().unwrap_or_default();
-    if !valid_actor_id(kind, id) {
-        return Err("IAM returned an invalid or legacy actor identity; complete the identifier migration and log in again".into());
-    }
-    Ok(Some(serde_json::json!({"type": kind, "public_id": id})))
-}
-
-fn authorized_organizations(value: &Value, app_id: &str) -> Result<Vec<String>, String> {
-    validate_app_id(app_id)?;
-    if value["active"] != true || value["client_id"].as_str() != Some(app_id) {
-        return Err("IAM session is inactive or belongs to another application".into());
-    }
-    let mut orgs: Vec<String> = value
-        .get("authorizations")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .chain(value.get("authorization"))
-        .filter_map(|authorization| authorization.get("org_id").and_then(Value::as_str))
-        .filter(|org| !org.is_empty())
-        .map(str::to_owned)
-        .collect();
-    orgs.sort();
-    orgs.dedup();
-    Ok(orgs)
-}
-
-/// Exchange an IAM SLT. The SLT is never persisted or returned by this helper.
-pub async fn exchange_slt(slt: &str, app_id: &str, app_secret: &str) -> Result<IamTokens, String> {
-    exchange_slt_with_key(slt, app_id, app_secret, &Uuid::now_v7().to_string()).await
-}
-
-/// Variant for recovering an uncertain exchange: persist and reuse this key with identical input.
-pub async fn exchange_slt_with_key(
-    slt: &str,
-    app_id: &str,
-    app_secret: &str,
-    idempotency_key: &str,
-) -> Result<IamTokens, String> {
-    validate_app_id(app_id)?;
-    if !slt.starts_with("oac_") {
-        return Err("credential is not an IAM short-lived token".into());
-    }
-    let response = reqwest::Client::new()
-        .post("https://backend.iam.teamofsilicons.com/api/v1/app-auth/tokens")
-        .basic_auth(app_id, Some(app_secret))
-        .header("Idempotency-Key", idempotency_key)
-        .form(&[("app_id", app_id), ("slt", slt)])
-        .send()
-        .await
-        .map_err(|e| format!("IAM token exchange failed: {e}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("IAM response read failed: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("IAM token exchange returned {status}: {body}"));
-    }
-    let mut tokens: IamTokens =
-        serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid token JSON: {e}"))?;
-    let authorization = introspect(&tokens.access_token, app_id, app_secret, None).await?;
-    tokens.org_ids = authorized_organizations(&authorization, app_id)?;
-    tokens.actor = introspected_actor(&authorization)?;
-    tokens.expires_at = Some(
-        authorization["expires_at"]
-            .as_i64()
-            .filter(|expiry| *expiry > Utc::now().timestamp())
-            .ok_or("IAM returned an expired session or no token expiry")?,
-    );
-    // IAM's current multi-organization flow omits the legacy token org_id.
-    tokens.org_id = (tokens.org_ids.len() == 1).then(|| tokens.org_ids[0].clone());
-    Ok(tokens)
-}
-
-#[allow(dead_code)]
-pub async fn refresh_tokens(
-    refresh_token: &str,
-    app_id: &str,
-    app_secret: &str,
-    idempotency_key: &str,
-) -> Result<IamTokens, String> {
-    validate_app_id(app_id)?;
-    let response = reqwest::Client::new()
-        .post("https://backend.iam.teamofsilicons.com/api/v1/app-auth/tokens")
-        .basic_auth(app_id, Some(app_secret))
-        .header("Idempotency-Key", idempotency_key)
-        .form(&[("app_id", app_id), ("refresh_token", refresh_token)])
-        .send()
-        .await
-        .map_err(|e| format!("IAM refresh failed: {e}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("IAM response read failed: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("IAM refresh returned {status}: {body}"));
-    }
-    serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid refresh JSON: {e}"))
-}
-
-pub async fn introspect(
-    access_token: &str,
-    app_id: &str,
-    app_secret: &str,
-    org: Option<&str>,
-) -> Result<Value, String> {
-    validate_app_id(app_id)?;
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post("https://backend.iam.teamofsilicons.com/api/v1/oauth/introspect")
-        .basic_auth(app_id, Some(app_secret))
-        .form(&[("token", access_token), ("token_type_hint", "access_token")]);
-    if let Some(org) = org {
-        request = request.header("X-Org-ID", org);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("IAM introspection failed: {e}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("IAM response read failed: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("IAM introspection returned {status}: {body}"));
-    }
-    serde_json::from_str(&body).map_err(|e| format!("IAM returned invalid introspection JSON: {e}"))
 }
 
 /// Verify IAM's signature over the exact, unparsed request body.
@@ -359,7 +806,7 @@ pub fn verify_webhook(headers: &HeaderMap, body: &[u8], secret: &[u8], now: i64)
         Ok(v) if v.len() == 32 => v,
         _ => return false,
     };
-    let mut mac = match HmacSha256::new_from_slice(secret) {
+    let mut mac = match <HmacSha256 as Mac>::new_from_slice(secret) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -390,233 +837,5 @@ pub fn webhook_event_id(body: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn expired_and_legacy_sessions_require_a_new_login() {
-        let state = AuthState::default();
-        for expires_at in [
-            None,
-            Some(Utc::now().timestamp() - 1),
-            Some(Utc::now().timestamp() + 1800),
-        ] {
-            let tokens = IamTokens {
-                access_token: "test".into(),
-                refresh_token: "test".into(),
-                expires_in: 1800,
-                expires_at,
-                actor: None,
-                org_id: None,
-                org_ids: vec!["tos".into()],
-            };
-            let id = state.insert(tokens).await.unwrap();
-            assert_eq!(
-                state.get(&id).await.is_some(),
-                expires_at.is_some_and(|expiry| expiry > Utc::now().timestamp())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn identifier_cutover_rejects_old_stores_and_preserves_current_tokens() {
-        let path = std::env::temp_dir().join(format!("starter-auth-{}.json", Uuid::now_v7()));
-        let legacy = serde_json::json!({"old-session": {
-            "access_token": "opaque-access-with-old-identity-text",
-            "refresh_token": "opaque-refresh-with-old-identity-text",
-            "expires_at": Utc::now().timestamp() + 1800,
-            "actor": {"type": "silicon", "public_id": "assistant:tos"},
-            "org_ids": ["tos"]
-        }})
-        .to_string();
-        tokio::fs::write(&path, &legacy).await.unwrap();
-        let state = AuthState {
-            file: Some(path.clone()),
-            ..AuthState::default()
-        };
-        assert!(
-            state
-                .load()
-                .await
-                .unwrap_err()
-                .contains("STARTER_AUTH_FILE")
-        );
-        assert!(state.get("old-session").await.is_none());
-        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), legacy);
-
-        let new_path = path.with_extension("canonical.json");
-        let fresh = AuthState {
-            file: Some(new_path.clone()),
-            ..AuthState::default()
-        };
-        fresh.load().await.unwrap();
-        let tokens: IamTokens = serde_json::from_value(serde_json::json!({
-            "access_token": "opaque-access-with-old-identity-text",
-            "refresh_token": "opaque-refresh-with-old-identity-text",
-            "expires_at": Utc::now().timestamp() + 1800,
-            "actor": {"type": "silicon", "public_id": "si:assistant"},
-            "org_ids": ["tos"]
-        }))
-        .unwrap();
-        let id = fresh.insert(tokens.clone()).await.unwrap();
-        let restarted = AuthState {
-            file: Some(new_path.clone()),
-            ..AuthState::default()
-        };
-        restarted.load().await.unwrap();
-        let loaded = restarted.get(&id).await.unwrap();
-        assert_eq!(loaded.access_token, tokens.access_token);
-        assert_eq!(loaded.refresh_token, tokens.refresh_token);
-        assert_eq!(loaded.actor, tokens.actor);
-        assert_eq!(loaded.organizations(), ["tos"]);
-        tokio::fs::remove_file(path).await.unwrap();
-        tokio::fs::remove_file(new_path).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rejects_legacy_apps_before_contacting_iam_and_checks_explicit_actor_kind() {
-        for app in ["starter", "a", &"a".repeat(80), "a_0-b"] {
-            assert!(validate_app_id(app).is_ok());
-        }
-        for app in [
-            "tos>starter",
-            "starter>test@1.0.0",
-            "",
-            "0app",
-            "App",
-            &"a".repeat(81),
-        ] {
-            assert!(validate_app_id(app).is_err());
-            assert!(
-                exchange_slt_with_key("oac_test", app, "secret", "key")
-                    .await
-                    .is_err()
-            );
-            assert!(
-                refresh_tokens("opaque", app, "secret", "key")
-                    .await
-                    .is_err()
-            );
-            assert!(introspect("opaque", app, "secret", None).await.is_err());
-        }
-        for (kind, id) in [("carbon", "c:alice0"), ("silicon", "si:assistant")] {
-            assert!(valid_actor_id(kind, id));
-            let actor =
-                introspected_actor(&serde_json::json!({"actor_type":kind,"public_id":id})).unwrap();
-            assert_eq!(actor, Some(serde_json::json!({"type":kind,"public_id":id})));
-        }
-        for undisclosed in [
-            serde_json::json!({}),
-            serde_json::json!({"actor_type":null,"public_id":null}),
-        ] {
-            assert_eq!(introspected_actor(&undisclosed).unwrap(), None);
-        }
-        for partial in [
-            serde_json::json!({"actor_type":"carbon"}),
-            serde_json::json!({"public_id":"c:alice"}),
-            serde_json::json!({"actor_type":false,"public_id":null}),
-        ] {
-            assert!(introspected_actor(&partial).is_err());
-        }
-        for (kind, id) in [
-            ("carbon", "alice"),
-            ("silicon", "assistant:tos"),
-            ("silicon", "c:alice"),
-            ("carbon", "si:assistant"),
-            ("carbon", "c:al"),
-            ("silicon", "si:assistant:tos"),
-            ("application", "starter"),
-        ] {
-            assert!(!valid_actor_id(kind, id));
-            assert!(
-                introspected_actor(&serde_json::json!({"actor_type":kind,"public_id":id})).is_err()
-            );
-        }
-    }
-    #[test]
-    fn browser_state_requires_both_values_and_an_exact_match() {
-        assert!(valid_login_state(
-            Some("random-state"),
-            Some("random-state")
-        ));
-        for (expected, supplied) in [
-            (None, None),
-            (Some("state"), None),
-            (None, Some("state")),
-            (Some(""), Some("")),
-            (Some("state"), Some("state-prefix")),
-        ] {
-            assert!(!valid_login_state(expected, supplied));
-        }
-    }
-
-    #[test]
-    fn organizations_come_from_active_application_authorizations() {
-        let mut response = serde_json::json!({
-            "active":true,"client_id":"starter",
-            "authorizations":[{"org_id":"tos"},{"org_id":"lab"},{"org_id":"tos"}]
-        });
-        assert_eq!(
-            authorized_organizations(&response, "starter").unwrap(),
-            ["lab", "tos"]
-        );
-        assert!(authorized_organizations(&response, "another-app").is_err());
-        response["active"] = false.into();
-        assert!(authorized_organizations(&response, "starter").is_err());
-        response = serde_json::json!({"active":true,"client_id":"starter","authorization":{"org_id":"tos"}});
-        assert_eq!(
-            authorized_organizations(&response, "starter").unwrap(),
-            ["tos"]
-        );
-        response["authorization"] = Value::Null;
-        response["org_id"] = "unverified".into();
-        assert!(
-            authorized_organizations(&response, "starter")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn accepts_exact_signature_and_rejects_duplicate_security_headers() {
-        let ts = "1000";
-        let body = br#"{}"#;
-        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
-        mac.update(b"1000.{}");
-        let sig = format!("v1={}", hex::encode(mac.finalize().into_bytes()));
-        let mut h = HeaderMap::new();
-        h.insert("x-silicon-iam-timestamp", ts.parse().unwrap());
-        h.insert("x-silicon-iam-key-version", "1".parse().unwrap());
-        h.insert("x-silicon-iam-signature", sig.parse().unwrap());
-        assert!(verify_webhook(&h, body, b"secret", 1000));
-        h.append(
-            "x-silicon-iam-signature",
-            "v1=0000000000000000000000000000000000000000000000000000000000000000"
-                .parse()
-                .unwrap(),
-        );
-        assert!(!verify_webhook(&h, body, b"secret", 1000));
-    }
-
-    #[test]
-    fn signature_requires_lowercase_and_rejects_far_future_without_overflow() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-silicon-iam-timestamp",
-            "-9223372036854775808".parse().unwrap(),
-        );
-        h.insert("x-silicon-iam-signature", "v1=00".parse().unwrap());
-        assert!(!verify_webhook(&h, b"{}", b"secret", 0));
-    }
-
-    #[test]
-    fn extracts_production_and_testing_event_ids() {
-        assert_eq!(
-            webhook_event_id(br#"{"metadata":{"event_id":"e1"}}"#).as_deref(),
-            Some("e1")
-        );
-        assert_eq!(
-            webhook_event_id(br#"{"test":{"metadata":{"event_id":"e2"}}}"#).as_deref(),
-            Some("e2")
-        );
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;

@@ -1,8 +1,10 @@
 # Starter identifier cutover
 
+This is the historical identifier migration for the legacy `starter_state` singleton. Perform it before the first IAM 5 startup when needed. The current [IAM 5 migration guide](IAM5-MIGRATION.md) supersedes this document's session-store, provider-credential, and live storage configuration; the author mapping procedure below remains applicable to that legacy snapshot.
+
 Starter uses application ID `starter`, owned by IAM organization `tos`. Carbon IDs are `c:<handle>` and Silicon IDs are `si:<handle>`. Organization selection stays separate. Starter repository IDs (`tos.example`), bundle IDs (`tos>interface`), resource UUIDs, Git commits, and release versions keep their meaning.
 
-The live [IAM OpenAPI](https://docs.iam.teamofsilicons.com/openapi.yaml) defines these identifiers; some IAM prose examples still show the retired qualified IDs. The [Honeycomb package contract](https://docs.honeycomb.teamofsilicons.com/package-format/) and [compatibility guide](https://docs.honeycomb.teamofsilicons.com/compatibility/) describe canonical manifests and verified legacy archive aliases. Starter uses direct HTTP adapters, so there is no IAM SDK dependency to upgrade.
+The live [IAM OpenAPI](https://docs.iam.teamofsilicons.com/openapi.yaml) defines these identifiers; some IAM prose examples still show the retired qualified IDs. The [Honeycomb package contract](https://docs.honeycomb.teamofsilicons.com/package-format/) and [compatibility guide](https://docs.honeycomb.teamofsilicons.com/compatibility/) describe canonical manifests and verified legacy archive aliases. The IAM 5 candidate now uses the pinned SDK described in the current migration guide.
 
 This procedure is for an operator's coordinated cutover. Source changes and local checks do not migrate production, publish releases, or change IAM/Honeycomb registrations.
 

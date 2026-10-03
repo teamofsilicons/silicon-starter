@@ -23,7 +23,7 @@ starter --help
 
 Honeycomb manages CLI installation and binary updates. `starter update` and `starter daemon` manage downloaded project checkouts. Git must already be on PATH; Honeycomb packages do not run setup scripts.
 
-For existing installations and deployed services, follow the [public identifier migration](docs/PUBLIC-IDENTIFIER-MIGRATION.md) before cutover. App IDs are bare, Silicon IDs use `si:handle` with a separate organization, and starter catalog IDs such as `tos.classic` stay unchanged.
+For IAM 5 deployment, session storage, explicit Briefcase permission and world-partitioned catalog cutover, follow the [IAM 5 migration guide](docs/IAM5-MIGRATION.md). If historical identifiers remain, complete the [public identifier migration](docs/PUBLIC-IDENTIFIER-MIGRATION.md) before the first IAM 5 startup. App IDs are bare, Silicon IDs use `si:handle` with a separate organization, and starter catalog IDs such as `tos.classic` stay unchanged.
 
 The CLI connects to the production API at `https://backend.starter.teamofsilicons.com`. Override it with `--api http://127.0.0.1:8080` or `STARTER_API_URL=http://127.0.0.1:8080` for local development.
 
