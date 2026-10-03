@@ -1,6 +1,6 @@
 import {createSignal, onCleanup, onMount, Show} from 'solid-js';
 import {ApiError, type Session} from './api';
-import {completionKey, consentOf, type Consent} from './consent';
+import {completionKey, consentOf, requiresFreshReview, type Consent} from './consent';
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Receipt = {startKey: string; consent?: Consent};
@@ -16,18 +16,20 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
   onCleanup(() => { active = false; setCode(''); });
   const read = (): Receipt | undefined => { try { const r = JSON.parse(localStorage.getItem(key) || 'null'); return typeof r?.startKey === 'string' ? r : undefined; } catch { return undefined; } };
   const save = (receipt: Receipt) => localStorage.setItem(key, JSON.stringify(receipt));
-  const accepted = (reply: unknown, receipt: Receipt): Consent => {
-    if (read()?.startKey !== receipt.startKey) throw new ApiError('Another review was started for this account. Reload its status.', 409);
-    const current = consentOf(reply, session, receipt.consent);
+  const accepted = (reply: unknown, receipt: Receipt, completing = false): Consent => {
+    const latest = read();
+    if (latest?.startKey !== receipt.startKey) throw new ApiError('Another review was started for this account. Reload its status.', 409);
+    const current = consentOf(reply, session, latest.consent || receipt.consent);
+    if (completing && !current.completed) throw new ApiError('IAM did not confirm completion. Retry with the same code.', 502);
     save({...receipt, consent:current});
     if (active) setRequest(current);
     return current;
   };
   const failed = (e: unknown) => {
     if (!active) return;
-    if (e instanceof ApiError && e.status === 412 && read()?.startKey === operationKey) {
+    if (requiresFreshReview(e) && read()?.startKey === operationKey) {
       localStorage.removeItem(key); setRequest(undefined); setCode('');
-      setError('The permissions changed while you were reviewing them. Start a new review; your starter and release draft are unchanged.');
+      setError('This permission needs a fresh review. Your starter and release draft are unchanged.');
     } else setError(e instanceof Error ? e.message : String(e));
   };
   const action = async (run: () => Promise<void>) => {
@@ -54,7 +56,7 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
     const current = receipt.consent;
     const idempotency = await completionKey(session.context_id!, current.request_id, value);
     const reply = await p.api(`/api/v1/briefcase/authorizations/${encodeURIComponent(current.request_id)}/complete`, {method:'POST', headers:{'Idempotency-Key':idempotency}, body:JSON.stringify({code:value})});
-    accepted(reply,receipt);
+    accepted(reply,receipt,true);
     if (active) setCode('');
   });
   const reset = () => { localStorage.removeItem(key); setRequest(undefined); setCode(''); setError(''); };
@@ -72,7 +74,7 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
             <Show when={!ended()}><div class="permission-actions"><Show when={request()?.authorization.authorization_url}><a class="button primary" href={request()!.authorization.authorization_url} target="_blank" rel="noopener noreferrer">Open IAM review ↗</a></Show><button class="button" disabled={busy()} onClick={refresh}>Check status</button></div>
               <form onSubmit={event => {event.preventDefault();void complete();}}><label>Code from IAM<input autocomplete="off" spellcheck={false} value={code()} onInput={event=>setCode(event.currentTarget.value)} /></label><button class="button" disabled={busy() || !code().trim()}>{busy() ? 'Checking…' : 'Complete authorization'}</button></form>
             </Show><button class="button" disabled={busy()} onClick={reset}>Start a new review</button>
-          </>}><p class="notice" role="status">Storage access is ready. Return to your original publish command to continue the release.</p></Show>
+          </>}><p class="notice" role="status">Storage access is ready. Return to your original publish command to continue the release.</p><button class="button" disabled={busy()} onClick={reset}>Review storage access again</button></Show>
         </Show>
         <Show when={error()}><p class="notice error" role="alert">{error()}</p></Show>
       </section>

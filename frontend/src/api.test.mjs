@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createApi,sessionOf,contextsOf} from './api.ts';
-import {consentOf,completionKey} from './consent.ts';
+import {ApiError,createApi,sessionOf,contextsOf} from './api.ts';
+import {consentOf,completionKey,requiresFreshReview} from './consent.ts';
 const session={authenticated:true,context_id:'account-a',org_id:'tos',actor:{type:'carbon',public_id:'c:alice'}};
 const reply=value=>new Response(JSON.stringify(value),{status:200});
 
@@ -27,6 +27,11 @@ test('a slow body cannot populate a newly established context',async()=>{
  client.establish(session);finish(JSON.stringify([{id:'old.private'}]));
  await assert.rejects(pending,e=>e.status===409);
 });
+test('anonymous tabs send an explicit marker so a new cookie cannot grant them another account',async()=>{
+ const client=createApi('');client.establish({authenticated:false});let marker;
+ globalThis.fetch=async(_url,init)=>{marker=init.headers.get('x-starter-context');return new Response(JSON.stringify({error:{code:'context_changed'}}),{status:409});};
+ await assert.rejects(client.request('/api/v1/starters'),e=>e.status===409);assert.equal(marker,'anonymous');
+});
 test('204 and structured permission errors retain their semantics',async()=>{
  const client=createApi('');client.establish(session);
  globalThis.fetch=async()=>new Response(null,{status:204});assert.equal(await client.request('/auth/context'),undefined);
@@ -44,6 +49,17 @@ test('feature review binds requester, context, state and IAM request identity',(
 test('manual reviews do not invent callback state, and declines remain displayable',()=>{
  const authorization={...consent.authorization,status:'declined'};delete authorization.redirect_uri;delete authorization.state;
  assert.equal(consentOf({...consent,authorization},session).authorization.status,'declined');
+});
+test('completed reviews cannot claim declined/expired/pending status or regress on a late response',()=>{
+ for(const status of ['pending','declined','expired'])assert.throws(()=>consentOf({...consent,completed:true,authorization:{...consent.authorization,status}},session));
+ const completed={...consent,completed:true,authorization:{...consent.authorization,status:'exchanged'}};
+ assert.equal(consentOf(completed,session).completed,true);
+ assert.throws(()=>consentOf(consent,session,completed));
+});
+test('only explicit reconsent and changed terms invalidate the active review',()=>{
+ assert.equal(requiresFreshReview(new ApiError('Revoked',403,'reconsent_required')),true);
+ assert.equal(requiresFreshReview(new ApiError('Terms changed',412)),true);
+ for(const error of [new ApiError('Unavailable',503),new ApiError('Not allowed',403,'forbidden'),new ApiError('Signed out',401)])assert.equal(requiresFreshReview(error),false);
 });
 test('lost completion replies use stable keys scoped to the exact request and code',async()=>{
  const key=await completionKey('a','request','code');assert.equal(key,await completionKey('a','request','code'));

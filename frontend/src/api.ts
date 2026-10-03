@@ -45,7 +45,7 @@ export function createApi(base: string) {
       const captured = context;
       const headers = new Headers(init?.headers);
       if (init?.body !== undefined && !headers.has('content-type')) headers.set('content-type', 'application/json');
-      if (captured && captured !== 'anonymous') headers.set('x-starter-context', captured);
+      if (captured) headers.set('x-starter-context', captured);
       const response = await fetch(`${base}${path}`, { credentials: 'include', ...init, headers });
       const text = response.status === 204 ? '' : await response.text();
       if (captured !== context) throw changed();

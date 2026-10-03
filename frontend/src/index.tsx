@@ -4,6 +4,7 @@ import type { JSX } from 'solid-js';
 import './styles.css';
 import { StoragePermissions } from './permissions';
 import { createApi, sessionOf, contextsOf, type Session, type SavedContext } from './api';
+import { callbackRecovery, hasLoginCallback } from './callback';
 
 type Starter = { id: string; name: string; description: string; owner: string; visibility: 'public' | 'private'; version: string; downloads: number; stars: number; updated_at: string; tags: string[]; yaml: string };
 type Version = { version: string; commit: string; notes: string; published_at: string };
@@ -266,6 +267,8 @@ function App() {
   const [session, setSession] = createSignal<Session>({ authenticated: false });
   const [authLoading, setAuthLoading] = createSignal(true);
   const [authError, setAuthError] = createSignal('');
+  const [loginPending, setLoginPending] = createSignal(hasLoginCallback(new URL(location.href)));
+  let pendingCallback: ReturnType<typeof callbackRecovery> | undefined;
   const [contexts, setContexts] = createSignal<SavedContext[]>([]);
   const [switching, setSwitching] = createSignal(false);
   const updateLocation = () => { setRoute(parseRoute()); setSearch(location.search); };
@@ -275,6 +278,27 @@ function App() {
     const actor = session().actor;
     return actor?.display_name || actor?.name || actor?.public_id || (session().authenticated ? 'Signed in' : 'Guest');
   };
+  const recoverLogin = async () => {
+    setAuthLoading(true); setAuthError('');
+    try {
+      if (pendingCallback && loginPending()) {
+        await pendingCallback.retry();
+        setLoginPending(false);
+      }
+      const selected = sessionOf(await api<Session>('/auth/session'));
+      client.establish(selected); setSession(selected);
+      if (selected.authenticated) {
+        try { setContexts(contextsOf(await api('/auth/contexts'))); }
+        catch (error) { setAuthError(message(error)); }
+      }
+    } catch (error) { setAuthError(`Could not verify your session. ${message(error)}`); }
+    finally { setAuthLoading(false); }
+  };
+  const cancelLogin = () => {
+    pendingCallback?.cancel();
+    setLoginPending(false);
+    location.reload();
+  };
   onMount(() => {
     const click = (event: MouseEvent) => {
       if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -282,6 +306,7 @@ function App() {
       if (!anchor || anchor.target || anchor.hasAttribute('download')) return;
       const url = new URL(anchor.href);
       if (url.origin !== location.origin || anchor.getAttribute('href')?.startsWith('#')) return;
+      if (loginPending()) { event.preventDefault(); return; }
       event.preventDefault(); navigate(url.pathname + url.search + url.hash);
     };
     const keyboard = (event: KeyboardEvent) => {
@@ -289,31 +314,10 @@ function App() {
     };
     document.addEventListener('click', click); window.addEventListener('popstate', updateLocation); window.addEventListener('keydown', keyboard);
     onCleanup(() => { document.removeEventListener('click', click); window.removeEventListener('popstate', updateLocation); window.removeEventListener('keydown', keyboard); });
-    void (async () => {
-      try {
-        const url = new URL(location.href);
-        let slt = url.searchParams.get('slt') || '';
-        const hasSlts = url.hash.startsWith('#slts=');
-        if (!slt && hasSlts) {
-          const entries = JSON.parse(decodeURIComponent(url.hash.slice(6))) as { app_id?: string; slt?: string }[];
-          slt = entries.find(entry => entry.app_id === 'starter')?.slt || '';
-        }
-        if (slt || hasSlts) {
-          const state = url.searchParams.get('state') || undefined;
-          url.searchParams.delete('slt'); url.searchParams.delete('state'); url.hash = '';
-          history.replaceState({}, '', url.pathname === '/auth/callback' ? '/' : url.pathname + url.search); updateLocation();
-          if (!slt) throw new Error('No login token for starter; log in again with IAM.');
-          await api('/auth/callback', { method: 'POST', body: JSON.stringify({ slt, state }) });
-        }
-        const selected = sessionOf(await api<Session>('/auth/session'));
-        client.establish(selected); setSession(selected);
-        if (selected.authenticated) {
-          try { setContexts(contextsOf(await api('/auth/contexts'))); }
-          catch (error) { setAuthError(message(error)); }
-        }
-      } catch (error) { setAuthError(`Could not verify your session. ${message(error)}`); }
-      finally { setAuthLoading(false); }
-    })();
+    if (loginPending()) pendingCallback = callbackRecovery(location.href,
+      body => api('/auth/callback', {method:'POST', body, referrerPolicy:'no-referrer'}),
+      url => { history.replaceState({}, '', url); updateLocation(); });
+    void recoverLogin();
   });
   const selectContext = async (id: string) => {
     if (!id || id === session().context_id || switching()) return;
@@ -326,9 +330,10 @@ function App() {
     try { await api('/auth/logout', {method:'POST'}); location.assign('/'); }
     catch (error) { setAuthError(message(error)); setSwitching(false); }
   };
-  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<button class="button" onClick={login}>Log in</button>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><button class="button" onClick={login}>Add account</button><button class="button" disabled={switching()} onClick={logout}>Sign out</button></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
+  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<button class="button" disabled={loginPending()} onClick={login}>Log in</button>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><button class="button" onClick={login}>Add account</button><button class="button" disabled={switching()} onClick={logout}>Sign out</button></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
     <Show when={authError()}><div class="page-width"><ErrorMessage error={authError()} /></div></Show>
-    <main><Show when={!authLoading()} fallback={<div class="page-width loading">Checking session…</div>}><Show when={route().page !== 'permissions'} fallback={<StoragePermissions session={session()} api={api} apiBase={API} login={login} />}><Show when={route().page === 'starters' && route().id} fallback={<Show when={route().page === 'explore'} fallback={<Show when={route().page === 'docs'} fallback={<Show when={route().page === 'new'} fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Show>}><Docs /></Show>}><Explore session={session()} search={search()} /></Show>}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Show></Show></Show></main>
+    <Show when={loginPending() && !authLoading()}><div class="page-width notice"><p>Your original IAM login is still pending. Retry it, or cancel before starting another login.</p><button class="button primary" onClick={recoverLogin}>Retry login</button><button class="button" onClick={cancelLogin}>Cancel login</button></div></Show>
+    <main><Show when={!authLoading() && !loginPending()} fallback={<div class="page-width loading">{authLoading() ? 'Checking session…' : 'Finish or cancel this login to continue.'}</div>}><Show when={route().page !== 'permissions'} fallback={<StoragePermissions session={session()} api={api} apiBase={API} login={login} />}><Show when={route().page === 'starters' && route().id} fallback={<Show when={route().page === 'explore'} fallback={<Show when={route().page === 'docs'} fallback={<Show when={route().page === 'new'} fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Show>}><Docs /></Show>}><Explore session={session()} search={search()} /></Show>}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Show></Show></Show></main>
     <footer class="site-footer"><span>✦ Silicon Starter</span><a href="/docs">Documentation</a><a href="https://github.com/teamofsilicons/silicon-starter">GitHub ↗</a></footer>
   </div>;
 }

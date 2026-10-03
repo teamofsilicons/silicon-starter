@@ -21,6 +21,11 @@ let registryError = false;
 let created;
 const requests = [];
 const callbacks = [];
+const callbackReferrers = [];
+let callbackFailures = 0;
+let permissionCompleted = false;
+let permissionUnavailable = false;
+const permissionKeys = [];
 const starter = { id: 'test.repo', name: 'Example architecture', owner: 'test', description: 'An organization-published architecture with real repository files.', visibility: 'public', version: '1.2', downloads: 12, stars: 3, updated_at: new Date().toISOString(), tags: ['rust', 'agents'], yaml: 'silicon:\n  id: si:example\n  org_id: test\n' };
 const files = [
   { path: 'README.md', content: '# Example architecture\n\nBuild an organization-owned silicon.\n\n## Getting started\n\n- [Source](src/main.rs)\n- [Unsafe link](javascript:alert(1))\n\n```sh\nstarter pull test.repo\n```\n' },
@@ -69,7 +74,16 @@ const server = createServer(async (request, response) => {
     }
     if (path === '/auth/callback' && request.method === 'POST') {
       let body = ''; for await (const chunk of request) body += chunk;
-      callbacks.push(JSON.parse(body)); authenticated = true; return json({ authenticated: true });
+      callbacks.push(JSON.parse(body)); callbackReferrers.push(request.headers.referer);
+      if (callbackFailures-- > 0) return json({error:'Temporary IAM interruption'},503);
+      authenticated = true; return json({ authenticated: true });
+    }
+    if (path.startsWith('/api/v1/briefcase/')) {
+      assert.equal(request.headers['x-starter-context'],selectedContext);
+      if (permissionUnavailable) return json({error:{code:'reconsent_required',message:'Review storage access again'}},403);
+      if(path.endsWith('/authorization')) { permissionKeys.push(request.headers['idempotency-key']); permissionCompleted=false; }
+      if(path.endsWith('/complete')) permissionCompleted=true;
+      return json({request_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',context_id:selectedContext,completed:permissionCompleted,roots:[],authorization:{id:'a3a262c3-ebed-4295-9756-55ee824f1e75',app_id:'starter',actor:selected().actor,org_id:selected().org_id,status:permissionCompleted?'exchanged':'pending',version:1,expires_at:'2099-01-01T00:00:00Z',state:null,authorization_url:'https://iam.example/review'}});
     }
     if (path === '/api/v1/starters' && request.method === 'POST') {
       let body = ''; for await (const chunk of request) body += chunk;
@@ -263,10 +277,39 @@ try {
   await send('Page.navigate', { url: `${origin}/?state=opaque-state#slts=${encodeURIComponent(JSON.stringify(entries))}` });
   await browser('wait', '--fn', 'location.search === "" && location.hash === "" && !!document.querySelector(".account-name")');
   assert.deepEqual(callbacks, [{ slt, state: 'opaque-state' }], 'Select the bare starter app and preserve its opaque SLT');
+  callbackFailures=1;authenticated=false;
+  await send('Page.navigate', {url:`${origin}/?slt=oac_retry&state=retry-state`});
+  await browser('wait','--text','Temporary IAM interruption');
+  await check('location.search.includes("oac_retry") && !document.querySelector(".account-name")', 'An uncertain callback remains recoverable without adopting another account');
+  await click('nav a[href="/docs"]');
+  await check('location.search.includes("oac_retry")', 'Internal navigation cannot discard a pending login callback');
+  await check('document.querySelector("meta[name=referrer]").content === "no-referrer" && !JSON.stringify(localStorage).includes("oac_retry")', 'Callback is not persisted to localStorage or exposed as a referrer');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Retry login").click();');
+  await browser('wait','--fn','location.search === "" && !!document.querySelector(".account-name")');
+  assert.deepEqual(callbacks[1],callbacks[2],'Explicit retry preserves the original callback exactly');
+  assert(callbackReferrers.every(value=>value===undefined),'Callback requests must not disclose the callback URL as Referer');
   await send('Page.navigate', { url: `${origin}/?state=legacy-state#slts=${encodeURIComponent(JSON.stringify(entries.slice(0, 2)))}` });
   await browser('wait', '--text', 'No login token for starter; log in again with IAM.');
-  assert.equal(callbacks.length, 1, 'Legacy and unrelated app tokens must never be exchanged for Starter');
-  await check('location.search === "" && location.hash === "" && !document.querySelector(".account-name")', 'Rejected login clears the fragment and does not fall back to an existing session');
+  assert.equal(callbacks.length, 3, 'Legacy and unrelated app tokens must never be exchanged for Starter');
+  await check('location.hash.startsWith("#slts=") && !document.querySelector(".account-name")', 'Rejected callback never adopts an existing session and remains cancellable');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Cancel login").click();');
+  await browser('wait','--fn','location.search === "" && location.hash === "" && !!document.querySelector(".account-name")');
+  await open('/permissions');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Review storage access").click();');
+  await browser('wait','--text','Code from IAM');
+  await browser('fill','.permission-card input','manual-code');
+  await evaluate('document.querySelector(".permission-card form").requestSubmit();');
+  await browser('wait','--text','Storage access is ready');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Review storage access again").click();');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Review storage access").click();');
+  await browser('wait','--text','Code from IAM');
+  assert.notEqual(permissionKeys[0],permissionKeys[1],'Completed review can start a fresh independent request');
+  await evaluate('localStorage.setItem("starter:iam5:briefcase:other-context","keep-other-review");');
+  permissionUnavailable=true;
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Check status").click();');
+  await browser('wait','--text','This permission needs a fresh review');
+  await check('!document.querySelector(".permission-card input") && localStorage.getItem("starter:iam5:briefcase:other-context")==="keep-other-review"', 'Reconsent resets only the active review and retains other contexts');
+  permissionUnavailable=false;
   authenticated = true;
   await open('/new');
   await check('document.querySelectorAll(".create-form select")[0].options.length === 1 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');
