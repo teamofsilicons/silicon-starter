@@ -1,3 +1,4 @@
+import { ArcButton, ArcInput } from './arc';
 import {createSignal, onCleanup, onMount, Show} from 'solid-js';
 import {ApiError, type Session} from './api';
 import {completionKey, consentOf, requiresFreshReview, type Consent} from './consent';
@@ -66,15 +67,15 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
     if (receipt?.consent) { try { setRequest(consentOf(receipt.consent,session)); void refresh(); } catch { reset(); } }
   });
   return <section class="page-width permissions-page"><span class="eyebrow">ACCOUNT PERMISSIONS</span><h1>Release storage</h1><p>Allow Starter to store release archives in Briefcase. IAM lets you choose the Briefcase account and organization for this feature.</p>
-    <Show when={session.authenticated} fallback={<button class="button primary" onClick={p.login}>Log in to review permissions</button>}>
+    <Show when={session.authenticated} fallback={<ArcButton class="button primary" onClick={p.login}>Log in to review permissions</ArcButton>}>
       <section class="panel permission-card"><h2>Briefcase</h2><p class="muted">{session.actor?.public_id} · {session.org_id}</p>
-        <Show when={request()} fallback={<><p>Storage access is requested separately from signing in. Your starter and release draft stay in place if you decline.</p><button class="button primary" disabled={busy()} onClick={start}>{busy() ? 'Preparing review…' : read() ? 'Recover permission review' : 'Review storage access'}</button></>}>
+        <Show when={request()} fallback={<><p>Storage access is requested separately from signing in. Your starter and release draft stay in place if you decline.</p><ArcButton class="button primary" disabled={busy()} onClick={start}>{busy() ? 'Preparing review…' : read() ? 'Recover permission review' : 'Review storage access'}</ArcButton></>}>
           <Show when={request()?.completed} fallback={<>
             <p role="status">{ended() ? 'This review has ended. You can start again when ready.' : `IAM review: ${request()!.authorization.status}`}</p>
-            <Show when={!ended()}><div class="permission-actions"><Show when={request()?.authorization.authorization_url}><a class="button primary" href={request()!.authorization.authorization_url} target="_blank" rel="noopener noreferrer">Open IAM review ↗</a></Show><button class="button" disabled={busy()} onClick={refresh}>Check status</button></div>
-              <form onSubmit={event => {event.preventDefault();void complete();}}><label>Code from IAM<input autocomplete="off" spellcheck={false} value={code()} onInput={event=>setCode(event.currentTarget.value)} /></label><button class="button" disabled={busy() || !code().trim()}>{busy() ? 'Checking…' : 'Complete authorization'}</button></form>
-            </Show><button class="button" disabled={busy()} onClick={reset}>Start a new review</button>
-          </>}><p class="notice" role="status">Storage access is ready. Return to your original publish command to continue the release.</p><button class="button" disabled={busy()} onClick={reset}>Review storage access again</button></Show>
+            <Show when={!ended()}><div class="permission-actions"><Show when={request()?.authorization.authorization_url}><a class="button primary" href={request()!.authorization.authorization_url} target="_blank" rel="noopener noreferrer">Open IAM review ↗</a></Show><ArcButton class="button" disabled={busy()} onClick={refresh}>Check status</ArcButton></div>
+              <form onSubmit={event => {event.preventDefault();void complete();}}><label>Code from IAM<ArcInput autocomplete="off" spellcheck={false} value={code()} onInput={event=>setCode(event.currentTarget.value)} /></label><ArcButton class="button" disabled={busy() || !code().trim()}>{busy() ? 'Checking…' : 'Complete authorization'}</ArcButton></form>
+            </Show><ArcButton class="button" disabled={busy()} onClick={reset}>Start a new review</ArcButton>
+          </>}><p class="notice" role="status">Storage access is ready. Return to your original publish command to continue the release.</p><ArcButton class="button" disabled={busy()} onClick={reset}>Review storage access again</ArcButton></Show>
         </Show>
         <Show when={error()}><p class="notice error" role="alert">{error()}</p></Show>
       </section>

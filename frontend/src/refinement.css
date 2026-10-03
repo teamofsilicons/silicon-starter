@@ -1,0 +1,59 @@
+/* Product layout layered over the native UIArc component ports. */
+:root { --blue:#2468d5; --border:#e4e7ec; --subtle:#f7f8fa; --muted:#667182; color:#20242c; font-size:14px; }
+body { -webkit-font-smoothing:antialiased; background:#fafbfc; }
+.site-header { min-height:76px; background:#fff; padding:18px 36px; gap:36px; }
+.brand { font-weight:600; letter-spacing:-.04em; font-size:23px; }
+.brand-mark { background:var(--blue); border-radius:10px; }
+.site-header nav a { color:var(--muted); font-weight:500; }
+.site-header nav a[aria-current] { color:#20242c; }
+.account-controls { gap:10px; }
+.account-controls select { min-height:38px; max-width:240px; border-radius:10px; color:#384456; background:#fafbfc; }
+.account-name { display:none; }
+.account-menu { position:relative; }
+.account-menu>summary { list-style:none; width:38px; min-height:38px; font-size:20px; border-radius:10px; padding:0; }
+.account-menu>summary::-webkit-details-marker { display:none; }
+.account-menu-body { position:absolute; right:0; top:calc(100% + 8px); min-width:190px; background:#fff; padding:6px; border:1px solid var(--border); border-radius:12px; box-shadow:0 12px 36px #1a2b451c; z-index:20; }
+.account-menu-body .arc-button { width:100%; justify-content:flex-start; min-height:38px; border:0; box-shadow:none; background:transparent; border-radius:8px; }
+.account-menu-body .arc-button:hover { background:var(--subtle); }
+.button,.arc-button.button { border-radius:10px; min-height:38px; padding:0 14px; box-shadow:0 1px 2px #17284005; }
+.button.primary { background:var(--blue); border-color:var(--blue); color:white; }
+.button.primary:hover { background:#1c54af; border-color:#1c54af; }
+.page-width { width:min(1180px,calc(100% - 80px)); }
+.explore { padding-top:64px; }
+.eyebrow { letter-spacing:.06em; font-size:11px; font-weight:600; color:var(--blue); }
+.explore-heading h1 { font-size:40px; font-weight:550; letter-spacing:-.045em; line-height:1.16; }
+.explore-heading>p { margin-bottom:36px; }
+.explore-tools { gap:12px; margin-bottom:24px; }
+.search { min-height:48px; background:#fff; border-radius:12px; border-color:#dbe0e7; padding-inline:15px; }
+.search input.arc-input { background:transparent; box-shadow:none; min-height:42px; font-size:14px; }
+.search:focus-within { outline:2px solid #2468d5; outline-offset:2px; }
+.search input:focus-visible { outline:0; }
+.explore-tools select { min-height:48px; border-radius:12px; }
+.registry-filters { border:0; gap:5px; margin-bottom:25px; }
+.registry-filters .arc-button { min-height:36px; padding:0 13px; border:1px solid transparent; border-radius:10px; font-size:13px; }
+.registry-filters .arc-button.active { background:#edf3ff; color:#1c54af; border-color:#dce7fb; font-weight:500; }
+.starter-list { gap:18px; }
+.starter-card { border-radius:16px; background:#fff; padding:26px; display:flex; flex-direction:column; }
+.starter-card-heading { font-size:16px; gap:9px; }
+.starter-card-heading>a { color:#242d3a; }
+.starter-card-heading>a strong { font-weight:600; }
+.starter-card-heading>.badge { margin-left:auto; }
+.starter-card>p { font-size:14px; line-height:1.65; margin-top:20px; min-height:46px; }
+.tags a { background:#f1f4f8; color:#56677d; border-radius:6px; font-size:11px; padding:4px 8px; }
+.starter-card-footer { padding-top:18px; border-top:1px solid #edf0f4; margin-top:auto; padding-bottom:0; font-size:11px; }
+.badge { color:#677384; border-color:#e3e8ee; background:#fafbfc; font-size:10px; }
+.panel { border-radius:14px; background:#fff; }
+.repository-heading { background:#fff; }
+.repository-tabs>a.active { border-bottom-color:var(--blue); }
+.repository-tabs>a:hover { background:#f6f8fb; }
+.permission-card { padding:30px; }
+.permission-card h2 { font-weight:550; }
+.site-footer { border-color:var(--border); background:#fff; padding:26px; }
+@media(max-width:900px) { .site-header { gap:24px; padding:18px 24px; flex-wrap:wrap; } .account { gap:8px; } .page-width { width:calc(100% - 48px); } }
+@media(max-width:600px) {
+ .site-header { padding:16px; gap:20px; } .site-header nav { margin-left:auto; } .account { width:100%; justify-content:space-between; margin-left:0; } .account-controls { gap:6px; } .account-controls select { max-width:155px; font-size:12px; padding:7px; } .account-controls>a { display:none; }
+ .page-width { width:calc(100% - 32px); } .explore { padding-top:36px; } .explore-heading h1 { font-size:32px; } .explore-heading>p { font-size:14px; margin-bottom:26px; } .explore-tools .search { min-width:100%; } .search kbd { display:none; } .explore-tools select { min-height:38px; font-size:12px; } .starter-card { padding:21px; } .starter-card-heading { font-size:14px; } .starter-card-footer { gap:12px; line-height:1.5; } .starter-card-footer>a { margin-left:0; width:100%; padding-top:4px; } .permissions-page { padding-top:32px; } .permission-card { padding:21px; }
+ .account-menu-body { left:0; right:auto; } .account-menu-body a { display:flex; padding:10px; color:inherit; border-radius:8px; font-size:13px; }
+}
+@media(min-width:601px) { .account-menu-body a { display:none; } }
+@media(prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none !important; animation:none !important; } }
