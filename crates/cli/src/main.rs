@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use silicon_starter_core::{
     SEED_YAML,
     local::{self, Binding, Mode},
-    release_version, validate_silicon_yaml,
+    validate_silicon_yaml,
 };
 use std::{
     fs,
@@ -14,6 +14,9 @@ use std::{
     process::Command as Process,
 };
 
+mod permissions;
+mod publication;
+mod session;
 mod templates;
 
 #[derive(Parser)]
@@ -25,10 +28,30 @@ mod templates;
 struct Cli {
     #[arg(
         long,
+        global = true,
         env = "STARTER_API_URL",
         default_value = "https://backend.starter.teamofsilicons.com"
     )]
     api: String,
+    /// Independent saved account and organization profile.
+    #[arg(
+        long,
+        global = true,
+        env = "STARTER_PROFILE",
+        default_value = "default"
+    )]
+    profile: String,
+    /// Assert the backend world: production or testing:<environment-UUID>.
+    #[arg(
+        long,
+        global = true,
+        env = "STARTER_WORLD",
+        default_value = "production"
+    )]
+    world: String,
+    /// Organization for login; must match a saved session on other commands.
+    #[arg(long, global = true, env = "SILICON_ORG")]
+    org: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -40,8 +63,24 @@ enum Command {
     },
     Login {
         token: Option<String>,
+        /// Recover the exact interrupted login, without entering another SLT.
+        #[arg(long, conflicts_with_all=["token","cancel"])]
+        recover: bool,
+        /// Discard the private local login retry receipt.
+        #[arg(long, conflicts_with_all=["token","recover"])]
+        cancel: bool,
         #[command(subcommand)]
         command: Option<LoginCommand>,
+    },
+    /// Inspect or explicitly bind the current checkout to a saved account.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+    /// Review Briefcase storage permission separately from ordinary login.
+    Permission {
+        #[command(subcommand)]
+        command: permissions::PermissionCommand,
     },
     Init,
     New {
@@ -133,6 +172,11 @@ enum Command {
     List,
 }
 #[derive(Subcommand)]
+enum ContextCommand {
+    Show,
+    Bind,
+}
+#[derive(Subcommand)]
 enum LoginCommand {
     Status {
         #[arg(long)]
@@ -149,12 +193,31 @@ enum CommitCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let c = Cli::parse();
+    let mut c = Cli::parse();
+    let selection = session::Selection::new(&c.api, &c.profile, &c.world, c.org.clone())?;
+    c.api = selection.api.clone();
+    let ignore_saved = matches!(
+        &c.command,
+        Command::Login { command: None, .. }
+            | Command::Iam { .. }
+            | Command::Init
+            | Command::Commit { .. }
+            | Command::Seed { .. }
+            | Command::Revert { .. }
+            | Command::Report { .. }
+            | Command::Daemon { .. }
+            | Command::Webhook { .. }
+            | Command::Unhook
+            | Command::Context {
+                command: ContextCommand::Show
+            }
+    );
+    session::configure(selection, ignore_saved)?;
     match c.command {
         Command::Iam { json: true } => println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"app_id":"starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core"})
+                &json!({"app_id":"starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core","app_scope":{"iam":["self.identity.read","self.profile.read","self.membership.read"],"external":permissions::ENDPOINTS.iter().map(|endpoint|json!({"app_id":"briefcase","endpoint_id":endpoint})).collect::<Vec<_>>() }})
             )?
         ),
         Command::Iam { json: false } => println!(
@@ -164,14 +227,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Login {
             token: Some(token),
             command: None,
-        } => login(&c.api, &token).await?,
+            recover: false,
+            cancel: false,
+        } => session::login(Some(&token)).await?,
         Command::Login {
             token: None,
             command: Some(LoginCommand::Status { json }),
-        } => login_status(&c.api, json).await?,
+            recover: false,
+            cancel: false,
+        } => session::status(json).await?,
+        Command::Login {
+            token: None,
+            command: None,
+            recover: true,
+            cancel: false,
+        } => session::login(None).await?,
+        Command::Login {
+            token: None,
+            command: None,
+            recover: false,
+            cancel: true,
+        } => session::cancel_login().await?,
         Command::Login { .. } => {
             return Err("usage: starter login <IAM SLT> | starter login status --json".into());
         }
+        Command::Context { command } => checkout_context(command)?,
+        Command::Permission { command } => permissions::run(command).await?,
         Command::Init => init()?,
         Command::New { visibility, id } => new_starter(&c.api, &visibility, &id).await?,
         Command::Commit {
@@ -211,10 +292,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?
             } else {
-                publish(
-                    &c.api,
+                publication::run(
                     &selector.ok_or("publish requires latest, a commit prefix, or history")?,
-                    &version.ok_or("publish requires version Y.X")?,
+                    version.as_deref(),
                     notes.as_deref(),
                 )
                 .await?;
@@ -299,6 +379,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+fn checkout_context(command: ContextCommand) -> session::Result<()> {
+    let root = local::repo_root()?;
+    let mut binding = local::load_binding(&root)?;
+    if matches!(command, ContextCommand::Bind) {
+        if session::normalize_api(&binding.api)? != session::current()?.selection.api {
+            return Err("use the checkout's original --api before binding its account".into());
+        }
+        session::current()?.check_current()?;
+        binding.auth_context = Some(session::current()?.binding());
+        local::save_binding(&root, &binding)?;
+        local::register_checkout(&root, &binding)?;
+    }
+    println!("{}", serde_json::to_value(&binding.auth_context)?);
+    Ok(())
+}
 fn init() -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new(".git").exists() {
         run_git(&["init", "-b", "main"])?;
@@ -344,6 +439,7 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     )
     .await?;
     let binding = Binding {
+        auth_context: Some(session::current()?.binding()),
         id: id.into(),
         api: api.into(),
         mode: Mode::Development,
@@ -358,52 +454,12 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     println!("{value}");
     Ok(())
 }
-async fn login(api: &str, t: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !t.starts_with("oac_") {
-        return Err(
-            "login requires an IAM oac_ short-lived token; credentials are never prompted".into(),
-        );
-    }
-    let v = request_value(api, "/auth/cli", Method::POST, Some(json!({"slt":t}))).await?;
-    let sid = v
-        .get("session_id")
-        .and_then(Value::as_str)
-        .ok_or("IAM exchange response omitted session_id")?;
-    let p = session_path();
-    fs::create_dir_all(p.parent().unwrap())?;
-    fs::write(p, sid)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(session_path(), fs::Permissions::from_mode(0o600))?;
-    }
-    println!("authenticated");
-    Ok(())
-}
-async fn login_status(api: &str, j: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let sid = fs::read_to_string(session_path()).ok();
-    if sid.is_none() {
-        if j {
-            println!("{{\"authenticated\":false}}")
-        } else {
-            println!("authenticated: false")
-        }
-        return Ok(());
-    }
-    let v = request_value_with_headers(api, "/auth/cli/status", Method::GET, None, sid.as_deref())
-        .await?;
-    if j {
-        println!("{v}")
-    } else {
-        println!("authenticated: {}", v["authenticated"])
-    }
-    Ok(())
-}
 async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let root = local::repo_root()?;
     let mut b = match local::load_binding(&root) {
         Ok(binding) => binding,
         Err(_) if id.is_some() => Binding {
+            auth_context: Some(session::current()?.binding()),
             id: id.unwrap().into(),
             api: api.into(),
             mode: Mode::Development,
@@ -423,32 +479,40 @@ async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Err
     if !silicon_starter_core::valid_id(&b.id) {
         return Err("invalid starter id".into());
     }
+    let context = session::current()?.for_checkout(&b)?;
+    if context.saved.is_none() {
+        return Err("pushing requires a saved account; explicitly use starter context bind for this checkout".into());
+    }
     local::ensure_publishable_history(&root)?;
     templates::prepare_push(&root, &b.id)?;
     let yaml = local::validate_checkout(&root)?;
     let (path, commit) = local::bundle(&root)?;
     let body = json!({"commit":commit,"bundle_base64":B64.encode(fs::read(&path)?),"yaml":yaml,"message":"local main"});
-    let result = authed_request_value(
-        api,
-        &format!("/api/v1/starters/{}/push", b.id),
-        Method::POST,
-        Some(body.clone()),
-    )
-    .await;
+    let result = context
+        .request(
+            &format!("/api/v1/starters/{}/push", b.id),
+            Method::POST,
+            Some(body.clone()),
+            None,
+            true,
+        )
+        .await;
     let _ = fs::remove_file(path);
     match result {
         Ok(v) => println!("{v}"),
         Err(e) if e.to_string().contains("404") => {
-            authed_request_value(api,"/api/v1/starters",Method::POST,Some(json!({"id":b.id,"name":b.id,"description":"","visibility":"public","yaml":yaml}))).await?;
+            context.request("/api/v1/starters",Method::POST,Some(json!({"id":b.id,"name":b.id,"description":"","visibility":"public","yaml":yaml})),None,true).await?;
             println!(
                 "{}",
-                authed_request_value(
-                    api,
-                    &format!("/api/v1/starters/{}/push", b.id),
-                    Method::POST,
-                    Some(body)
-                )
-                .await?
+                context
+                    .request(
+                        &format!("/api/v1/starters/{}/push", b.id),
+                        Method::POST,
+                        Some(body),
+                        None,
+                        true
+                    )
+                    .await?
             );
         }
         Err(e) => return Err(e),
@@ -510,13 +574,24 @@ async fn pull(
         .into());
     }
     let query = reference.map_or(String::new(), |r| format!("?ref={}", encode(r)));
-    let archive = request_value(
-        api,
-        &format!("/api/v1/starters/{id}/archive{query}"),
-        Method::GET,
-        None,
-    )
-    .await?;
+    let context = if existing {
+        session::current()?.for_checkout(
+            current_binding
+                .as_ref()
+                .ok_or("checkout binding disappeared")?,
+        )?
+    } else {
+        session::current()?.clone()
+    };
+    let archive = context
+        .request(
+            &format!("/api/v1/starters/{id}/archive{query}"),
+            Method::GET,
+            None,
+            None,
+            false,
+        )
+        .await?;
     let temp = templates::Temporary::new("archive.bundle");
     fs::write(
         &temp.0,
@@ -613,6 +688,7 @@ async fn pull(
         }
     };
     let binding = Binding {
+        auth_context: Some(session::current()?.binding()),
         id: id.into(),
         api: api.into(),
         mode: if download {
@@ -644,34 +720,6 @@ fn pause_updates(target: &Path, binding: &mut Binding) -> Result<(), Box<dyn std
     Ok(())
 }
 
-async fn publish(
-    api: &str,
-    sel: &str,
-    ver: &str,
-    notes: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    release_version(ver).map_err(|e| format!("invalid release version: {e}"))?;
-    let b = local::load_binding(".")?;
-    if b.mode != Mode::Development {
-        return Err("only pulled developer starters may publish".into());
-    }
-    let c = if sel == "latest" {
-        local::head(".")?
-    } else {
-        local::run_git(".", ["rev-parse", &format!("{sel}^{{commit}}")].as_ref())?
-    };
-    println!(
-        "{}",
-        authed_request_value(
-            api,
-            &format!("/api/v1/starters/{}/publish", b.id),
-            Method::POST,
-            Some(json!({"selector":sel,"version":ver,"commit":c,"notes":notes.unwrap_or("")}))
-        )
-        .await?
-    );
-    Ok(())
-}
 async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
     let root = local::repo_root()?;
     let mut binding = local::load_binding(&root)?;
@@ -717,7 +765,8 @@ async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn daemon(_api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let _supervisor = session::daemon_lock()?;
     loop {
         let file = local::registry_path();
         let entries: Vec<local::RegistryEntry> = fs::read(&file)
@@ -734,18 +783,32 @@ async fn daemon(api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>>
             } else {
                 binding.auto_update
             };
-            if binding.api != api
-                || binding.mode != Mode::Download
-                || !auto_update
-                || binding.pinned.is_some()
-            {
+            if binding.mode != Mode::Download || !auto_update || binding.pinned.is_some() {
                 continue;
             }
             active += 1;
+            let profile = binding
+                .auth_context
+                .as_ref()
+                .map_or("default", |context| context.profile.as_str());
+            let world = binding
+                .auth_context
+                .as_ref()
+                .map_or("production", |context| context.world.as_str());
             let result = std::env::current_exe().and_then(|exe| {
                 Process::new(exe)
                     .current_dir(&entry.path)
-                    .args(["--api", api, "update", "now"])
+                    .args([
+                        "--api",
+                        &binding.api,
+                        "--profile",
+                        profile,
+                        "--world",
+                        world,
+                        "update",
+                        "now",
+                    ])
+                    .env_remove("SILICON_ORG")
                     .stdin(std::process::Stdio::null())
                     .status()
             });
@@ -1064,18 +1127,16 @@ fn unhook() -> Result<(), Box<dyn std::error::Error>> {
 fn webhook_path() -> PathBuf {
     local::data_dir().join("webhook.json")
 }
-fn session_path() -> PathBuf {
-    local::data_dir().join("session")
-}
 async fn authed_request_value(
     api: &str,
     p: &str,
     m: Method,
     b: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let s = fs::read_to_string(session_path())
-        .map_err(|_| "not authenticated; run `starter login <SLT>`")?;
-    request_value_with_headers(api, p, m, b, Some(&s)).await
+    if session::normalize_api(api)? != session::current()?.selection.api {
+        return Err("request API changed after context selection".into());
+    }
+    session::current()?.request(p, m, b, None, true).await
 }
 async fn authed_request(
     api: &str,
@@ -1092,38 +1153,10 @@ async fn request_value(
     m: Method,
     b: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let session = fs::read_to_string(session_path()).ok();
-    request_value_with_headers(api, p, m, b, session.as_deref()).await
-}
-async fn request_value_with_headers(
-    api: &str,
-    p: &str,
-    m: Method,
-    b: Option<Value>,
-    s: Option<&str>,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let c = reqwest::Client::new();
-    let mut r = c.request(m, format!("{api}{p}"));
-    if let Some(s) = s {
-        r = r.header("x-starter-session", s.trim())
+    if session::normalize_api(api)? != session::current()?.selection.api {
+        return Err("request API changed after context selection".into());
     }
-    if let Some(v) = b {
-        r = r.json(&v)
-    }
-    let x = r.send().await?;
-    let status = x.status();
-    let text = x.text().await?;
-    let v = serde_json::from_str(&text).unwrap_or_else(|_| json!({"body":text}));
-    if status == reqwest::StatusCode::UNAUTHORIZED && s.is_some() {
-        return Err(format!(
-            "HTTP {status}: {v}; authentication expired or invalid; run `starter login <SLT>` with a fresh IAM token"
-        )
-        .into());
-    }
-    if !status.is_success() {
-        return Err(format!("HTTP {status}: {v}").into());
-    }
-    Ok(v)
+    session::current()?.request(p, m, b, None, false).await
 }
 async fn request(
     api: &str,

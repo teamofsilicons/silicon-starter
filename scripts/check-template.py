@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end template lifecycle against an isolated registry; no production writes."""
 import base64
+import hashlib
 import http.server
 import json
 import os
@@ -18,6 +19,8 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(HOME=str(root), SILICON_HOME=str(root), GIT_CONFIG_NOSYSTEM="1")
     env.pop("STARTER_API_URL", None)
+    for key in ("STARTER_PROFILE", "STARTER_WORLD", "SILICON_ORG"):
+        env.pop(key, None)
     env["TZ"] = "UTC"
 
     def run(*args, cwd=root, ok=True):
@@ -197,7 +200,10 @@ with tempfile.TemporaryDirectory(prefix="starter-template-check-") as directory:
 
         # Push compiles the recipe and uploads its default preview, not saved answers.
         (root / ".starter").mkdir(exist_ok=True)
-        (root / ".starter/session").write_text("test-session")
+        session_file = root / ".starter/profiles/default" / hashlib.sha256(f"{api}\nproduction".encode()).hexdigest() / "session.json"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text(json.dumps({"api":api,"profile":"default","world":"production","world_fingerprint":"production:1","session_id":"test-session","context_id":"828c7fc8-04cb-409a-829a-6f52756b3b24","actor":{"type":"silicon","public_id":"si:tester"},"org_id":"tos"}))
+        session_file.chmod(0o600)
         run(*command, "seed", "--defaults", "--set", "purpose=Personal answer", cwd=author)
         git("add", "-A", cwd=author)
         git("commit", "-m", "Personal working configuration", cwd=author)

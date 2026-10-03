@@ -11,6 +11,9 @@ use std::{
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Binding {
+    /// Originating local account context; credentials never enter a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context: Option<CheckoutContext>,
     pub id: String,
     pub api: String,
     pub mode: Mode,
@@ -18,6 +21,16 @@ pub struct Binding {
     pub auto_update: bool,
     #[serde(default)]
     pub pinned: Option<String>,
+}
+/// A checkout stays with the profile and login that created it. None context ID is explicit anonymous access.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckoutContext {
+    pub profile: String,
+    pub world: String,
+    pub world_fingerprint: Option<String>,
+    pub context_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub org_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegistryEntry {

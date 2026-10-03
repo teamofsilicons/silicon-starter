@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-check a built CLI without production writes: python3 scripts/check-cli.py /path/to/starter."""
 import base64
+import hashlib
 import http.server
 import json
 import os
@@ -15,6 +16,8 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
     root = pathlib.Path(directory)
     env = {**os.environ, "SILICON_HOME": str(root), "HOME": str(root)}
     env.pop("STARTER_API_URL", None)
+    for key in ("STARTER_PROFILE", "STARTER_WORLD", "SILICON_ORG"):
+        env.pop(key, None)
     for key in list(env):
         if key.startswith("GIT_"):
             env.pop(key)
@@ -86,7 +89,12 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
         assert not requests, requests
         run(str(binary), "--api", api, "list")
         (root / ".starter").mkdir(exist_ok=True)
-        (root / ".starter/session").write_text("test-session\n")
+        session_file = root / ".starter/profiles/default" / hashlib.sha256(f"{api}\nproduction".encode()).hexdigest() / "session.json"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        def write_session(token):
+            session_file.write_text(json.dumps({"api":api,"profile":"default","world":"production","world_fingerprint":"production:1","session_id":token,"context_id":"828c7fc8-04cb-409a-829a-6f52756b3b24","actor":{"type":"silicon","public_id":"si:tester"},"org_id":"tos"}))
+            session_file.chmod(0o600)
+        write_session("test-session")
         run(str(binary), "--api", api, "list")
         run(str(binary), "--api", api, "show", "tos.example")
         run(str(binary), "--api", api, "download", "tos.example")
@@ -96,12 +104,12 @@ with tempfile.TemporaryDirectory(prefix="starter-cli-check-") as directory:
             ("/api/v1/starters/tos.example", "test-session"),
             ("/api/v1/starters/tos.example/archive", "test-session"),
         ], requests
-        (root / ".starter/session").write_text("opaque:legacy>session\n")
+        write_session("opaque:legacy>session")
         expired = subprocess.run([str(binary), "--api", api, "list"], cwd=root, env=env, text=True, capture_output=True)
         assert expired.returncode != 0 and "starter login <SLT>" in expired.stderr, expired
         assert requests[-1] == ("/api/v1/starters", "opaque:legacy>session"), requests
-        assert (root / ".starter/session").read_text() == "opaque:legacy>session\n"
-        (root / ".starter/session").write_text("test-session\n")
+        assert json.loads(session_file.read_text())["session_id"] == "opaque:legacy>session"
+        write_session("test-session")
         assert (root / "example/README.md").read_text() == "starter content\n"
         assert json.loads((root / "example/.git/starter.json").read_text())["id"] == "tos.example"
         checkout = root / "example"
