@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-starter-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-starter-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cel-interpreter",
  "cel-parser",
@@ -2876,7 +2876,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starter"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
