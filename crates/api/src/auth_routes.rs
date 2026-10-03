@@ -104,21 +104,65 @@ pub(super) async fn context_guard(
         .insert("cache-control", HeaderValue::from_static("no-store"));
     response
 }
-pub(super) async fn auth_login(headers: HeaderMap, State(s): State<AppState>) -> Response {
-    let (nonce, group) = match s
-        .auth
-        .begin_browser_login(cookie_value(&headers, "starter_browser"))
-        .await
+#[derive(Deserialize)]
+pub(super) struct LoginOptions {
+    identity_kind: String,
+    return_to: Option<String>,
+    #[serde(default)]
+    popup: bool,
+}
+pub(super) fn validated_return(value: Option<&str>) -> Result<String, String> {
+    let base = url::Url::parse(&frontend_url()).map_err(|_| "Invalid application origin")?;
+    let value = value.unwrap_or("/");
+    if value.starts_with("//") || value.contains('\\') || value.chars().any(char::is_control) {
+        return Err("Return destination must stay within this application".into());
+    }
+    let target = base.join(value).map_err(|_| "Invalid return destination")?;
+    if target.origin() != base.origin()
+        || !target.username().is_empty()
+        || target.password().is_some()
     {
-        Ok(v) => v,
-        Err(e) => return unavailable(e).into_response(),
-    };
+        return Err("Return destination must stay within this application".into());
+    }
+    Ok(target.into())
+}
+async fn start_login(
+    s: &AppState,
+    headers: &HeaderMap,
+    options: LoginOptions,
+) -> Result<(HeaderMap, Value), Error> {
+    if !matches!(options.identity_kind.as_str(), "carbon" | "silicon") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Choose Carbon or Silicon before starting login"})),
+        ));
+    }
+    let return_to = validated_return(options.return_to.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error":e}))))?;
+    let (nonce, group) = s
+        .auth
+        .begin_browser_login(
+            cookie_value(headers, "starter_browser"),
+            &options.identity_kind,
+            return_to,
+            options.popup,
+        )
+        .await
+        .map_err(unavailable)?;
+    let attempt = s
+        .auth
+        .browser_attempt(&nonce, &group)
+        .await
+        .map_err(unavailable)?;
     let callback = format!("{}/auth/callback?state={nonce}", frontend_url());
-    let url = format!(
-        "https://auth.iam.teamofsilicons.com/login?app_id={}&redirect_uri={}",
-        urlencoding::encode(&app_id()),
-        urlencoding::encode(&callback)
-    );
+    let mut url = url::Url::parse("https://auth.iam.teamofsilicons.com/login").expect("IAM URL");
+    url.query_pairs_mut()
+        .append_pair("app_id", &app_id())
+        .append_pair("redirect_uri", &callback)
+        .append_pair("identity_kind", &options.identity_kind);
+    if options.popup {
+        url.query_pairs_mut().append_pair("display", "popup");
+    }
     let mut cookies = HeaderMap::new();
     cookies.append(
         "set-cookie",
@@ -129,19 +173,130 @@ pub(super) async fn auth_login(headers: HeaderMap, State(s): State<AppState>) ->
         cookie("starter_browser", &group, Some(365 * 86400)),
     );
     cookies.insert("cache-control", HeaderValue::from_static("no-store"));
-    (cookies, Redirect::temporary(&url)).into_response()
+    Ok((
+        cookies,
+        json!({"attempt_id":attempt.attempt_id,"login_url":url.as_str(),"iam_origin":url.origin().ascii_serialization()}),
+    ))
+}
+pub(super) async fn auth_attempt(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Json(options): Json<LoginOptions>,
+) -> Response {
+    if !origin_ok(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match start_login(&s, &headers, options).await {
+        Ok((cookies, attempt)) => (cookies, Json(attempt)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+pub(super) async fn auth_login(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Query(mut options): Query<LoginOptions>,
+) -> Response {
+    // The fallback always navigates the browser after establishing its session.
+    options.popup = false;
+    match start_login(&s, &headers, options).await {
+        Ok((cookies, attempt)) => (
+            cookies,
+            Redirect::temporary(attempt["login_url"].as_str().expect("login URL")),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+async fn bound_attempt(
+    s: &AppState,
+    headers: &HeaderMap,
+    state: Option<&str>,
+) -> Result<auth::BrowserAttempt, Error> {
+    let expected = cookie_value(headers, "starter_login_state");
+    if !auth::valid_login_state(expected, state) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"Login state does not match the initiating browser"})),
+        ));
+    }
+    let group = cookie_value(headers, "starter_browser").ok_or((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error":"Login browser is missing"})),
+    ))?;
+    s.auth
+        .browser_attempt(expected.expect("checked"), group)
+        .await
+        .map_err(|error| (StatusCode::UNAUTHORIZED, Json(json!({"error":error}))))
+}
+fn popup_completion(
+    attempt: &auth::BrowserAttempt,
+    state: &str,
+    complete: bool,
+    can_retry: bool,
+) -> Response {
+    let origin = url::Url::parse(&frontend_url())
+        .expect("configured frontend URL")
+        .origin()
+        .ascii_serialization();
+    let message = json!({"type":"starter:login","attempt_id":attempt.attempt_id,"status":if complete {"complete"} else {"error"}});
+    // JSON escapes '<' so neither configuration nor message data can end the script element.
+    let message = message.to_string().replace('<', "\\u003c");
+    let origin = serde_json::to_string(&origin)
+        .expect("origin JSON")
+        .replace('<', "\\u003c");
+    let destination = serde_json::to_string(&attempt.return_to)
+        .expect("return JSON")
+        .replace('<', "\\u003c");
+    let label = if complete {
+        "Signed in. You can close this window."
+    } else {
+        "Sign-in could not complete. Retry this attempt, or return to Starter."
+    };
+    let retry = serde_json::to_string(&format!(
+        "/auth/callback?state={}",
+        urlencoding::encode(state)
+    ))
+    .expect("retry JSON");
+    let hide_retry = complete || !can_retry;
+    let html = format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Starter sign-in</title></head><body><p>{label}</p><p><a id="return">Return to Starter</a></p><p><a id="retry">Retry this login</a></p><script>history.replaceState(null,"","/auth/callback");document.getElementById("return").href={destination};const retry=document.getElementById("retry");retry.href={retry};retry.hidden={hide_retry};if(window.opener){{window.opener.postMessage({message},{origin});if({complete})window.close();}}else if({complete}){{location.replace({destination});}}</script></body></html>"#
+    );
+    let mut response = axum::response::Html(html).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 pub(super) async fn auth_callback(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
     State(s): State<AppState>,
 ) -> Response {
-    let Some(slt) = q.get("slt") else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let state = q.get("state").map(String::as_str);
+    let attempt = match bound_attempt(&s, &headers, state).await {
+        Ok(attempt) => attempt,
+        Err(error) => return error.into_response(),
     };
-    match browser_login(&s, &headers, slt, q.get("state").map(String::as_str)).await {
-        Ok(cookies) => (cookies, Redirect::to(&frontend_url())).into_response(),
-        Err(e) => e.into_response(),
+    let can_retry = !q.contains_key("error");
+    let result = if can_retry {
+        browser_login(&s, &headers, q.get("slt").map(String::as_str), state).await
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"IAM login was not completed"})),
+        ))
+    };
+    match result {
+        Ok(cookies) if attempt.popup => (
+            cookies,
+            popup_completion(&attempt, state.expect("bound state"), true, false),
+        )
+            .into_response(),
+        Ok(cookies) => (cookies, Redirect::to(&attempt.return_to)).into_response(),
+        Err(_) => popup_completion(&attempt, state.expect("bound state"), false, can_retry),
     }
 }
 #[derive(Deserialize)]
@@ -157,7 +312,7 @@ pub(super) async fn auth_callback_json(
     if !origin_ok(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match browser_login(&s, &headers, &body.slt, body.state.as_deref()).await {
+    match browser_login(&s, &headers, Some(&body.slt), body.state.as_deref()).await {
         Ok(cookies) => (cookies, Json(json!({"authenticated":true}))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -165,25 +320,17 @@ pub(super) async fn auth_callback_json(
 async fn browser_login(
     s: &AppState,
     headers: &HeaderMap,
-    slt: &str,
+    slt: Option<&str>,
     state: Option<&str>,
 ) -> Result<HeaderMap, Error> {
-    let expected = cookie_value(headers, "starter_login_state");
-    if !auth::valid_login_state(expected, state) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"Login state does not match the initiating browser"})),
-        ));
+    bound_attempt(s, headers, state).await?;
+    let expected = cookie_value(headers, "starter_login_state").expect("bound state");
+    let group = cookie_value(headers, "starter_browser").expect("bound browser");
+    let id = match slt {
+        Some(slt) => s.auth.login(slt, Some((expected, group)), None, None).await,
+        None => s.auth.resume_browser_login(expected, group).await,
     }
-    let group = cookie_value(headers, "starter_browser").ok_or((
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error":"Login browser is missing"})),
-    ))?;
-    let id = s
-        .auth
-        .login(slt, Some((expected.expect("checked"), group)), None, None)
-        .await
-        .map_err(unavailable)?;
+    .map_err(unavailable)?;
     // Keep the expiring nonce cookie so an uncertain callback can recover its original receipt.
     Ok(session_cookies(&id))
 }

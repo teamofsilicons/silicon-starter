@@ -38,7 +38,7 @@ test('204 and structured permission errors retain their semantics',async()=>{
  globalThis.fetch=async()=>new Response(JSON.stringify({error:{code:'consent_changed',message:'Review again'}}),{status:412});
  await assert.rejects(client.request('/api/v1/briefcase/authorization'),e=>e.status===412&&e.message==='Review again');
 });
-const consent={request_id:'request-a',context_id:session.context_id,completed:false,authorization:{id:'iam-a',app_id:'starter',actor:session.actor,org_id:'tos',status:'pending',version:1,expires_at:'2099-01-01T00:00:00Z',authorization_url:'https://iam.example/review',redirect_uri:'https://starter.example/callback',state:'a'.repeat(43)}};
+const consent={request_id:'request-a',context_id:session.context_id,completed:false,authorization:{id:'iam-a',app_id:'starter',actor:session.actor,org_id:'tos',status:'pending',version:1,expires_at:'2099-01-01T00:00:00Z',authorization_url:'https://auth.iam.teamofsilicons.com/obo/consent?request=iam-a',redirect_uri:'https://starter.example/callback',state:'a'.repeat(43)}};
 test('feature review binds requester, context, state and IAM request identity',()=>{
  assert.equal(consentOf(consent,session).request_id,'request-a');
  for(const invalid of [{...consent,context_id:'other'},{...consent,authorization:{...consent.authorization,actor:{type:'carbon',public_id:'c:bobby'}}},{...consent,authorization:{...consent.authorization,state:'short'}}])assert.throws(()=>consentOf(invalid,session));
@@ -65,4 +65,8 @@ test('lost completion replies use stable keys scoped to the exact request and co
  const key=await completionKey('a','request','code');assert.equal(key,await completionKey('a','request','code'));
  assert.notEqual(key,await completionKey('b','request','code'));assert.notEqual(key,await completionKey('a','request','other'));
  assert.match(key,/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+});
+
+test('consent links stay on the IAM review for the exact authorization',()=>{
+ for(const url of ['https://attacker.example/obo/consent?request=iam-a','https://auth.iam.teamofsilicons.com/login?request=iam-a','https://auth.iam.teamofsilicons.com/obo/consent?request=other','https://auth.iam.teamofsilicons.com/obo/consent?request=iam-a&request=iam-a','https://auth.iam.teamofsilicons.com/obo/consent?request=iam-a#fragment','https://auth.iam.teamofsilicons.com/obo/consent?request=iam-a&app_id=starter']) assert.throws(()=>consentOf({...consent,authorization:{...consent.authorization,authorization_url:url}},session));
 });

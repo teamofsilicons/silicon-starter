@@ -33,7 +33,7 @@ fn pair(endpoint: &str) -> Value {
     json!({"grant_id":operation(&json!(["grant",endpoint])),"access_token":format!("oba_initial_{}",endpoint.replace('.',"_")),"refresh_token":format!("obr_initial_{}",endpoint.replace('.',"_")),"token_type":"Bearer","expires_in":1800,"expires_at":"2090-01-01T00:00:00Z","audience":"briefcase","endpoint_id":endpoint,"org_id":ORG,"actor":{"type":"carbon","public_id":ACTOR},"scope":format!("obo:briefcase:{endpoint}")})
 }
 fn detail(id: Uuid, status: &str) -> Value {
-    json!({"id":id,"app_id":"starter","app_name":"Starter","actor":{"type":"carbon","public_id":ACTOR},"org_id":ORG,"status":status,"version":1,"expires_at":"2090-01-01T00:00:00Z","endpoints":[],"authorization_url":format!("https://auth.iam.teamofsilicons.com/review/{id}")})
+    json!({"id":id,"app_id":"starter","app_name":"Starter","actor":{"type":"carbon","public_id":ACTOR},"org_id":ORG,"status":status,"version":1,"expires_at":"2090-01-01T00:00:00Z","endpoints":[],"authorization_url":format!("https://auth.iam.teamofsilicons.com/obo/consent?request={id}")})
 }
 fn upstream(status: u16, code: &str) -> ResponseTemplate {
     ResponseTemplate::new(status)
@@ -233,6 +233,108 @@ impl Harness {
             .filter(|r| r.url.path() == "/api/v1/obo-access/tokens")
             .collect()
     }
+}
+
+#[tokio::test]
+async fn browser_consent_binds_callback_and_recovers_encrypted_code_after_restart() {
+    let mut h = Harness::new().await;
+    let saved = Arc::new(Mutex::new(Value::Null));
+    let captured = saved.clone();
+    let auth_id = h.auth_id;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo-access/authorizations"))
+        .respond_with(move |r: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            let mut result = detail(auth_id, "pending");
+            result["redirect_uri"] = body["redirect_uri"].clone();
+            result["state"] = body["state"].clone();
+            *captured.lock().unwrap() = result.clone();
+            ResponseTemplate::new(200).set_body_json(result)
+        })
+        .with_priority(1)
+        .mount(&h.iam_server)
+        .await;
+    let captured = saved.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/obo-access/authorizations/{auth_id}")))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut result = captured.lock().unwrap().clone();
+            result["status"] = json!("approved");
+            ResponseTemplate::new(200).set_body_json(result)
+        })
+        .with_priority(1)
+        .mount(&h.iam_server)
+        .await;
+    let f = h.feature();
+    let browser = Some((
+        "https://starter.teamofsilicons.com/permissions".into(),
+        true,
+    ));
+    let started = f
+        .start_browser(&h.session, "browser-review-key", browser.clone())
+        .await
+        .unwrap();
+    let id = Uuid::parse_str(started["request_id"].as_str().unwrap()).unwrap();
+    let state = started["authorization"]["state"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(state.len() >= 32);
+    assert_eq!(
+        f.start_browser(&h.session, "browser-review-key", browser)
+            .await
+            .unwrap(),
+        started
+    );
+    assert!(
+        f.start_browser(
+            &h.session,
+            "browser-review-key",
+            Some(("https://starter.teamofsilicons.com/new".into(), true))
+        )
+        .await
+        .is_err()
+    );
+    assert!(f.browser_callback(id, Uuid::new_v4(), &state).is_err());
+    assert!(f.browser_callback(id, auth_id, "wrong-state").is_err());
+    assert!(h.token_calls().await.is_empty());
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo-access/tokens"))
+        .respond_with(upstream(503, "uncertain"))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&h.iam_server)
+        .await;
+    assert!(
+        f.complete_browser(id, auth_id, &state, Some("private-browser-code"))
+            .await
+            .is_err()
+    );
+    assert!(
+        f.complete_browser(id, auth_id, &state, Some("replacement-code"))
+            .await
+            .is_err()
+    );
+    drop(f);
+    h.store = FeatureStore::open(&h.dir.path().join("features.sqlite"), &[9; 32]).unwrap();
+    let f = h.feature();
+    assert_eq!(
+        f.complete_browser(id, auth_id, &state, None).await.unwrap()["completed"],
+        true
+    );
+    assert_eq!(
+        f.complete_browser(id, auth_id, &state, None).await.unwrap()["completed"],
+        true
+    );
+    let calls = h.token_calls().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].body, calls[1].body);
+    assert_eq!(
+        calls[0].headers["idempotency-key"],
+        calls[1].headers["idempotency-key"]
+    );
+    let raw = std::fs::read(h.dir.path().join("features.sqlite-wal")).unwrap();
+    assert!(!raw.windows(20).any(|w| w == b"private-browser-code"));
 }
 
 #[tokio::test]

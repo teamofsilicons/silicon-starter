@@ -2,9 +2,10 @@ import { ArcButton, ArcInput } from './arc';
 import {createSignal, onCleanup, onMount, Show} from 'solid-js';
 import {ApiError, type Session} from './api';
 import {completionKey, consentOf, requiresFreshReview, type Consent} from './consent';
+import {watchPopup} from './popup';
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
-type Receipt = {startKey: string; consent?: Consent};
+type Receipt = {startKey: string; consent?: Consent; popup?: boolean; returnTo?: string};
 export function StoragePermissions(p: {session: Session; api: Request; apiBase: string; login: () => void}) {
   const session = p.session;
   const key = `starter:iam5:briefcase:${JSON.stringify([p.apiBase,session.context_id])}`;
@@ -14,14 +15,15 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
   const [error, setError] = createSignal('');
   let active = true;
   let operationKey: string | undefined;
-  onCleanup(() => { active = false; setCode(''); });
+  let pendingPopup: ReturnType<typeof watchPopup> | undefined;
+  onCleanup(() => { active = false; pendingPopup?.cancel(); setCode(''); });
   const read = (): Receipt | undefined => { try { const r = JSON.parse(localStorage.getItem(key) || 'null'); return typeof r?.startKey === 'string' ? r : undefined; } catch { return undefined; } };
   const save = (receipt: Receipt) => localStorage.setItem(key, JSON.stringify(receipt));
   const accepted = (reply: unknown, receipt: Receipt, completing = false): Consent => {
     const latest = read();
     if (latest?.startKey !== receipt.startKey) throw new ApiError('Another review was started for this account. Reload its status.', 409);
     const current = consentOf(reply, session, latest.consent || receipt.consent);
-    if (completing && !current.completed) throw new ApiError('IAM did not confirm completion. Retry with the same code.', 502);
+    if (completing && !current.completed) throw new ApiError('IAM did not confirm completion. Check this request again.', 502);
     save({...receipt, consent:current});
     if (active) setRequest(current);
     return current;
@@ -38,12 +40,34 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
     setBusy(true); setError('');
     try { await run(); } catch (e) { failed(e); } finally { if (active) setBusy(false); }
   };
-  const start = () => action(async () => {
-    const receipt = read() || {startKey:crypto.randomUUID()};
-    save(receipt); operationKey = receipt.startKey;
-    const value = await p.api('/api/v1/briefcase/authorization', {method:'POST', headers:{'Idempotency-Key':receipt.startKey}, body:'{}'});
-    accepted(value, receipt);
-  });
+  const openReview = (consent: Consent, popup: Window | null) => {
+    const url = new URL(consent.authorization.authorization_url!);
+    url.searchParams.set('display', 'popup');
+    pendingPopup?.cancel();
+    setError('');
+    if (!popup) { location.assign(url.href); return; }
+    pendingPopup = watchPopup(popup, 'starter:briefcase', async () => {
+      const receipt = read();
+      if (!receipt?.consent || receipt.consent.request_id !== consent.request_id) throw new Error('This permission review changed. Reload its status.');
+      const value = await p.api(`/api/v1/briefcase/authorizations/${encodeURIComponent(consent.request_id)}`);
+      accepted(value, receipt, true);
+    }, failed);
+    pendingPopup.navigate(consent.request_id, url.href);
+  };
+  const start = () => {
+    if (busy() || !active) return;
+    const receipt = read() || {startKey:crypto.randomUUID(), popup:true, returnTo:location.pathname + location.search + location.hash};
+    const popup = receipt.popup ? window.open('about:blank', '_blank', 'popup,width=600,height=760') : null;
+    void action(async () => {
+      try {
+        save(receipt); operationKey = receipt.startKey;
+        const value = await p.api('/api/v1/briefcase/authorization', {method:'POST', headers:{'Idempotency-Key':receipt.startKey}, body:JSON.stringify(receipt.popup ? {popup:true,return_to:receipt.returnTo} : {})});
+        const consent = accepted(value, receipt);
+        if (receipt.popup && consent.authorization.redirect_uri && consent.authorization.authorization_url && !consent.completed) openReview(consent,popup);
+        else popup?.close();
+      } catch (error) { popup?.close(); throw error; }
+    });
+  };
   const refresh = () => action(async () => {
     const receipt = read();
     if (!receipt?.consent) throw new Error('Start a permission review first.');
@@ -60,7 +84,7 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
     accepted(reply,receipt,true);
     if (active) setCode('');
   });
-  const reset = () => { localStorage.removeItem(key); setRequest(undefined); setCode(''); setError(''); };
+  const reset = () => { pendingPopup?.cancel(); localStorage.removeItem(key); setRequest(undefined); setCode(''); setError(''); };
   const ended = () => !!request() && (['declined','denied','expired','cancelled'].includes(request()!.authorization.status) || (!request()!.completed && Date.parse(request()!.authorization.expires_at) <= Date.now()));
   onMount(() => {
     const receipt = read();
@@ -72,8 +96,8 @@ export function StoragePermissions(p: {session: Session; api: Request; apiBase: 
         <Show when={request()} fallback={<><p>Storage access is requested separately from signing in. Your starter and release draft stay in place if you decline.</p><ArcButton class="button primary" disabled={busy()} onClick={start}>{busy() ? 'Preparing review…' : read() ? 'Recover permission review' : 'Review storage access'}</ArcButton></>}>
           <Show when={request()?.completed} fallback={<>
             <p role="status">{ended() ? 'This review has ended. You can start again when ready.' : `IAM review: ${request()!.authorization.status}`}</p>
-            <Show when={!ended()}><div class="permission-actions"><Show when={request()?.authorization.authorization_url}><a class="button primary" href={request()!.authorization.authorization_url} target="_blank" rel="noopener noreferrer">Open IAM review ↗</a></Show><ArcButton class="button" disabled={busy()} onClick={refresh}>Check status</ArcButton></div>
-              <form onSubmit={event => {event.preventDefault();void complete();}}><label>Code from IAM<ArcInput autocomplete="off" spellcheck={false} value={code()} onInput={event=>setCode(event.currentTarget.value)} /></label><ArcButton class="button" disabled={busy() || !code().trim()}>{busy() ? 'Checking…' : 'Complete authorization'}</ArcButton></form>
+            <Show when={!ended()}><div class="permission-actions"><Show when={request()?.authorization.authorization_url}><Show when={request()?.authorization.redirect_uri} fallback={<a class="button primary" href={request()!.authorization.authorization_url} target="_blank" rel="noopener noreferrer">Open IAM review ↗</a>}><ArcButton class="button primary" onClick={() => openReview(request()!,window.open('about:blank', '_blank', 'popup,width=600,height=760'))}>Open IAM review ↗</ArcButton></Show></Show><ArcButton class="button" disabled={busy()} onClick={refresh}>Check status</ArcButton></div>
+              <Show when={!request()?.authorization.redirect_uri}><form onSubmit={event => {event.preventDefault();void complete();}}><label>Code from IAM<ArcInput autocomplete="off" spellcheck={false} value={code()} onInput={event=>setCode(event.currentTarget.value)} /></label><ArcButton class="button" disabled={busy() || !code().trim()}>{busy() ? 'Checking…' : 'Complete authorization'}</ArcButton></form></Show>
             </Show><ArcButton class="button" disabled={busy()} onClick={reset}>Start a new review</ArcButton>
           </>}><p class="notice" role="status">Storage access is ready. Return to your original publish command to continue the release.</p><ArcButton class="button" disabled={busy()} onClick={reset}>Review storage access again</ArcButton></Show>
         </Show>

@@ -130,6 +130,8 @@ pub fn router(state: AppState) -> Router {
             get(discussions).post(add_discussion),
         )
         .route("/auth/login", get(auth_login))
+        .route("/auth/briefcase/callback", get(feature_routes::callback))
+        .route("/auth/attempt", post(auth_attempt))
         .route(
             "/auth/callback",
             get(auth_callback).post(auth_callback_json),
@@ -198,7 +200,9 @@ async fn save_state_unlocked(s: &AppState) -> Result<(), String> {
     })
 }
 async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status":"ok","service":"silicon-starter","api_version":"v1"}))
+    Json(
+        json!({"status":"ok","service":"silicon-starter","api_version":"v1","version":env!("CARGO_PKG_VERSION"),"iam_protocol":"5"}),
+    )
 }
 async fn authenticated_session(
     s: &AppState,

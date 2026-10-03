@@ -112,7 +112,10 @@ async fn durable_login_recovers_after_introspection_failure_without_redeeming_sl
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("sessions");
     let state = setup(Some(file.clone()), &server).await;
-    let (nonce, group) = state.begin_browser_login(None).await.unwrap();
+    let (nonce, group) = state
+        .begin_browser_login(None, "carbon", "http://127.0.0.1:3000/".into(), false)
+        .await
+        .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/v1/app-auth/tokens"))
         .respond_with(ResponseTemplate::new(200).set_body_json(pair("oat_login", "ort_login")))
@@ -154,9 +157,21 @@ async fn durable_login_recovers_after_introspection_failure_without_redeeming_sl
         .await;
     let restarted = setup(Some(file.clone()), &server).await;
     let id = restarted
-        .login("oac_private", Some((&nonce, &group)), None, None)
+        .resume_browser_login(&nonce, &group)
         .await
         .unwrap();
+    assert!(
+        restarted.inner.lock().await.states[&hash(&nonce)]
+            .slt
+            .is_none()
+    );
+    assert_eq!(
+        restarted
+            .resume_browser_login(&nonce, &group)
+            .await
+            .unwrap(),
+        id
+    );
     assert_eq!(
         restarted
             .login("oac_private", Some((&nonce, &group)), None, None)
@@ -168,7 +183,10 @@ async fn durable_login_recovers_after_introspection_failure_without_redeeming_sl
         restarted.get(&id).await.unwrap().unwrap().actor.unwrap()["public_id"],
         "c:alice"
     );
-    let other = restarted.begin_browser_login(None).await.unwrap();
+    let other = restarted
+        .begin_browser_login(None, "carbon", "http://127.0.0.1:3000/".into(), false)
+        .await
+        .unwrap();
     assert!(
         restarted
             .login("oac_private", Some((&other.0, &other.1)), None, None)
@@ -413,7 +431,7 @@ async fn browser_callback_saves_two_independent_accounts_and_selects_only_its_gr
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/auth/login")
+                    .uri("/auth/login?identity_kind=carbon")
                     .header("cookie", cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -601,4 +619,244 @@ async fn cli_login_receipt_binds_input_and_expires_instead_of_redeeming_an_old_s
             .contains("expired")
     );
     assert!(state.get(&id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn browser_kind_is_proved_by_introspection_even_when_exchange_omits_actor() {
+    let server = MockServer::start().await;
+    let auth = setup(None, &server).await;
+    let mut reply = pair("oat_login", "ort_login");
+    reply["actor"] = Value::Null;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/app-auth/tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+        .expect(2)
+        .mount(&server)
+        .await;
+    allow_proof(&server).await;
+    for kind in ["silicon", "carbon"] {
+        let (nonce, group) = auth
+            .begin_browser_login(None, kind, "http://127.0.0.1:3000/".into(), true)
+            .await
+            .unwrap();
+        let result = auth
+            .login(&format!("oac_{kind}"), Some((&nonce, &group)), None, None)
+            .await;
+        if kind == "silicon" {
+            assert!(result.unwrap_err().contains("kind does not match"));
+            assert!(
+                auth.contexts(Some(&group), None).await.unwrap()["contexts"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            let session = auth.get(&result.unwrap()).await.unwrap().unwrap();
+            assert_eq!(session.actor.unwrap()["type"], "carbon");
+            assert_eq!(session.org_id.as_deref(), Some("tos"));
+        }
+    }
+    // Neither absent identity nor an inactive token can establish the chosen kind.
+    for (field, value) in [
+        ("actor_type", Value::Null),
+        ("public_id", Value::Null),
+        ("active", json!(false)),
+    ] {
+        let mut seen = proof();
+        seen[field] = value;
+        let mut token = tokens();
+        token.actor = None;
+        assert!(!matches!(
+            validate_proof(
+                &serde_json::from_value(seen).unwrap(),
+                "starter",
+                &mut token
+            ),
+            Ok(true)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn popup_callback_returns_status_only_and_fullpage_uses_stored_safe_return() {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let server = MockServer::start().await;
+    let auth = setup(None, &server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/app-auth/tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pair("oat_secret", "ort_secret")))
+        .expect(2)
+        .mount(&server)
+        .await;
+    allow_proof(&server).await;
+    let app = crate::router(crate::AppState {
+        auth: Arc::new(auth),
+        ..Default::default()
+    });
+    for popup in [true, false] {
+        let request = if popup {
+            Request::builder().method("POST").uri("/auth/attempt")
+                .header("content-type", "application/json")
+                .header("origin", "http://127.0.0.1:3000")
+                .body(Body::from(json!({"identity_kind":"carbon","return_to":"/starters?from=login","popup":true}).to_string())).unwrap()
+        } else {
+            Request::builder()
+                .uri("/auth/login?identity_kind=carbon&return_to=%2Fstarters%3Ffrom%3Dlogin")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), if popup { 200 } else { 307 });
+        let cookies = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (url, attempt_id) = if popup {
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["iam_origin"], "https://auth.iam.teamofsilicons.com");
+            (
+                body["login_url"].as_str().unwrap().to_string(),
+                body["attempt_id"].as_str().unwrap().to_string(),
+            )
+        } else {
+            (
+                response.headers()["location"].to_str().unwrap().to_string(),
+                String::new(),
+            )
+        };
+        let url = url::Url::parse(&url).unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(k, v)| k == "identity_kind" && v == "carbon")
+        );
+        assert_eq!(
+            url.query_pairs()
+                .any(|(k, v)| k == "display" && v == "popup"),
+            popup
+        );
+        assert!(!url.query_pairs().any(|(k, _)| k == "org_id"));
+        let callback = url
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1
+            .to_string();
+        let mut callback = url::Url::parse(&callback).unwrap();
+        callback.query_pairs_mut().append_pair(
+            "slt",
+            if popup {
+                "oac_popup_secret"
+            } else {
+                "oac_fullpage_secret"
+            },
+        );
+        if popup {
+            Mock::given(method("POST"))
+                .and(path("/api/v1/oauth/introspect"))
+                .respond_with(ResponseTemplate::new(503))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            let failed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{}?{}", callback.path(), callback.query().unwrap()))
+                        .header("cookie", &cookies)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!failed.headers().contains_key("set-cookie"));
+            let page = String::from_utf8(
+                failed
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(page.contains("Retry this login"));
+            assert!(page.contains("\"status\":\"error\""));
+            assert!(page.contains("if(false)window.close()"));
+            for secret in ["oac_popup_secret", "oat_secret", "ort_secret"] {
+                assert!(!page.contains(secret));
+            }
+            // Retry carries state only; the original SLT and mutation receipt stay on the server.
+            let state = callback
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .unwrap()
+                .1
+                .to_string();
+            callback.set_query(None);
+            callback.query_pairs_mut().append_pair("state", &state);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?{}", callback.path(), callback.query().unwrap()))
+                    .header("cookie", cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.headers().contains_key("set-cookie"));
+        if popup {
+            assert_eq!(response.status(), 200);
+            let page = String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(page.contains(&attempt_id));
+            assert!(page.contains("\"status\":\"complete\""));
+            assert!(page.contains("\"http://127.0.0.1:3000\""));
+            for secret in [
+                "oac_popup_secret",
+                "oat_secret",
+                "ort_secret",
+                "starter_session",
+            ] {
+                assert!(!page.contains(secret));
+            }
+        } else {
+            assert_eq!(response.status(), 303);
+            assert_eq!(
+                response.headers()["location"],
+                "http://127.0.0.1:3000/starters?from=login"
+            );
+        }
+    }
+    for destination in [
+        "//evil.test/path",
+        "https://evil.test",
+        "https://name:secret@127.0.0.1:3000/",
+        "/\\evil.test",
+        "/\nredirect",
+    ] {
+        assert!(
+            crate::auth_routes::validated_return(Some(destination)).is_err(),
+            "{destination}"
+        );
+    }
+    assert!(crate::auth_routes::validated_return(Some("/starters?q=hello#top")).is_ok());
 }

@@ -13,7 +13,9 @@ export function consentOf(value: unknown, session: Session, expected?: Consent):
   }
   if (a.authorization_url) {
     const url = new URL(a.authorization_url);
-    if (url.protocol !== 'https:' || url.username || url.password) throw new ApiError('IAM returned an invalid review link.', 502, 'invalid_review_url');
+    if (url.origin !== 'https://auth.iam.teamofsilicons.com' || url.pathname !== '/obo/consent' || url.username || url.password || url.hash ||
+      ['app_id','app_ids','bundle_id'].some(key => url.searchParams.has(key)) || url.searchParams.getAll('request').length !== 1 ||
+      url.searchParams.get('request') !== a.id) throw new ApiError('IAM returned an invalid review link.', 502, 'invalid_review_url');
   }
   return c;
 }

@@ -25,9 +25,11 @@ const publishedBlocks = [];
 const blockRequests = [];
 const requests = [];
 const callbacks = [];
+const loginAttempts = [];
 const callbackReferrers = [];
 let callbackFailures = 0;
 let permissionCompleted = false;
+let permissionPopup = false;
 let blockFailures = 0;
 const blockAttempts = [];
 let permissionUnavailable = false;
@@ -74,6 +76,12 @@ const server = createServer(async (request, response) => {
     const path = url.pathname;
     requests.push(path);
     const json = (data, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(data)); };
+    if (path === '/login' || path === '/auth/login') { response.writeHead(200, {'Content-Type':'text/html'}); response.end('<p>Mock IAM login</p>'); return; }
+    if (path === '/auth/attempt') {
+      let body = ''; for await (const chunk of request) body += chunk;
+      loginAttempts.push(JSON.parse(body));
+      return json({attempt_id:`attempt-${loginAttempts.length}`,login_url:`${origin}/login`,iam_origin:origin});
+    }
     if (path === '/auth/session') return json(authenticated ? {authenticated:true,...selected(),org_ids:[selected().org_id]} : {authenticated:false});
     if(path === '/auth/contexts') return json({contexts:contexts.map(c=>({...c,selected:c.context_id===selectedContext}))});
     if(path === '/auth/context') {
@@ -91,7 +99,7 @@ const server = createServer(async (request, response) => {
       if (permissionUnavailable) return json({error:{code:'reconsent_required',message:'Review storage access again'}},403);
       if(path.endsWith('/authorization')) { permissionKeys.push(request.headers['idempotency-key']); permissionCompleted=false; }
       if(path.endsWith('/complete')) permissionCompleted=true;
-      return json({request_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',context_id:selectedContext,completed:permissionCompleted,roots:[],authorization:{id:'a3a262c3-ebed-4295-9756-55ee824f1e75',app_id:'starter',actor:selected().actor,org_id:selected().org_id,status:permissionCompleted?'exchanged':'pending',version:1,expires_at:'2099-01-01T00:00:00Z',state:null,authorization_url:'https://iam.example/review'}});
+      return json({request_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',context_id:selectedContext,completed:permissionCompleted,roots:[],authorization:{id:'a3a262c3-ebed-4295-9756-55ee824f1e75',app_id:'starter',actor:selected().actor,org_id:selected().org_id,status:permissionCompleted?'exchanged':'pending',version:1,expires_at:'2099-01-01T00:00:00Z',state:permissionPopup?'a'.repeat(43):null,...(permissionPopup?{redirect_uri:origin+'/auth/briefcase/callback'}:{}),authorization_url:'https://auth.iam.teamofsilicons.com/obo/consent?request=a3a262c3-ebed-4295-9756-55ee824f1e75'}});
     }
     if (path === '/api/v1/starters' && request.method === 'POST') {
       let body = ''; for await (const chunk of request) body += chunk;
@@ -166,7 +174,7 @@ const send = (method, params = {}) => new Promise((resolve, reject) => {
   socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
 });
 const execute = async expression => {
-  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true, userGesture: true });
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
   return result.result.value;
 };
@@ -205,9 +213,9 @@ const open = async path => { await browser('open', origin + path); await browser
 const click = async selector => { await evaluate(`document.querySelector(${JSON.stringify(selector)}).click();`); };
 
 try {
-  chrome = spawn(process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
+  chrome = spawn(process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', '--host-resolver-rules=MAP auth.iam.teamofsilicons.com ~NOTFOUND', 'about:blank'], { stdio: 'ignore' });
   let port;
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 300; attempt++) {
     port = await readFile(join(profile, 'DevToolsActivePort'), 'utf8').catch(() => '');
     if (port) break;
     await pause(100);
@@ -348,6 +356,40 @@ try {
   await open('/blocks');
   await check('document.querySelector("[role=alert]").textContent.includes("Block search unavailable")', 'Block search failure offers retry');
   blocksError = false;
+  await open('/');
+  await click('.account > button');
+  await check('document.querySelector(".login-dialog").open && document.querySelectorAll(".login-choices button").length === 2', 'IAM offers Carbon and Silicon explicitly');
+  await evaluate('window.originalOpen=window.open;window.open=(...args)=>(window.testPopup=window.originalOpen(...args));');
+  await click('.login-choices button:first-child');
+  await browser('wait','--fn','window.testPopup && window.testPopup.location.pathname === "/login"');
+  assert.deepEqual(loginAttempts[0],{identity_kind:'carbon',return_to:'/',popup:true});
+  const sessionReads = requests.filter(path=>path==='/auth/session').length;
+  await evaluate(`const body={type:'starter:login',attempt_id:'attempt-1',status:'complete'};for(const patch of [{origin:'https://attacker.example'},{source:window},{data:{...body,attempt_id:'wrong'}},{data:{...body,status:'unexpected'}}])window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:body,...patch}));`);
+  await pause(100);
+  assert.equal(requests.filter(path=>path==='/auth/session').length,sessionReads,'Forged completion cannot trigger session verification');
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:{type:'starter:login',attempt_id:'attempt-1',status:'complete'}}));");
+  await browser('wait','--text','IAM did not verify the selected account');
+  await check('!document.querySelector(".account-name")', 'A completion message alone never authenticates the app');
+  await click('.account > button');
+  await click('.login-choices button:first-child');
+  await browser('wait','--fn','window.testPopup && window.testPopup.location.pathname === "/login"');
+  authenticated=true;
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:{type:'starter:login',attempt_id:'attempt-2',status:'complete'}}));");
+  await browser('wait','--fn','!!document.querySelector(".account-name")');
+  await open('/new');
+  await browser('fill','.create-form textarea','unsaved architecture draft');
+  await evaluate('window.originalOpen=window.open;window.open=(...args)=>(window.testPopup=window.originalOpen(...args));[...document.querySelectorAll("button")].find(b=>b.textContent==="Add account").click();');
+  await click('.login-choices button:nth-child(2)');
+  await browser('wait','--fn','window.testPopup && window.testPopup.location.pathname === "/login"');
+  assert.equal(loginAttempts[2].identity_kind,'silicon');
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:{type:'starter:login',attempt_id:'attempt-3',status:'error'}}));");
+  await browser('wait','--text','Your work is unchanged');
+  await check('document.querySelector(".create-form textarea").value === "unsaved architecture draft"', 'Declining an added account preserves the current draft and context');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Cancel sign-in").click();');
+  await evaluate('window.open=()=>null;[...document.querySelectorAll("button")].find(b=>b.textContent==="Add account").click();');
+  await click('.login-choices button:nth-child(2)');
+  await browser('wait','--fn','location.pathname === "/auth/login"');
+  await check('new URL(location.href).searchParams.get("identity_kind") === "silicon" && new URL(location.href).searchParams.get("return_to") === "/new"', 'Blocked popup retains identity and original return path');
   const slt = 'oac_starter:opaque+value/=';
   const entries = [{ app_id: 'tos>starter', slt: 'oac_legacy' }, { app_id: 'iam', slt: 'oac_other' }, { app_id: 'starter', slt }];
   await send('Page.navigate', { url: `${origin}/?state=opaque-state#slts=${encodeURIComponent(JSON.stringify(entries))}` });
@@ -386,6 +428,21 @@ try {
   await browser('wait','--text','This permission needs a fresh review');
   await check('!document.querySelector(".permission-card input") && localStorage.getItem("starter:iam5:briefcase:other-context")==="keep-other-review"', 'Reconsent resets only the active review and retains other contexts');
   permissionUnavailable=false;
+  permissionPopup=true;
+  await evaluate('window.originalOpen=window.open;window.open=(...args)=>(window.testPopup=window.originalOpen(...args));[...document.querySelectorAll("button")].find(b=>b.textContent==="Review storage access").click();');
+  await browser('wait','--text','Open IAM review');
+  await check('!document.querySelector(".permission-card input") && !document.body.innerText.includes("Storage access is ready")', 'Browser review opens IAM without collecting manual codes');
+  const publishCount = publishedBlocks.length;
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window,data:{type:'starter:briefcase',attempt_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',status:'complete'}}));");
+  await check('!document.body.innerText.includes("Storage access is ready")', 'Permission completion from another window is ignored');
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:{type:'starter:briefcase',attempt_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',status:'complete'}}));");
+  await browser('wait','--text','IAM did not confirm completion');
+  await check('!document.body.innerText.includes("Storage access is ready")', 'Permission message alone cannot establish storage access');
+  await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="Open IAM review ↗").click();');
+  permissionCompleted=true;
+  await evaluate("window.dispatchEvent(new MessageEvent('message',{origin:location.origin,source:window.testPopup,data:{type:'starter:briefcase',attempt_id:'8d4d2a5d-0592-49af-81e0-799dd8d216ab',status:'complete'}}));");
+  await browser('wait','--text','Storage access is ready');
+  assert.equal(publishedBlocks.length,publishCount,'Verified permission never publishes automatically');
   authenticated = true;
   await open('/new');
   await check('document.querySelectorAll(".create-form select")[0].options.length === 1 && !document.querySelector(".create-form input").value', 'Verified organization selector and blank draft form');

@@ -8,6 +8,7 @@ import { StoragePermissions } from './permissions';
 import { createApi, sessionOf, contextsOf, type Session, type SavedContext } from './api';
 import { blockDraftKey, blockDraftStore, type BlockDraft } from './block-draft';
 import { callbackRecovery, hasLoginCallback } from './callback';
+import { popupLogin } from './popup';
 
 type Starter = { id: string; name: string; description: string; owner: string; visibility: 'public' | 'private'; version: string; downloads: number; stars: number; updated_at: string; tags: string[]; yaml: string };
 type Version = { version: string; commit: string; notes: string; published_at: string };
@@ -404,9 +405,23 @@ function App() {
   let pendingCallback: ReturnType<typeof callbackRecovery> | undefined;
   const [contexts, setContexts] = createSignal<SavedContext[]>([]);
   const [switching, setSwitching] = createSignal(false);
+  const [popupPending, setPopupPending] = createSignal(false);
+  let loginDialog!: HTMLDialogElement;
+  let cancelPopup: (() => void) | undefined;
   const updateLocation = () => { setRoute(parseRoute()); setSearch(location.search); };
   const navigate = (path: string) => { history.pushState({}, '', path); updateLocation(); window.scrollTo(0, 0); };
-  const login = () => { location.href = `${API}/auth/login?return_to=${encodeURIComponent(location.href)}`; };
+  const login = () => { if (!loginPending() && !popupPending()) loginDialog.showModal(); };
+  const chooseIdentity = (kind: 'carbon' | 'silicon') => {
+    cancelPopup?.();
+    loginDialog.close(); setAuthError(''); setPopupPending(true);
+    cancelPopup = popupLogin(kind, API, api, async () => {
+      // Verify the new cookie independently, then remount all context-bound forms and caches.
+      const verified = sessionOf(await createApi(API).request('/auth/session'));
+      if (!verified.authenticated || verified.actor?.type !== kind) throw new Error('IAM did not verify the selected account. Please sign in again.');
+      location.reload();
+    }, (error, retryable) => { if (!retryable) setPopupPending(false); setAuthError(error.message); });
+  };
+  onCleanup(() => cancelPopup?.());
   const accountName = () => {
     const actor = session().actor;
     return actor?.display_name || actor?.name || actor?.public_id || (session().authenticated ? 'Signed in' : 'Guest');
@@ -455,7 +470,7 @@ function App() {
     void recoverLogin();
   });
   const selectContext = async (id: string) => {
-    if (!id || id === session().context_id || switching()) return;
+    if (!id || id === session().context_id || switching() || popupPending()) return;
     setSwitching(true); setAuthError('');
     try { await api('/auth/context', { method: 'POST', body: JSON.stringify({context_id: id}) }); location.assign('/'); }
     catch (error) { setAuthError(message(error)); setSwitching(false); }
@@ -465,7 +480,9 @@ function App() {
     try { await api('/auth/logout', {method:'POST'}); location.assign('/'); }
     catch (error) { setAuthError(message(error)); setSwitching(false); }
   };
-  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/blocks" aria-current={route().page === 'blocks' ? 'page' : undefined}>Blocks</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<ArcButton class="button" disabled={loginPending()} onClick={login}>Log in</ArcButton>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><details class="account-menu" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}><summary class="button" aria-label="Account actions">···</summary><div class="account-menu-body" onClick={event => { const menu = event.currentTarget.closest("details"); if (menu) menu.open = false; }}><a href="/permissions">Permissions</a><ArcButton onClick={login}>Add account</ArcButton><ArcButton disabled={switching()} onClick={logout}>Sign out</ArcButton></div></details></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
+  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/blocks" aria-current={route().page === 'blocks' ? 'page' : undefined}>Blocks</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<ArcButton class="button" disabled={loginPending() || popupPending()} onClick={login}>Log in</ArcButton>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching() || popupPending()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><details class="account-menu" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}><summary class="button" aria-label="Account actions">···</summary><div class="account-menu-body" onClick={event => { const menu = event.currentTarget.closest("details"); if (menu) menu.open = false; }}><a href="/permissions">Permissions</a><ArcButton disabled={popupPending()} onClick={login}>Add account</ArcButton><ArcButton disabled={switching() || popupPending()} onClick={logout}>Sign out</ArcButton></div></details></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
+    <dialog class="login-dialog" ref={loginDialog} aria-labelledby="login-heading"><h2 id="login-heading">Continue with IAM</h2><p>Choose an account type, then select one organization in IAM.</p><div class="login-choices"><ArcButton class="button primary" onClick={() => chooseIdentity('carbon')}>Continue as Carbon</ArcButton><ArcButton class="button" onClick={() => chooseIdentity('silicon')}>Continue as Silicon</ArcButton></div><form method="dialog"><ArcButton class="button">Cancel</ArcButton></form></dialog>
+    <Show when={popupPending()}><div class="page-width notice" role="status"><p>Complete sign-in in the IAM window.</p><ArcButton class="button" onClick={() => cancelPopup?.()}>Cancel sign-in</ArcButton></div></Show>
     <Show when={authError()}><div class="page-width"><ErrorMessage error={authError()} /></div></Show>
     <Show when={loginPending() && !authLoading()}><div class="page-width notice"><p>Your original IAM login is still pending. Retry it, or cancel before starting another login.</p><ArcButton class="button primary" onClick={recoverLogin}>Retry login</ArcButton><ArcButton class="button" onClick={cancelLogin}>Cancel login</ArcButton></div></Show>
     <main><Show when={!authLoading() && !loginPending()} fallback={<div class="page-width loading">{authLoading() ? 'Checking session…' : 'Finish or cancel this login to continue.'}</div>}><Switch fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}>

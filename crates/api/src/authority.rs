@@ -134,6 +134,17 @@ struct Pending {
     code_hash: Option<String>,
     completed: bool,
     roots: Vec<Value>,
+    #[serde(default)]
+    callback: Option<BrowserCallback>,
+    #[serde(default)]
+    callback_code: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BrowserCallback {
+    pub redirect_uri: String,
+    pub state: String,
+    pub return_to: String,
+    pub popup: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct Root {
@@ -191,13 +202,14 @@ impl Feature {
             org,
         })
     }
-    fn check_detail(&self, detail: &models::OboConsentDetail) -> Result<()> {
+    fn check_detail(&self, detail: &models::OboConsentDetail, row: &Pending) -> Result<()> {
         if detail.id.is_nil()
             || detail.app_id != self.iam.app_id
             || detail.org_id != self.org
             || detail.actor.public_id != self.actor
-            || detail.redirect_uri.is_some()
-            || detail.state.is_some()
+            || detail.redirect_uri.as_deref()
+                != row.callback.as_ref().map(|c| c.redirect_uri.as_str())
+            || detail.state.as_deref() != row.callback.as_ref().map(|c| c.state.as_str())
         {
             return Err(Error::invalid());
         }
@@ -210,8 +222,17 @@ impl Feature {
         }
         if let Some(url) = &detail.authorization_url {
             let u = url::Url::parse(url).map_err(|_| Error::invalid())?;
-            if u.scheme() != "https"
-                || u.host_str().is_none()
+            let request_ids: Vec<_> = u
+                .query_pairs()
+                .filter(|(key, _)| key == "request")
+                .map(|(_, value)| value.into_owned())
+                .collect();
+            if u.origin().ascii_serialization() != "https://auth.iam.teamofsilicons.com"
+                || u.path() != "/obo/consent"
+                || request_ids != [detail.id.to_string()]
+                || u.query_pairs()
+                    .any(|(key, _)| matches!(key.as_ref(), "app_id" | "app_ids" | "bundle_id"))
+                || u.fragment().is_some()
                 || !u.username().is_empty()
                 || u.password().is_some()
             {
@@ -238,23 +259,48 @@ impl Feature {
         Ok(row)
     }
     fn view(&self, row: &Pending) -> Value {
-        json!({"request_id":row.id,"context_id":row.context_id,"authorization":row.authorization,"completed":row.completed,"roots":row.roots})
+        json!({"request_id":row.id,"attempt_id":row.id,"context_id":row.context_id,"authorization":row.authorization,"completed":row.completed,"roots":row.roots})
     }
     pub(crate) async fn start(&self, session: &IamTokens, key: &str) -> Result<Value> {
+        self.start_browser(session, key, None).await
+    }
+    pub(crate) async fn start_browser(
+        &self,
+        session: &IamTokens,
+        key: &str,
+        browser: Option<(String, bool)>,
+    ) -> Result<Value> {
         mutation(key)?;
         let key = digest(&encode(&(self.context_id.as_str(), key))?);
         let mut row = if let Some(id) = self.lease.get::<Uuid>("request-key", &key)? {
-            self.request(id)?
+            let row = self.request(id)?;
+            if row.callback.as_ref().map(|c| (&c.return_to, c.popup))
+                != browser.as_ref().map(|(url, popup)| (url, *popup))
+            {
+                return Err(Error::conflict(
+                    "Retry the original permission return destination",
+                ));
+            }
+            row
         } else {
             let id = Uuid::new_v4();
+            let callback = browser.map(|(return_to, popup)| BrowserCallback {
+                redirect_uri: format!(
+                    "{}/auth/briefcase/callback?request_id={id}",
+                    crate::frontend_url()
+                ),
+                state: Uuid::new_v4().to_string(),
+                return_to,
+                popup,
+            });
             let row = Pending {
                 id,
                 context_id: self.context_id.clone(),
                 body: Some(models::OboAuthorizationRequest {
                     subject_token: session.access_token.clone(),
                     org_id: self.org.clone(),
-                    redirect_uri: None,
-                    state: None,
+                    redirect_uri: callback.as_ref().map(|c| c.redirect_uri.clone()),
+                    state: callback.as_ref().map(|c| c.state.clone()),
                     endpoints: ENDPOINTS
                         .iter()
                         .map(|e| models::OboAuthorizationEndpoint {
@@ -267,6 +313,8 @@ impl Feature {
                 code_hash: None,
                 completed: false,
                 roots: vec![],
+                callback,
+                callback_code: None,
             };
             self.lease.put_many(vec![
                 ("request-key".into(), key, encode(&id)?),
@@ -286,7 +334,7 @@ impl Feature {
                 )
                 .await
                 .map_err(Error::iam)?;
-            self.check_detail(&detail)?;
+            self.check_detail(&detail, &row)?;
             row.authorization = Some(detail);
             row.body = None;
             self.lease.put("request", &row.id.to_string(), &row)?;
@@ -307,7 +355,7 @@ impl Feature {
             .authorization(auth)
             .await
             .map_err(Error::iam)?;
-        self.check_detail(&detail)?;
+        self.check_detail(&detail, &row)?;
         if detail.id != auth {
             return Err(Error::invalid());
         }
@@ -338,7 +386,7 @@ impl Feature {
             .authorization(auth)
             .await
             .map_err(Error::iam)?;
-        self.check_detail(&detail)?;
+        self.check_detail(&detail, &row)?;
         if detail.id != auth
             || !matches!(
                 detail.status,
@@ -389,9 +437,70 @@ impl Feature {
         }
         row.authorization = Some(detail);
         row.completed = true;
+        row.callback_code = None;
         updates.push(("request".into(), row.id.to_string(), encode(&row)?));
         self.lease.put_many(updates)?;
         Ok(self.view(&row))
+    }
+    pub(crate) fn browser_callback(
+        &self,
+        id: Uuid,
+        authorization_id: Uuid,
+        state: &str,
+    ) -> Result<BrowserCallback> {
+        let row = self.request(id)?;
+        let callback = row.callback.ok_or_else(Error::invalid)?;
+        if callback.state != state
+            || row.authorization.as_ref().map(|a| a.id) != Some(authorization_id)
+        {
+            return Err(Error::new(
+                StatusCode::FORBIDDEN,
+                "invalid_callback",
+                "The permission callback does not match its original review",
+            ));
+        }
+        Ok(callback)
+    }
+    pub(crate) async fn complete_browser(
+        &self,
+        id: Uuid,
+        authorization_id: Uuid,
+        state: &str,
+        code: Option<&str>,
+    ) -> Result<Value> {
+        self.browser_callback(id, authorization_id, state)?;
+        let mut row = self.request(id)?;
+        if row.completed {
+            return Ok(self.view(&row));
+        }
+        if let Some(code) = code {
+            if code.is_empty() || code.len() > 1024 || !code.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_code",
+                    "IAM returned an invalid permission code",
+                ));
+            }
+            if row
+                .callback_code
+                .as_deref()
+                .is_some_and(|saved| saved != code)
+            {
+                return Err(Error::conflict(
+                    "Retry this callback with its original code",
+                ));
+            }
+            row.callback_code = Some(code.to_owned());
+            self.lease.put("request", &id.to_string(), &row)?;
+        }
+        let code = row.callback_code.ok_or_else(|| {
+            Error::new(
+                StatusCode::BAD_REQUEST,
+                "missing_code",
+                "The IAM permission code is missing",
+            )
+        })?;
+        self.complete(id, &code).await
     }
     async fn validate_pair(&self, pair: &models::OboTokenPair) -> Result<()> {
         let actor = pair.actor.as_ref().ok_or_else(Error::invalid)?;

@@ -81,6 +81,17 @@ struct LoginState {
     group: String,
     expires_at: i64,
     slt_hash: Option<String>,
+    #[serde(default)]
+    slt: Option<String>,
+    #[serde(default)]
+    attempt: Option<BrowserAttempt>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BrowserAttempt {
+    pub attempt_id: String,
+    pub identity_kind: String,
+    pub return_to: String,
+    pub popup: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
@@ -276,7 +287,13 @@ impl AuthState {
     pub async fn begin_browser_login(
         &self,
         existing: Option<&str>,
+        identity_kind: &str,
+        return_to: String,
+        popup: bool,
     ) -> Result<(String, String), String> {
+        if !matches!(identity_kind, "carbon" | "silicon") {
+            return Err("Choose Carbon or Silicon before starting login".into());
+        }
         self.iam().await?;
         let mut data = self.inner.lock().await;
         let _lock = self.file_lock().await?;
@@ -295,10 +312,62 @@ impl AuthState {
                 group: hash(&group),
                 expires_at: Utc::now().timestamp() + 600,
                 slt_hash: None,
+                slt: None,
+                attempt: Some(BrowserAttempt {
+                    attempt_id: Uuid::new_v4().to_string(),
+                    identity_kind: identity_kind.into(),
+                    return_to,
+                    popup,
+                }),
             },
         );
         self.persist(&data)?;
         Ok((nonce, group))
+    }
+    pub async fn browser_attempt(
+        &self,
+        nonce: &str,
+        group: &str,
+    ) -> Result<BrowserAttempt, String> {
+        let mut data = self.inner.lock().await;
+        let _lock = self.file_lock().await?;
+        self.reload(&mut data)?;
+        data.states
+            .get(&hash(nonce))
+            .filter(|ticket| {
+                ticket.group == hash(group) && ticket.expires_at > Utc::now().timestamp()
+            })
+            .and_then(|ticket| ticket.attempt.clone())
+            .ok_or("Login state is missing, expired, or belongs to another browser".into())
+    }
+    pub async fn resume_browser_login(&self, nonce: &str, group: &str) -> Result<String, String> {
+        let (slt, session) = {
+            let mut data = self.inner.lock().await;
+            let _lock = self.file_lock().await?;
+            self.reload(&mut data)?;
+            let ticket = data
+                .states
+                .get(&hash(nonce))
+                .filter(|ticket| {
+                    ticket.group == hash(group) && ticket.expires_at > Utc::now().timestamp()
+                })
+                .ok_or("Login state is missing, expired, or belongs to another browser")?;
+            let session = ticket
+                .slt_hash
+                .as_ref()
+                .and_then(|key| data.logins.get(key))
+                .filter(|receipt| receipt.completed)
+                .map(|receipt| receipt.session.clone());
+            (ticket.slt.clone(), session)
+        };
+        if let Some(session) = session {
+            self.get(&session)
+                .await?
+                .ok_or("This login is no longer active; begin again")?;
+            return Ok(session);
+        }
+        let slt = slt.ok_or("No recoverable login exists; begin a new IAM login")?;
+        self.login(&slt, Some((nonce, group)), None, None).await
     }
     pub async fn login(
         &self,
@@ -332,7 +401,7 @@ impl AuthState {
         } else {
             self.receipt_key("login", slt)
         };
-        let (binding, group) = if let Some((nonce, group)) = browser {
+        let (binding, group, requested_kind) = if let Some((nonce, group)) = browser {
             let ticket = data
                 .states
                 .get_mut(&hash(nonce))
@@ -344,15 +413,23 @@ impl AuthState {
                 return Err("Login state does not match the initiating browser".into());
             }
             ticket.slt_hash = Some(login_hash.clone());
+            let kind = ticket
+                .attempt
+                .as_ref()
+                .filter(|attempt| matches!(attempt.identity_kind.as_str(), "carbon" | "silicon"))
+                .ok_or("Begin a new login and choose Carbon or Silicon")?
+                .identity_kind
+                .clone();
             (
                 format!("browser:{}:{}", hash(group), hash(nonce)),
                 Some(hash(group)),
+                Some(kind),
             )
         } else {
             let key = cli_key
                 .filter(|k| Uuid::parse_str(k).is_ok())
                 .ok_or("CLI login requires a UUID Idempotency-Key")?;
-            (format!("cli:{key}"), None)
+            (format!("cli:{key}"), None, None)
         };
         let input_hash = self.receipt_key(
             "login-input",
@@ -403,6 +480,13 @@ impl AuthState {
                 },
             );
         }
+        if let Some((nonce, _)) = browser {
+            // The encrypted attempt recovers a lost exchange without exposing its SLT again.
+            data.states
+                .get_mut(&hash(nonce))
+                .expect("bound login state")
+                .slt = Some(slt.to_owned());
+        }
         self.persist(&data)?;
         if data.logins[&login_hash].candidate.is_none() {
             let mutation = mutation(&login_hash)?;
@@ -423,15 +507,6 @@ impl AuthState {
             .candidate
             .clone()
             .expect("candidate");
-        if is_actor
-            && tokens
-                .actor
-                .as_ref()
-                .and_then(|actor| actor["public_id"].as_str())
-                != Some(slt)
-        {
-            return Err("IAM testing login returned a different account".into());
-        }
         if org.is_some_and(|org| tokens.org_id.as_deref() != Some(org)) {
             return Err("The IAM login belongs to another organization".into());
         }
@@ -440,6 +515,19 @@ impl AuthState {
         }
         if !prove(&iam, &mut tokens).await? {
             return Err("IAM login is no longer active; start a new login".into());
+        }
+        let actor = tokens
+            .actor
+            .as_ref()
+            .ok_or("IAM did not prove the login identity")?;
+        if requested_kind
+            .as_deref()
+            .is_some_and(|kind| actor["type"].as_str() != Some(kind))
+        {
+            return Err("IAM identity kind does not match the chosen login button".into());
+        }
+        if is_actor && actor["public_id"].as_str() != Some(slt) {
+            return Err("IAM testing login returned a different account".into());
         }
         let receipt = data.logins.get_mut(&login_hash).expect("receipt");
         receipt.completed = true;
@@ -454,6 +542,12 @@ impl AuthState {
                 pending_pair: false,
             },
         );
+        if let Some((nonce, _)) = browser {
+            data.states
+                .get_mut(&hash(nonce))
+                .expect("bound login state")
+                .slt = None;
+        }
         self.persist(&data)?;
         Ok(id)
     }
@@ -511,8 +605,17 @@ impl AuthState {
                 .await
                 .map_err(|_| "IAM refresh could not complete; retry in this account")?;
             let mut next = tokens_of(pair, &iam.world)?;
-            if next.actor != row.tokens.actor || next.org_id != row.tokens.org_id {
+            if next
+                .actor
+                .as_ref()
+                .is_some_and(|actor| Some(actor) != row.tokens.actor.as_ref())
+                || next.org_id != row.tokens.org_id
+            {
                 return Err("IAM refresh changed the immutable account or organization".into());
+            }
+            // Missing exchange identity is verified by introspection against the saved account.
+            if next.actor.is_none() {
+                next.actor = row.tokens.actor.clone();
             }
             next.context_id = row.tokens.context_id.clone();
             row.tokens = next;
@@ -655,7 +758,15 @@ fn tokens_of(pair: models::OAuthTokenResponse, world: &World) -> Result<IamToken
         context_id: Uuid::new_v4().to_string(),
         world: world.clone(),
     };
-    if !tokens.valid()
+    if tokens.organizations().len() != 1
+        || tokens.access_token.is_empty()
+        || tokens.refresh_token.is_empty()
+        || tokens.actor.as_ref().is_some_and(|actor| {
+            !valid_actor_id(
+                actor["type"].as_str().unwrap_or_default(),
+                actor["public_id"].as_str().unwrap_or_default(),
+            )
+        })
         || pair.token_type != "Bearer"
         || pair.expires_in <= 0
         || pair.scope.split_whitespace().any(|s| s.starts_with("obo:"))
@@ -691,7 +802,18 @@ fn validate_proof(
         .authorization
         .as_ref()
         .ok_or("IAM 5 requires one authorization snapshot; sign in again")?;
-    let actor = tokens.actor.as_ref().ok_or("Missing session identity")?;
+    let proven_kind =
+        serde_json::to_value(&seen.actor_type).map_err(|_| "Missing session identity")?;
+    let proven_kind = proven_kind.as_str().ok_or("Missing session identity")?;
+    let proven_id = seen
+        .public_id
+        .as_deref()
+        .ok_or("Missing session identity")?;
+    if !valid_actor_id(proven_kind, proven_id) {
+        return Err("IAM did not prove a canonical Carbon or Silicon identity".into());
+    }
+    let proven_actor = json!({"type":proven_kind,"public_id":proven_id});
+    let actor = tokens.actor.as_ref().unwrap_or(&proven_actor);
     let kind = actor["type"].as_str().ok_or("Missing session identity")?;
     let id = actor["public_id"]
         .as_str()
@@ -741,6 +863,7 @@ fn validate_proof(
         );
     }
     tokens.expires_at = seen.expires_at;
+    tokens.actor = Some(proven_actor);
     Ok(true)
 }
 

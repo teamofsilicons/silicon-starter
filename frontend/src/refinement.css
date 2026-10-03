@@ -57,3 +57,5 @@ body { -webkit-font-smoothing:antialiased; background:#fafbfc; }
 }
 @media(min-width:601px) { .account-menu-body a { display:none; } }
 @media(prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none !important; animation:none !important; } }
+
+.login-dialog{width:min(440px,calc(100% - 32px));padding:28px;border:1px solid var(--border);border-radius:12px;color:inherit;background:#fff;box-shadow:0 20px 80px #0003}.login-dialog::backdrop{background:#1f232866}.login-dialog p{color:var(--muted)}.login-choices{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:24px}.login-dialog>form{display:flex;justify-content:flex-end}
