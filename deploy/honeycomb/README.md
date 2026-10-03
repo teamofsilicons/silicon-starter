@@ -21,6 +21,16 @@ Keep the exact accepted archive for retries; a release version is immutable. Inc
 
 Existing release archives keep their original bytes, manifest IDs, versions, and checksums. Honeycomb's migrated catalog supplies the exact verified legacy manifest alias for those releases; do not repack an old version merely to replace `tos>starter`. Migrate existing local `installed.json` registries with Honeycomb's mapping tool and the approved IAM mapping while maintenance workers are stopped; retain package paths and command wrappers.
 
+## IAM 5 release 0.3.1 (3 October 2026 UTC)
+
+The API and website run IAM 5 code from `93b409bd50969f6201de634504f3428071f2d040`. The native API release is `/opt/starter/releases/53e82efea6be279a`, binary SHA-256 `6c3ed29f061985ebf2c133f28ad3877223d1a524c1467c17d9f4935b6bf8c469`. The stopped-writer cutover backup is `/var/lib/starter/backups/iam5-cutover/20261003T180530Z`. All three starters were preserved; production CLI Carbon login, browser callback exchange, anonymous browsing after old-cookie expiry, and stale-context denial passed.
+
+Honeycomb accepted configuration revision 4 / IAM revision 41 and release `5fff3be5-9923-4fa1-af88-156423180bb1` on `prod`. Its immutable six-platform archive is 22,146,444 bytes, SHA-256 `8ba6fe57b2e425e4ca25639f0261a9ade337fe926f4019f815c8ffecac8f85a8`. The exact ordinary scopes and five Briefcase operations are effective, with no provider permission review pending.
+
+Updating the app configuration made the Honeycomb catalog private pending validator request `31805a0a-8d99-422f-8319-87baa82be20a`. A validator must review it in [received requests](https://console.honeycomb.teamofsilicons.com/requests/received) before public Honeycomb downloads resume. [GitHub v0.3.1](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.3.1) is distributed independently. The historical public state below does not describe the current configuration.
+
+Shared testing acceptance is incomplete because Starter lacks Honeycomb's protected lifecycle participant. See [migration validation and remaining acceptance checks](../../docs/IAM5-MIGRATION.md#release-031-validation-and-review-status-3-october-2026); do not report the pending environment as ready.
+
 ## Identifier release 0.2.2 (24 September 2026 IST)
 
 [GitHub v0.2.2](https://github.com/teamofsilicons/silicon-starter/releases/tag/v0.2.2) is published from source commit `a0e4402ad0b6a4cc9f3c953577c633ebad648fdf`. The six-platform Honeycomb archive is 20,768,539 bytes, SHA-256 `fae2024770d29f3fef9b75e13de033943c27b214a928b68c7a2e26e40927797c`; accepted release ID `c2407fbb-d8fb-4073-9870-9b6fe61005c5` on `prod`.
