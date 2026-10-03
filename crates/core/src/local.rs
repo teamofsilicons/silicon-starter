@@ -18,8 +18,6 @@ pub struct Binding {
     pub api: String,
     pub mode: Mode,
     #[serde(default)]
-    pub auto_update: bool,
-    #[serde(default)]
     pub pinned: Option<String>,
 }
 /// A checkout stays with the profile and login that created it. None context ID is explicit anonymous access.
@@ -71,7 +69,7 @@ pub fn load_binding(dir: impl AsRef<Path>) -> Result<Binding, String> {
 pub fn save_binding(dir: impl AsRef<Path>, binding: &Binding) -> Result<(), String> {
     let p = binding_path(&dir);
     let bytes = serde_json::to_vec_pretty(binding).map_err(|e| e.to_string())?;
-    fs::write(p, bytes).map_err(|e| e.to_string())
+    atomic_write(&p, &bytes).map_err(|e| e.to_string())
 }
 pub fn data_dir() -> PathBuf {
     std::env::var_os("SILICON_HOME")
@@ -83,7 +81,68 @@ pub fn data_dir() -> PathBuf {
 pub fn registry_path() -> PathBuf {
     data_dir().join("registry.json")
 }
-pub fn register_checkout(dir: impl AsRef<Path>, binding: &Binding) -> Result<(), String> {
+/// Read and prune the to-update list, including bindings from older CLI versions.
+pub fn registered_checkouts() -> Result<Vec<RegistryEntry>, String> {
+    let _lock = registry_lock()?;
+    read_registry()
+}
+
+fn registry_lock() -> Result<fs::File, String> {
+    fs::create_dir_all(data_dir()).map_err(|error| error.to_string())?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir().join("registry.lock"))
+        .map_err(|error| error.to_string())?;
+    file.lock().map_err(|error| error.to_string())?;
+    Ok(file)
+}
+
+fn read_registry() -> Result<Vec<RegistryEntry>, String> {
+    let file = registry_path();
+    let bytes = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read update registry: {error}")),
+    };
+    let stored: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid update registry: {error}"))?;
+    let mut entries = Vec::new();
+    for value in stored {
+        // Old registries also contained disabled and developer checkouts.
+        if value["binding"]["auto_update"] == false {
+            continue;
+        }
+        let entry: RegistryEntry = serde_json::from_value(value)
+            .map_err(|error| format!("invalid update registry entry: {error}"))?;
+        if !binding_path(&entry.path)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        let binding = load_binding(&entry.path)?;
+        if binding.mode == Mode::Download && binding.pinned.is_none() {
+            entries.push(RegistryEntry {
+                path: entry.path,
+                binding,
+            });
+        }
+    }
+    let cleaned = serde_json::to_vec_pretty(&entries).map_err(|e| e.to_string())?;
+    if bytes != cleaned {
+        atomic_write(&file, &cleaned).map_err(|e| e.to_string())?;
+    }
+    Ok(entries)
+}
+
+pub fn register_checkout(
+    dir: impl AsRef<Path>,
+    binding: &Binding,
+    enabled: bool,
+) -> Result<(), String> {
     let path = dir
         .as_ref()
         .canonicalize()
@@ -92,15 +151,15 @@ pub fn register_checkout(dir: impl AsRef<Path>, binding: &Binding) -> Result<(),
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut entries: Vec<RegistryEntry> = fs::read(&file)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let _lock = registry_lock()?;
+    let mut entries = read_registry()?;
     entries.retain(|x| x.path != path);
-    entries.push(RegistryEntry {
-        path,
-        binding: binding.clone(),
-    });
+    if enabled && binding.mode == Mode::Download && binding.pinned.is_none() {
+        entries.push(RegistryEntry {
+            path,
+            binding: binding.clone(),
+        });
+    }
     let bytes = serde_json::to_vec_pretty(&entries).map_err(|e| e.to_string())?;
     atomic_write(&file, &bytes).map_err(|e| e.to_string())
 }

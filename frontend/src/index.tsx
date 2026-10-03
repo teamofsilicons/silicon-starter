@@ -1,18 +1,21 @@
 import { ArcButton, ArcInput, ArcCard } from './arc';
 import { render } from 'solid-js/web';
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
+import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
 import type { JSX } from 'solid-js';
 import './styles.css';
 import './refinement.css';
 import { StoragePermissions } from './permissions';
 import { createApi, sessionOf, contextsOf, type Session, type SavedContext } from './api';
+import { blockDraftKey, blockDraftStore, type BlockDraft } from './block-draft';
 import { callbackRecovery, hasLoginCallback } from './callback';
 
 type Starter = { id: string; name: string; description: string; owner: string; visibility: 'public' | 'private'; version: string; downloads: number; stars: number; updated_at: string; tags: string[]; yaml: string };
 type Version = { version: string; commit: string; notes: string; published_at: string };
 type Discussion = { id: string; parent_id?: string; author: string; body: string; created_at: string };
 type RepoFile = { path: string; content: string | null; size?: number; reason?: string };
-type Recipe = { schema: number; name?: string; description?: string; auto_update: boolean; variables: { name: string; type: string; prompt?: string; default: unknown; when?: string; choices?: unknown }[]; files: { from: string; to: string }[]; build: string[] };
+type Block = { id: string; kind: 'gene' | 'isi' | 'function'; name: string; description: string; owner: string; visibility: 'public' | 'private'; version: string; downloads: number; updated_at: string };
+type BlockContent = { id: string; kind: Block['kind']; version: string; text?: string; archive_base64?: string };
+type Recipe = { schema: number; name?: string; description?: string; variables: { name: string; type: string; prompt?: string; default: unknown; when?: string; choices?: unknown }[]; files: { from: string; to: string }[]; build: string[] };
 type Repository = { commit: string | null; files: RepoFile[]; draft?: boolean; truncated?: boolean; template?: Recipe | null; template_error?: string | null };
 type Route = { page: string; id: string; tab: string; path: string };
 const API = (import.meta as ImportMeta & { env: { VITE_API_URL?: string } }).env.VITE_API_URL || '';
@@ -20,6 +23,14 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 const client = createApi(API);
 const api = client.request;
 const repoUrl = (id: string, tab = 'code', path = '') => `/starters/${encodeURIComponent(id)}${tab === 'code' ? '' : `/${tab}`}${path ? `/${path.split('/').map(encodeURIComponent).join('/')}` : ''}`;
+const blockUrl = (id: string) => `/blocks/${encodeURIComponent(id)}`;
+const blockLabel = (kind: string) => kind === 'isi' ? 'ISI' : kind === 'function' ? 'Function' : 'Gene';
+const downloadFile = (content: BlobPart, name: string, type: string) => {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = name; anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
 const parseRoute = (): Route => {
   try {
     const parts = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -109,7 +120,7 @@ function Template(props: { id: string; repository: Repository }) {
     <div class="section-heading"><div><h2>{props.repository.template?.name || 'Template'}</h2><p>{props.repository.template?.description || 'Questions, build steps, and source ingredients for this starter.'}</p></div><a class="button" href={source('starter.yaml')}>View starter.yaml</a></div>
     <Show when={props.repository.template_error}><ErrorMessage error={`Template preview unavailable: ${props.repository.template_error}`} /></Show>
     <Show when={props.repository.template} fallback={<Show when={!props.repository.template_error}><div class="notice">Template metadata is unavailable. Browse the source ingredients below.</div></Show>}>{recipe => <>
-      <p class="template-intro">This is a preview of the author’s recipe. Expressions and scripts run locally through the CLI. Initial automatic updates: <strong>{recipe().auto_update ? 'enabled' : 'disabled'}</strong>.</p>
+      <p class="template-intro">This is a preview of the author’s recipe. Expressions and scripts run locally through the CLI. Downloads auto-update by default; pinned downloads and developer pulls do not.</p>
       <ol class="template-flow">
         <li><section class="panel template-stage"><header><span>1</span><h3>Choose a folder</h3></header><p>Starter asks for an available destination folder unless you supply one. Your folder name is separate from the silicon’s identity.</p></section></li>
         <li><section class="panel template-stage"><header><span>2</span><h3>Resolve answers in order</h3></header><p>Press Enter to accept a resolved default. Saved answers are reused on updates; variables without a prompt resolve silently.</p>
@@ -167,10 +178,7 @@ function RepositoryPage(props: { id: string; route: Route; session: Session; nav
       setActionError('');
       const payload = await api<{ bundle_base64: string }>(`/api/v1/starters/${encodeURIComponent(props.id)}/archive${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`);
       const bytes = Uint8Array.from(atob(payload.bundle_base64), character => character.charCodeAt(0));
-      const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-      const anchor = document.createElement('a');
-      anchor.href = url; anchor.download = `${props.id}.bundle`; anchor.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      downloadFile(bytes, `${props.id}.bundle`, 'application/octet-stream');
     } catch (error) { setActionError(message(error)); }
   };
   const star = async () => {
@@ -222,22 +230,145 @@ function RepositoryPage(props: { id: string; route: Route; session: Session; nav
   </Show>;
 }
 
+function BlockList(props: { query: string; kind?: string; embedded?: boolean; items?: Block[] }) {
+  const [blocks, { refetch }] = createResource(() => props.items ? false : props.query, async q => {
+    const items = await api<(Starter | Block)[]>(q ? `/api/v1/search?${new URLSearchParams({ q })}` : '/api/v1/blocks');
+    return items.filter((item): item is Block => 'kind' in item);
+  });
+  const visible = () => (props.items || blocks() || []).filter(item => !props.kind || item.kind === props.kind);
+  return <section class="block-list"><Show when={!props.embedded || props.items?.length || blocks.error || blocks()?.length}>
+    <Show when={props.embedded}><div class="section-heading"><div><h2>Genes, ISIs & functions</h2><p>Reusable blocks for your silicon.</p></div><a href={`/blocks?q=${encodeURIComponent(props.query)}`}>Browse all blocks →</a></div></Show>
+    <Show when={!blocks.error} fallback={<ErrorMessage error={blocks.error} retry={refetch} />}><Show when={!blocks.loading} fallback={<div class="loading">Loading blocks…</div>}><div class="starter-list"><For each={visible()} fallback={<div class="empty panel"><h2>No matching blocks</h2><p>Try another search, or publish a reusable block.</p></div>}>{item => <article class="starter-card panel"><div class="starter-card-heading"><Icon name={item.kind === 'gene' ? 'book' : 'code'} /><a href={blockUrl(item.id)}><strong>{item.id}</strong></a><span class="badge">{blockLabel(item.kind)}</span><span class="badge">{item.visibility}</span></div><p>{item.description || item.name}</p><div class="starter-card-footer"><span>{item.owner}</span><span><Icon name="download" size={15} />{item.downloads}</span><span>Updated {timeAgo(item.updated_at)}</span><a href={blockUrl(item.id)}>View block →</a></div></article>}</For></div></Show></Show>
+  </Show></section>;
+}
+
+function Blocks(props: { search: string }) {
+  const [query, setQuery] = createSignal(new URLSearchParams(props.search).get('q') || '');
+  const [kind, setKind] = createSignal('');
+  createEffect(() => setQuery(new URLSearchParams(props.search).get('q') || ''));
+  return <section class="page-width explore"><header class="explore-heading"><span class="eyebrow">REUSABLE SILICON BLOCKS</span><h1>Genes, ISIs & functions.</h1><p>Find prompts, internal silicons, and functions to use in your silicon.</p></header><div class="explore-tools"><div class="search"><Icon name="search" size={20} /><input aria-label="Search blocks" type="search" value={query()} onInput={event => setQuery(event.currentTarget.value)} placeholder="Search genes, ISIs, and functions…" /></div><a class="button primary" href="/blocks/new"><Icon name="plus" size={16} />Publish a block</a></div><div class="registry-filters"><For each={['', 'gene', 'isi', 'function']}>{value => <button class={kind() === value ? 'active' : ''} onClick={() => setKind(value)}>{value ? blockLabel(value) : 'All blocks'}</button>}</For></div><BlockList query={query()} kind={kind()} /></section>;
+}
+
+function BlockPage(props: { id: string; session: Session }) {
+  const [version, setVersion] = createSignal('latest');
+  const [error, setError] = createSignal('');
+  const [downloading, setDownloading] = createSignal(false);
+  const [block, { refetch }] = createResource(() => props.id, id => api<Block>(`/api/v1/blocks/${encodeURIComponent(id)}`));
+  const [versions, { refetch: reloadVersions }] = createResource(() => props.id, id => api<{ version: string; published_at: string }[]>(`/api/v1/blocks/${encodeURIComponent(id)}/versions`));
+  const [content, { refetch: reloadContent }] = createResource(() => !block.error && block()?.kind === 'gene' ? [props.id, version()] as const : false, ([id, version]) => api<BlockContent>(`/api/v1/blocks/${encodeURIComponent(id)}/content?version=${encodeURIComponent(version)}`));
+  createEffect(() => { props.id; setVersion('latest'); setError(''); });
+  const download = async () => {
+    setError(''); setDownloading(true);
+    try {
+      const value = await api<BlockContent>(`/api/v1/blocks/${encodeURIComponent(props.id)}/download?version=${encodeURIComponent(version())}`);
+      const name = `${props.id.replace(':', '-')}-${value.version.slice(0, 12)}`;
+      if (value.kind === 'gene' && typeof value.text === 'string') downloadFile(value.text, `${name}.md`, 'text/markdown;charset=utf-8');
+      else if (value.archive_base64) downloadFile(Uint8Array.from(atob(value.archive_base64), character => character.charCodeAt(0)), `${name}.zip`, 'application/zip');
+      else throw new Error('The server returned no block content.');
+    } catch (error) { setError(message(error)); }
+    finally { setDownloading(false); }
+  };
+  const canPublish = () => props.session.authenticated && props.session.org_id === block()?.owner;
+  return <section class="page-width block-page"><a href="/blocks">← Explore blocks</a><Show when={!block.error} fallback={<ErrorMessage error={block.error} retry={refetch} />}><Show when={block()} fallback={<div class="loading">Loading block…</div>}>{item => <>
+    <div class="section-heading"><div><h1>{item().id}</h1><p>{item().description || item().name}</p><span class="badge">{blockLabel(item().kind)}</span> <span class="badge">{item().visibility}</span> <span class="muted">Published by {item().owner}</span></div><Show when={canPublish()}><a class="button" href={`${blockUrl(props.id)}/edit`}>{item().kind === 'gene' ? 'Edit gene' : 'Publish a version'}</a></Show></div>
+    <div class="block-toolbar"><label for="block-version">Version</label><select id="block-version" value={version()} onChange={event => setVersion(event.currentTarget.value)}><option value="latest">Latest · {item().version.slice(0, 12)}</option><For each={versions.error ? [] : versions()}>{entry => <option value={entry.version}>{entry.version.slice(0, 12)} · {new Date(entry.published_at).toLocaleDateString()}</option>}</For></select><button class="button primary" disabled={downloading()} onClick={download}><Icon name="download" size={16} />{downloading() ? 'Downloading…' : `Download ${item().kind === 'gene' ? 'Markdown' : 'ZIP'}`}</button></div>
+    <Show when={versions.error}><ErrorMessage error={versions.error} retry={reloadVersions} /></Show><Show when={error()}><ErrorMessage error={error()} /></Show>
+    <p class="muted block-version">Content hash: <code>{version() === 'latest' ? item().version : version()}</code></p>
+    <Show when={item().kind === 'gene'} fallback={<div class="notice">The ZIP contains <code>{item().kind === 'isi' ? 'isi.yaml' : 'function.yaml'}</code> and any supporting files. Each archive defines exactly one {blockLabel(item().kind)}.</div>}><Show when={!content.error} fallback={<ErrorMessage error={content.error} retry={reloadContent} />}><Show when={!content.loading && content()} fallback={<div class="loading">Loading gene…</div>}>{value => <section class="readme panel"><header><Icon name="book" size={16} />{item().id}.md</header><Readme content={value().text || ''} link={path => path.startsWith('#') ? path : ''} /></section>}</Show></Show></Show>
+    <p class="muted">Downloads use the latest content unless you select a version. Each published content hash remains available.</p><pre class="block-command"><code>{`starter download ${props.id}${version() === 'latest' ? '' : `@${version()}`}`}</code></pre>
+  </>}</Show></Show></section>;
+}
+
+function PublishBlock(props: { id?: string; session: Session; login: () => void; navigate: (path: string) => void }) {
+  const organizations = () => props.session.org_id ? [props.session.org_id] : [];
+  const [kind, setKind] = createSignal<Block['kind']>('gene');
+  const [id, setId] = createSignal('');
+  const [organization, setOrganization] = createSignal(props.session.org_id || organizations()[0] || '');
+  const [name, setName] = createSignal('');
+  const [description, setDescription] = createSignal('');
+  const [visibility, setVisibility] = createSignal('public');
+  const [text, setText] = createSignal('');
+  const [archive, setArchive] = createSignal<File>();
+  const [error, setError] = createSignal('');
+  const [saving, setSaving] = createSignal(false);
+  const [pending, setPending] = createSignal<BlockDraft>();
+  const [restoring, setRestoring] = createSignal(true);
+  const draftKey = blockDraftKey(API, props.session.context_id || 'anonymous', props.id);
+  let active = true;
+  onCleanup(() => { active = false; });
+  const restoreDraft = (draft: BlockDraft) => {
+    setPending(draft);
+    const body = draft.body, identifier = String(body.id).split(':');
+    setKind(identifier[0] as Block['kind']); setId(identifier[1]);
+    setOrganization(String(body.org_id)); setName(String(body.name || '')); setDescription(String(body.description || ''));
+    setVisibility(String(body.visibility)); setText(String(body.text || ''));
+  };
+  onMount(async () => {
+    try { const draft = await blockDraftStore(draftKey, 'read'); if (active) { if (draft) restoreDraft(draft); setRestoring(false); } }
+    catch (e) { if (active) setError(message(e)); }
+  });
+  const discard = async () => {
+    try { await blockDraftStore(draftKey, 'remove'); if (active) { setPending(undefined); setError(''); } }
+    catch (e) { if (active) setError(message(e)); }
+  };
+  const [existing, { refetch }] = createResource(() => props.id || false, async id => {
+    const item = await api<Block>(`/api/v1/blocks/${encodeURIComponent(id)}`);
+    const content = item.kind === 'gene' ? await api<BlockContent>(`/api/v1/blocks/${encodeURIComponent(id)}/content`) : null;
+    return { item, content };
+  });
+  createEffect(() => { const current = existing.error ? undefined : existing(); if (current && !pending()) { setKind(current.item.kind); setId(current.item.id.split(':')[1]); setOrganization(current.item.owner); setName(current.item.name); setDescription(current.item.description); setVisibility(current.item.visibility); setText(current.content?.text || ''); } });
+  const submit = async (event: SubmitEvent) => {
+    event.preventDefault(); if (saving() || restoring()) return;
+    setSaving(true); setError('');
+    try {
+      let draft = pending();
+      if (!draft) {
+      let archive_base64;
+      if (kind() !== 'gene') {
+        const file = archive();
+        if (!file || !file.name.toLowerCase().endsWith('.zip')) throw new Error('Choose a ZIP file to publish.');
+        if (file.size > 8 * 1024 * 1024) throw new Error('The ZIP must be 8 MiB or smaller.');
+        archive_base64 = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = () => reject(new Error('Could not read the ZIP file.')); reader.readAsDataURL(file); });
+      } else if (new TextEncoder().encode(text()).length > 1024 * 1024) throw new Error('The gene must be 1 MiB or smaller.');
+      draft = { key: crypto.randomUUID(), body: { id: `${kind()}:${id().trim()}`, org_id: organization(), name: name().trim(), description: description().trim(), visibility: visibility(), ...(kind() === 'gene' ? { text: text() } : { archive_base64 }) } };
+      await blockDraftStore(draftKey, 'write', draft);
+      if (!active) return;
+      setPending(draft);
+      }
+      const item = await api<Block>('/api/v1/blocks', { method: 'POST', headers: {'Idempotency-Key': draft.key}, body: JSON.stringify(draft.body) });
+      await blockDraftStore(draftKey, 'remove');
+      if (active) props.navigate(blockUrl(item.id));
+    } catch (error) { if (active) setError(message(error)); }
+    finally { if (active) setSaving(false); }
+  };
+  return <section class="page-width create-page"><a href={props.id ? blockUrl(props.id) : '/blocks'}>← Back to blocks</a><h1>{props.id ? 'Publish a new version' : 'Publish a block'}</h1><p>Write a gene in Markdown, or upload an ISI or function ZIP. Every distinct upload gets an immutable content hash.</p><Show when={props.session.authenticated && organizations().length} fallback={<div class="notice"><p>Log in with an organization to publish a block.</p><ArcButton class="button primary" onClick={props.login}>Log in with IAM</ArcButton></div>}><Show when={!existing.error} fallback={<ErrorMessage error={existing.error} retry={refetch} />}><Show when={!existing.loading} fallback={<div class="loading">Loading block…</div>}><Show when={!props.id || organizations().includes(organization())} fallback={<div class="notice">Only members of {organization()} can publish a new version.</div>}><form class="create-form block-form" onSubmit={submit}><fieldset class="block-fields" disabled={!!pending() || restoring() || saving()}>
+    <label>Organization<select required disabled={!!props.id} value={organization()} onChange={event => setOrganization(event.currentTarget.value)}><For each={organizations()}>{org => <option value={org}>{org}</option>}</For></select></label>
+    <label>Block type<select disabled={!!props.id} value={kind()} onChange={event => { setKind(event.currentTarget.value as Block['kind']); setArchive(undefined); }}><option value="gene">Gene</option><option value="isi">ISI</option><option value="function">Function</option></select></label>
+    <label>Block ID<div class="starter-id-field"><span>{kind()}:</span><ArcInput required disabled={!!props.id} pattern="[a-z0-9\-]{1,128}" maxLength={128} value={id()} onInput={event => setId(event.currentTarget.value)} placeholder="my-block" aria-describedby="block-id-help" /></div></label><p id="block-id-help" class="muted">Use lowercase letters, numbers, and hyphens. Publishing an ID owned by your organization adds a version.</p>
+    <label>Name<ArcInput value={name()} onInput={event => setName(event.currentTarget.value)} /></label><label>Description<ArcInput value={description()} onInput={event => setDescription(event.currentTarget.value)} /></label><label>Visibility<select disabled={!!props.id} value={visibility()} onChange={event => setVisibility(event.currentTarget.value)}><option value="public">Public</option><option value="private">Private · organization members</option></select></label>
+    <Show when={kind() === 'gene'} fallback={<><label>ZIP archive<ArcInput type="file" required accept=".zip,application/zip" onChange={event => setArchive(event.currentTarget.files?.[0])} /></label><p class="muted">Include <code>{kind() === 'isi' ? 'isi.yaml' : 'function.yaml'}</code> at the archive root with exactly one {blockLabel(kind())}, plus supporting files. <Show when={kind() === 'isi'}>The ISI name must be <code>{id() || 'my-block'}</code>. </Show>Maximum ZIP size: 8 MiB.</p></>}><label>Gene Markdown<textarea required rows={16} value={text()} onInput={event => setText(event.currentTarget.value)} placeholder="# My gene&#10;&#10;Write the prompt to include in the silicon’s DNA." /></label><details class="gene-preview"><summary>Preview Markdown</summary><section class="readme panel"><Readme content={text()} link={path => path.startsWith('#') ? path : ''} /></section></details></Show>
+    </fieldset><Show when={pending()}><div class="notice"><p>Your original block is saved for this account. Review storage permission in a separate tab, then retry this exact publication.</p><a class="button" href="/permissions" target="_blank" rel="noopener noreferrer">Review storage access ↗</a><ArcButton type="button" disabled={saving()} onClick={discard}>Discard saved retry</ArcButton></div></Show>
+    <Show when={error()}><ErrorMessage error={error()} /></Show><div class="form-actions"><a class="button" href={props.id ? blockUrl(props.id) : '/blocks'}>Cancel</a><ArcButton class="button primary" disabled={saving() || restoring()}>{saving() ? 'Publishing…' : pending() ? 'Retry publication' : 'Publish block'}</ArcButton></div>
+  </form></Show></Show></Show></Show></section>;
+}
+
 function Explore(props: { session: Session; search: string }) {
   const initial = () => new URLSearchParams(props.search);
   const [query, setQuery] = createSignal(initial().get('q') || '');
   const [org, setOrg] = createSignal(initial().get('org') || '');
   const [sort, setSort] = createSignal('updated');
   const [mine, setMine] = createSignal(false);
+  createEffect(() => setSort(query() ? 'relevance' : 'updated'));
   const [starters, { refetch }] = createResource(() => [query(), mine() ? props.session.org_id || '' : org()] as const, async ([q, organization]) => {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
     if (organization) params.set('org', organization);
-    const result = await api<Starter[] | { items: Starter[] }>(`/api/v1/starters?${params}`);
-    return Array.isArray(result) ? result : result.items;
+    const result = await api<(Starter | Block)[]>(`/api/v1/search?${params}`);
+    return result.filter(item => !organization || item.owner === organization);
   });
   createEffect(() => { setOrg(initial().get('org') || ''); setQuery(initial().get('q') || ''); });
-  const visible = () => starters.error ? [] : [...(starters() || [])].sort((a, b) => sort() === 'stars' ? b.stars - a.stars : sort() === 'downloads' ? b.downloads - a.downloads : +new Date(b.updated_at) - +new Date(a.updated_at));
-  return <section class="page-width explore"><header class="explore-heading"><span class="eyebrow">THE SILICON REGISTRY</span><h1>Find your next starting point.</h1><p>Explore silicon architectures published by organizations.</p></header><div class="explore-tools"><div class="search"><Icon name="search" size={20} /><ArcInput aria-label="Search starters" type="search" value={query()} onInput={event => setQuery(event.currentTarget.value)} placeholder="Search starters, architectures, or tags…" /><kbd>⌘ K</kbd></div><select aria-label="Sort starters" value={sort()} onChange={event => setSort(event.currentTarget.value)}><option value="updated">Recently updated</option><option value="stars">Most starred</option><option value="downloads">Most downloaded</option></select></div><div class="registry-filters"><ArcButton aria-pressed={!mine() && !org()} class={!mine() && !org() ? 'active' : ''} onClick={() => { setMine(false); setOrg(''); }}>All starters</ArcButton><Show when={props.session.org_id}><ArcButton aria-pressed={mine()} class={mine() ? 'active' : ''} onClick={() => setMine(true)}>My organization</ArcButton></Show><Show when={org() && !mine()}><span>Organization: {org()}</span></Show></div><Show when={!starters.error} fallback={<ErrorMessage error={`The registry could not be loaded. ${message(starters.error)}`} retry={refetch} />}><Show when={!starters.loading} fallback={<div class="loading">Loading the registry…</div>}><div class="starter-list"><For each={visible()} fallback={<div class="empty panel"><Icon name="book" size={30} /><h2>{query() || org() || mine() ? 'No matching starters' : 'No starters yet'}</h2><p>{query() || org() || mine() ? 'Try another search or organization.' : 'Organizations can add the first starter after logging in.'}</p></div>}>{item => <ArcCard as="article" class="starter-card panel"><div class="starter-card-heading"><Icon name="book" size={19} /><a href={repoUrl(item.id)}>{item.owner} <span>/</span> <strong>{item.name}</strong></a><span class="badge">{item.visibility}</span></div><p>{item.description || 'No description provided.'}</p><div class="tags"><For each={item.tags}>{tag => <a href={`/?q=${encodeURIComponent(tag)}`}>{tag}</a>}</For></div><div class="starter-card-footer"><span><Icon name="star" size={15} />{item.stars}</span><span><Icon name="download" size={15} />{item.downloads}</span><span>Updated {timeAgo(item.updated_at)}</span><a href={repoUrl(item.id)}>View code →</a></div></ArcCard>}</For></div></Show></Show></section>;
+  const visible = () => starters.error ? [] : [...(starters() || [])].filter((item): item is Starter => !('kind' in item)).sort((a, b) => sort() === 'relevance' ? 0 : sort() === 'stars' ? b.stars - a.stars : sort() === 'downloads' ? b.downloads - a.downloads : +new Date(b.updated_at) - +new Date(a.updated_at));
+  return <section class="page-width explore"><header class="explore-heading"><span class="eyebrow">THE SILICON REGISTRY</span><h1>Find your next starting point.</h1><p>Explore silicon architectures and reusable blocks published by organizations.</p></header><div class="explore-tools"><div class="search"><Icon name="search" size={20} /><ArcInput aria-label="Search starters" type="search" value={query()} onInput={event => setQuery(event.currentTarget.value)} placeholder="Search starters, architectures, or tags…" /><kbd>⌘ K</kbd></div><select aria-label="Sort starters" value={sort()} onChange={event => setSort(event.currentTarget.value)}><Show when={query()}><option value="relevance">Best match</option></Show><option value="updated">Recently updated</option><option value="stars">Most starred</option><option value="downloads">Most downloaded</option></select></div><div class="registry-filters"><ArcButton aria-pressed={!mine() && !org()} class={!mine() && !org() ? 'active' : ''} onClick={() => { setMine(false); setOrg(''); }}>All starters</ArcButton><Show when={props.session.org_id}><ArcButton aria-pressed={mine()} class={mine() ? 'active' : ''} onClick={() => setMine(true)}>My organization</ArcButton></Show><Show when={org() && !mine()}><span>Organization: {org()}</span></Show></div><Show when={!starters.error} fallback={<ErrorMessage error={`The registry could not be loaded. ${message(starters.error)}`} retry={refetch} />}><Show when={!starters.loading} fallback={<div class="loading">Loading the registry…</div>}><div class="starter-list"><For each={visible()} fallback={<div class="empty panel"><Icon name="book" size={30} /><h2>{query() || org() || mine() ? 'No matching starters' : 'No starters yet'}</h2><p>{query() || org() || mine() ? 'Try another search or organization.' : 'Organizations can add the first starter after logging in.'}</p></div>}>{item => <ArcCard as="article" class="starter-card panel"><div class="starter-card-heading"><Icon name="book" size={19} /><a href={repoUrl(item.id)}>{item.owner} <span>/</span> <strong>{item.name}</strong></a><span class="badge">{item.visibility}</span></div><p>{item.description || 'No description provided.'}</p><div class="tags"><For each={item.tags}>{tag => <a href={`/?q=${encodeURIComponent(tag)}`}>{tag}</a>}</For></div><div class="starter-card-footer"><span><Icon name="star" size={15} />{item.stars}</span><span><Icon name="download" size={15} />{item.downloads}</span><span>Updated {timeAgo(item.updated_at)}</span><a href={repoUrl(item.id)}>View code →</a></div></ArcCard>}</For></div></Show></Show><BlockList query={query()} items={starters.error ? [] : (starters() || []).filter((item): item is Block => 'kind' in item)} embedded /></section>;
 }
 
 function CreateStarter(props: { session: Session; login: () => void; navigate: (path: string) => void }) {
@@ -258,10 +389,10 @@ function CreateStarter(props: { session: Session; login: () => void; navigate: (
     } catch (error) { setError(message(error)); }
     finally { setSaving(false); }
   };
-  return <section class="page-width create-page"><a href="/">← Explore starters</a><h1>Create a starter</h1><p>Add your organization’s architecture. Use the CLI to push repository files and publish releases.</p><Show when={props.session.authenticated && organizations().length} fallback={<div class="notice"><p>{props.session.authenticated ? 'An attached organization is required to create a starter.' : 'Log in with an organization to create a starter.'}</p><ArcButton class="button primary" onClick={props.login}>{props.session.authenticated ? 'Connect an organization' : 'Log in with IAM'}</ArcButton></div>}><form onSubmit={submit} class="create-form"><label>Organization<select required value={organization()} onChange={event => setOrganization(event.currentTarget.value)}><For each={organizations()}>{org => <option value={org}>{org}</option>}</For></select></label><label>Starter ID<div class="starter-id-field"><span>{organization()}.</span><ArcInput required pattern="[A-Za-z0-9._-]+" value={id()} onInput={event => setId(event.currentTarget.value)} placeholder="starter-name" /></div></label><label>Name<ArcInput required value={name()} onInput={event => setName(event.currentTarget.value)} /></label><label>Description<ArcInput value={description()} onInput={event => setDescription(event.currentTarget.value)} /></label><label>Visibility<select value={visibility()} onChange={event => setVisibility(event.currentTarget.value)}><option value="public">Public</option><option value="private">Private</option></select></label><label>silicon.yaml<textarea required rows={13} value={yaml()} onInput={event => setYaml(event.currentTarget.value)} spellcheck={false} placeholder="Paste your silicon.yaml configuration" /></label><Show when={error()}><ErrorMessage error={error()} /></Show><div class="form-actions"><a class="button" href="/">Cancel</a><ArcButton class="button primary" disabled={saving()}>{saving() ? 'Creating…' : 'Create starter'}</ArcButton></div></form></Show></section>;
+  return <section class="page-width create-page"><a href="/">← Explore starters</a><h1>Create a starter</h1><p>Add your organization’s architecture. Use the CLI to push repository files and publish releases.</p><Show when={props.session.authenticated && organizations().length} fallback={<div class="notice"><p>{props.session.authenticated ? 'An attached organization is required to create a starter.' : 'Log in with an organization to create a starter.'}</p><ArcButton class="button primary" onClick={props.login}>{props.session.authenticated ? 'Connect an organization' : 'Log in with IAM'}</ArcButton></div>}><form onSubmit={submit} class="create-form"><label>Organization<select required value={organization()} onChange={event => setOrganization(event.currentTarget.value)}><For each={organizations()}>{org => <option value={org}>{org}</option>}</For></select></label><label>Starter ID<div class="starter-id-field"><span>{organization()}.</span><ArcInput required pattern="[a-z0-9\-]{1,128}" maxLength={128} title="Use lowercase letters, numbers, and hyphens; dots are not allowed." value={id()} onInput={event => setId(event.currentTarget.value)} placeholder="starter-name" /></div></label><label>Name<ArcInput required value={name()} onInput={event => setName(event.currentTarget.value)} /></label><label>Description<ArcInput value={description()} onInput={event => setDescription(event.currentTarget.value)} /></label><label>Visibility<select value={visibility()} onChange={event => setVisibility(event.currentTarget.value)}><option value="public">Public</option><option value="private">Private</option></select></label><label>silicon.yaml<textarea required rows={13} value={yaml()} onInput={event => setYaml(event.currentTarget.value)} spellcheck={false} placeholder="Paste your silicon.yaml configuration" /></label><Show when={error()}><ErrorMessage error={error()} /></Show><div class="form-actions"><a class="button" href="/">Cancel</a><ArcButton class="button primary" disabled={saving()}>{saving() ? 'Creating…' : 'Create starter'}</ArcButton></div></form></Show></section>;
 }
 function Docs() {
-  return <section class="page-width docs"><span class="eyebrow">FOR CARBONS & SILICONS</span><h1>Starter, in your terminal.</h1><p>Pull architectures, push repository changes, and publish releases with the Starter CLI.</p><div class="docs-grid"><article class="panel"><h2>1. Install</h2><p>Install on macOS (Apple Silicon or Intel) or Linux (ARM64 or x86_64). The installer puts <code>starter</code> on your PATH.</p><pre><code>curl -fsSL https://starter.teamofsilicons.com/install.sh | sh</code></pre><p>Git is required for repository operations. Open a new terminal if the installer updates your shell’s PATH.</p><a href="https://github.com/teamofsilicons/silicon-starter/releases/latest">Release downloads ↗</a></article><article class="panel"><h2>2. Pull</h2><p>Pull a starter into a new folder. Templates ask their setup questions and build the configured silicon. Rebuild later with saved answers or change them with <code>--set</code>.</p><pre><code>{'starter pull organization.starter\nstarter seed\nstarter seed --set waveform=false'}</code></pre><p>Use <code>starter download organization.starter</code> for an instance that follows the recipe’s automatic update setting. Developer pulls never auto-update.</p></article><article class="panel"><h2>3. Publish</h2><p>Commit and push your organization’s changes, then publish a version.</p><pre><code>{'starter commit "update architecture"\nstarter push\nstarter publish latest 1.0'}</code></pre></article></div></section>;
+  return <section class="page-width docs"><span class="eyebrow">FOR CARBONS & SILICONS</span><h1>Starter, in your terminal.</h1><p>Pull architectures, push repository changes, and publish releases with the Starter CLI.</p><div class="docs-grid"><article class="panel"><h2>1. Install</h2><p>Install on macOS (Apple Silicon or Intel) or Linux (ARM64 or x86_64). The installer puts <code>starter</code> on your PATH.</p><pre><code>curl -fsSL https://starter.teamofsilicons.com/install.sh | sh</code></pre><p>Git is required for repository operations. Open a new terminal if the installer updates your shell’s PATH.</p><a href="https://github.com/teamofsilicons/silicon-starter/releases/latest">Release downloads ↗</a></article><article class="panel"><h2>2. Pull</h2><p>Pull a starter into a new folder. Templates ask their setup questions and build the configured silicon. Rebuild later with saved answers or change them with <code>--set</code>.</p><pre><code>{'starter pull organization.starter\nstarter seed\nstarter seed --set waveform=false'}</code></pre><p>Use <code>starter download organization.starter</code> for an instance that auto-updates by default. Use an @version suffix to pin a download, or starter update off to stop updates. Developer pulls never auto-update.</p></article><article class="panel"><h2>3. Publish</h2><p>Commit and push your organization’s changes, then publish a version.</p><pre><code>{'starter commit "update architecture"\nstarter push\nstarter publish latest 1.0'}</code></pre></article></div></section>;
 }
 function App() {
   const [route, setRoute] = createSignal(parseRoute());
@@ -314,7 +445,7 @@ function App() {
       event.preventDefault(); navigate(url.pathname + url.search + url.hash);
     };
     const keyboard = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); document.querySelector<HTMLInputElement>('input[aria-label="Search starters"]')?.focus(); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); document.querySelector<HTMLInputElement>('input[type="search"]')?.focus(); }
     };
     document.addEventListener('click', click); window.addEventListener('popstate', updateLocation); window.addEventListener('keydown', keyboard);
     onCleanup(() => { document.removeEventListener('click', click); window.removeEventListener('popstate', updateLocation); window.removeEventListener('keydown', keyboard); });
@@ -334,10 +465,19 @@ function App() {
     try { await api('/auth/logout', {method:'POST'}); location.assign('/'); }
     catch (error) { setAuthError(message(error)); setSwitching(false); }
   };
-  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<ArcButton class="button" disabled={loginPending()} onClick={login}>Log in</ArcButton>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><details class="account-menu" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}><summary class="button" aria-label="Account actions">···</summary><div class="account-menu-body" onClick={event => { const menu = event.currentTarget.closest("details"); if (menu) menu.open = false; }}><a href="/permissions">Permissions</a><ArcButton onClick={login}>Add account</ArcButton><ArcButton disabled={switching()} onClick={logout}>Sign out</ArcButton></div></details></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
+  return <div class="app"><header class="site-header"><a class="brand" href="/"><span class="brand-mark">✦</span>starter</a><nav aria-label="Main navigation"><a href="/" aria-current={route().page === 'explore' ? 'page' : undefined}>Explore</a><a href="/blocks" aria-current={route().page === 'blocks' ? 'page' : undefined}>Blocks</a><a href="/docs" aria-current={route().page === 'docs' ? 'page' : undefined}>Docs</a></nav><div class="account"><Show when={!authLoading()} fallback={<span class="muted">Checking session…</span>}><Show when={session().authenticated} fallback={<ArcButton class="button" disabled={loginPending()} onClick={login}>Log in</ArcButton>}><div class="account-controls"><a class="button" href="/permissions">Permissions</a><span class="account-name" title={session().actor?.public_id}>{accountName()}</span><select aria-label="Account and organization" disabled={switching()} onChange={event => { const id = event.currentTarget.value; event.currentTarget.value = session().context_id || ''; void selectContext(id); }}><For each={contexts().length ? contexts() : [{ context_id: session().context_id!, actor: session().actor!, org_id: session().org_id!, selected: true }]}>{context => <option value={context.context_id} selected={context.context_id === session().context_id}>{context.actor.public_id} · {context.org_id}</option>}</For></select><details class="account-menu" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}><summary class="button" aria-label="Account actions">···</summary><div class="account-menu-body" onClick={event => { const menu = event.currentTarget.closest("details"); if (menu) menu.open = false; }}><a href="/permissions">Permissions</a><ArcButton onClick={login}>Add account</ArcButton><ArcButton disabled={switching()} onClick={logout}>Sign out</ArcButton></div></details></div></Show><a class="button primary" href="/new"><Icon name="plus" size={16} />New starter</a></Show></div></header>
     <Show when={authError()}><div class="page-width"><ErrorMessage error={authError()} /></div></Show>
     <Show when={loginPending() && !authLoading()}><div class="page-width notice"><p>Your original IAM login is still pending. Retry it, or cancel before starting another login.</p><ArcButton class="button primary" onClick={recoverLogin}>Retry login</ArcButton><ArcButton class="button" onClick={cancelLogin}>Cancel login</ArcButton></div></Show>
-    <main><Show when={!authLoading() && !loginPending()} fallback={<div class="page-width loading">{authLoading() ? 'Checking session…' : 'Finish or cancel this login to continue.'}</div>}><Show when={route().page !== 'permissions'} fallback={<StoragePermissions session={session()} api={api} apiBase={API} login={login} />}><Show when={route().page === 'starters' && route().id} fallback={<Show when={route().page === 'explore'} fallback={<Show when={route().page === 'docs'} fallback={<Show when={route().page === 'new'} fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Show>}><Docs /></Show>}><Explore session={session()} search={search()} /></Show>}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Show></Show></Show></main>
+    <main><Show when={!authLoading() && !loginPending()} fallback={<div class="page-width loading">{authLoading() ? 'Checking session…' : 'Finish or cancel this login to continue.'}</div>}><Switch fallback={<div class="page-width empty"><h1>Page not found</h1><a href="/">Explore starters</a></div>}>
+      <Match when={route().page === 'permissions'}><StoragePermissions session={session()} api={api} apiBase={API} login={login} /></Match>
+      <Match when={route().page === 'starters' && route().id}><RepositoryPage id={route().id} route={route()} session={session()} navigate={navigate} login={login} /></Match>
+      <Match when={route().page === 'explore'}><Explore session={session()} search={search()} /></Match>
+      <Match when={route().page === 'docs'}><Docs /></Match>
+      <Match when={route().page === 'new'}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><CreateStarter session={session()} login={login} navigate={navigate} /></Show></Match>
+      <Match when={route().page === 'blocks' && (route().id === 'new' || route().tab === 'edit')}><Show when={!authLoading()} fallback={<div class="page-width loading">Checking your organization…</div>}><PublishBlock id={route().id === 'new' ? undefined : route().id} session={session()} login={login} navigate={navigate} /></Show></Match>
+      <Match when={route().page === 'blocks' && route().id}><BlockPage id={route().id} session={session()} /></Match>
+      <Match when={route().page === 'blocks'}><Blocks search={search()} /></Match>
+    </Switch></Show></main>
     <footer class="site-footer"><span>✦ Silicon Starter</span><a href="/docs">Documentation</a><a href="https://github.com/teamofsilicons/silicon-starter">GitHub ↗</a></footer>
   </div>;
 }

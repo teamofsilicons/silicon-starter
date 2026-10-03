@@ -51,6 +51,7 @@ pub async fn embed(text: &str, is_query: bool) -> Result<Vec<f32>, String> {
 
     let response = reqwest::Client::new()
         .post(EMBED_ENDPOINT)
+        .timeout(std::time::Duration::from_secs(20))
         .header("x-goog-api-key", key)
         .json(&body)
         .send()

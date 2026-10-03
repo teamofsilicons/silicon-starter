@@ -14,7 +14,6 @@ pub struct State {
     pub source_id: String,
     pub revision: String,
     pub answers: Map<String, Value>,
-    pub auto_update: bool,
     #[serde(default)]
     pub generated: Vec<String>,
 }
@@ -28,15 +27,6 @@ pub fn load_state(project: &Path) -> Result<Option<State>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
-}
-
-pub fn auto_update(project: &Path) -> Result<bool, String> {
-    Ok(template::compile(&project.join(".starterbase"))?.auto_update)
-}
-
-pub fn set_auto_update(project: &Path, enabled: bool) -> Result<(), String> {
-    let _lock = lock_project(project)?;
-    template::set_auto_update(&project.join(".starterbase"), enabled)
 }
 
 /// Build/reconfigure an instance or install a staged upstream recipe.
@@ -141,9 +131,6 @@ fn apply_inner(
     let scratch = Scratch::new(&project)?;
     let staged_source = scratch.0.join("source");
     copy_source(source, &staged_source)?;
-    if project.join(".starterbase/starter.yaml").is_file() {
-        template::set_auto_update(&staged_source, auto_update(&project)?)?;
-    }
     ensure_ignore(&staged_source)?;
     if !reset.is_empty() {
         let recipe = template::compile(&staged_source)?;
@@ -234,7 +221,6 @@ fn apply_inner(
         source_id: source_id.into(),
         revision: revision.into(),
         answers: built.answers,
-        auto_update: built.auto_update,
         generated: new
             .dirs
             .iter()
@@ -291,7 +277,6 @@ pub fn preview(project: &Path) -> Result<State, String> {
             .map(|s| s.revision.clone())
             .unwrap_or_default(),
         answers: built.answers,
-        auto_update: built.auto_update,
         generated: new
             .dirs
             .iter()
@@ -932,7 +917,6 @@ mod tests {
         );
         assert!(project.join("workspace").is_dir());
         fs::write(project.join("workspace/personal.txt"), "user content").unwrap();
-        set_auto_update(&project, false).unwrap();
         let tools = project.join("prompts/tools.md");
         let local_tools = fs::read_to_string(&tools)
             .unwrap()
@@ -958,7 +942,6 @@ mod tests {
         .unwrap();
         assert_eq!(state.revision, "revision-two");
         assert_eq!(state.answers["silicon_token"], "private-token");
-        assert!(!state.auto_update);
         let merged = fs::read_to_string(&tools).unwrap();
         assert!(merged.contains("# Team tools"));
         assert!(merged.contains("share generated audio links with the team."));

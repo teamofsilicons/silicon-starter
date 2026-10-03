@@ -28,3 +28,5 @@ Open the returned HTTPS IAM review link and approve there. Completion validates 
 A failed or permission-blocked publication keeps its exact commit, release version, notes, context and idempotency key in private `.git/starter-publication.json`. `publish retry` uses those original bytes even if local HEAD changed. `publish cancel` discards the local receipt without undoing any remote result. Another account cannot resume it.
 
 Verification: `cargo test -p starter -p silicon-starter-core`, `cargo clippy -p starter -p silicon-starter-core --all-targets -- -D warnings`, `python3 crates/cli/tests/iam5_contexts.py <built-starter>` and `python3 scripts/check-cli.py <built-starter>` run without production access.
+
+A rejected block publication keeps its exact file bytes and metadata in the selected profile. Complete `starter permission authorize` / `starter permission complete` and run `starter publish gene:example --retry` (also works for `isi:` and `function:` IDs). `--cancel` discards only that local retry; it does not undo an already completed publication. A replacement login cannot reuse a pending block action.

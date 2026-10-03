@@ -159,6 +159,175 @@ async fn publish_with_feature(
         ])?;
         row
     };
+    let folders = [
+        "starters".to_owned(),
+        feature.org.clone(),
+        id.into(),
+        row.version.version.clone(),
+    ];
+    drive_upload(
+        feature,
+        &mut row,
+        &stored_key,
+        provider,
+        &folders,
+        "starter.git.bundle",
+        true,
+    )
+    .await?;
+    // Record the release only after both provider commit and explicit public
+    // access are confirmed. The durable receipt can restore a lost local save.
+    feature.iam.assert_current().await?;
+    let mut versions = s.versions.write().await;
+    let entries = versions.entry(id.into()).or_default();
+    if let Some(existing) = entries.iter().find(|v| v.version == row.version.version) {
+        if existing.commit != row.version.commit || existing.notes != row.version.notes {
+            return Err(Error::conflict("Another release occupies this version"));
+        }
+    } else {
+        entries.push(row.version.clone());
+    }
+    drop(versions);
+    if let Some(entry) = row.entry_id {
+        s.briefcase_entries
+            .write()
+            .await
+            .insert(format!("{id}:{}", row.version.commit), entry);
+    }
+    crate::persist_state_checked(s)
+        .await
+        .map_err(Error::unavailable)?;
+    Ok(row.version)
+}
+
+pub(crate) async fn publish_block(
+    s: &AppState,
+    session: &IamTokens,
+    block: &silicon_starter_core::blocks::Block,
+    bytes: &[u8],
+) -> Result<Option<Uuid>> {
+    if std::env::var_os("STARTER_IAM_APP_SECRET").is_none()
+        && std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_none()
+        && std::env::var_os("BRIEFCASE_APP_SECRET").is_none()
+    {
+        // Preserve the existing explicitly unconfigured local registry mode.
+        return Ok(None);
+    }
+    let feature = crate::feature_routes::feature(s, session).await?;
+    let provider = Provider::from_env()?;
+    publish_block_with_feature(&feature, block, bytes, &provider)
+        .await
+        .map(Some)
+}
+async fn publish_block_with_feature(
+    feature: &Feature,
+    block: &silicon_starter_core::blocks::Block,
+    bytes: &[u8],
+    provider: &Provider,
+) -> Result<Uuid> {
+    if block.owner != feature.org || digest(bytes) != block.version {
+        return Err(Error::conflict(
+            "Block content or organization does not match the selected action",
+        ));
+    }
+    let input_hash = digest(&encode(&json!([
+        block.id,
+        block.owner,
+        block.name,
+        block.description,
+        block.visibility,
+        block.version
+    ]))?);
+    let stored_key = digest(&encode(&(
+        "block-v1",
+        &feature.context_id,
+        &block.id,
+        &block.version,
+    ))?);
+    let mut row = if let Some(row) = feature
+        .lease
+        .get::<Publication>("publication", &stored_key)?
+    {
+        if row.context_id != feature.context_id
+            || row.starter != block.id
+            || row.input_hash != input_hash
+        {
+            return Err(Error::conflict(
+                "Retry the original block content and metadata in its original account",
+            ));
+        }
+        row
+    } else {
+        let row = Publication {
+            id: Uuid::new_v4(),
+            context_id: feature.context_id.clone(),
+            starter: block.id.clone(),
+            input_hash,
+            version: Version {
+                version: block.version.clone(),
+                commit: block.version.clone(),
+                notes: String::new(),
+                published_at: block.updated_at,
+            },
+            bundle_hash: digest(bytes),
+            destination: None,
+            parent_path: String::new(),
+            next_folder: 0,
+            upload_id: None,
+            entry_id: None,
+            linked: false,
+            cancelled: false,
+        };
+        feature.lease.put_many(vec![
+            ("publication".into(), stored_key.clone(), encode(&row)?),
+            (
+                "publication-bytes".into(),
+                row.id.to_string(),
+                bytes.to_vec(),
+            ),
+        ])?;
+        row
+    };
+    let (kind, slug) = block
+        .id
+        .split_once(':')
+        .ok_or_else(|| Error::conflict("Invalid block identity"))?;
+    let folders = [
+        "blocks".to_owned(),
+        feature.org.clone(),
+        kind.into(),
+        slug.into(),
+        block.version.clone(),
+    ];
+    let filename = if kind == "gene" {
+        "gene.md"
+    } else {
+        "block.zip"
+    };
+    let public = matches!(block.visibility, silicon_starter_core::Visibility::Public);
+    drive_upload(
+        feature,
+        &mut row,
+        &stored_key,
+        provider,
+        &folders,
+        filename,
+        public,
+    )
+    .await?;
+    feature.iam.assert_current().await?;
+    row.entry_id
+        .ok_or_else(|| Error::unavailable("Briefcase omitted the completed block entry"))
+}
+async fn drive_upload(
+    feature: &Feature,
+    row: &mut Publication,
+    stored_key: &str,
+    provider: &Provider,
+    folders: &[String],
+    filename: &str,
+    public: bool,
+) -> Result<()> {
     if row.cancelled {
         return Err(Error::conflict(
             "This publication was cancelled; create a new action",
@@ -177,14 +346,8 @@ async fn publish_with_feature(
         }
         if row.destination.is_none() {
             row.destination = Some(selected);
-            row.save(feature, &stored_key)?;
+            row.save(feature, stored_key)?;
         }
-        let folders = [
-            "starters".to_owned(),
-            feature.org.clone(),
-            id.into(),
-            row.version.version.clone(),
-        ];
         while row.next_folder < folders.len() {
             let name = &folders[row.next_folder];
             let op = operation(&json!([
@@ -197,7 +360,7 @@ async fn publish_with_feature(
             let value = provider
                 .json(
                     feature,
-                    &row,
+                    row,
                     "briefcase.folders.create",
                     "/api/v1/obo/folders/create",
                     &json!({"operation_id":op,"parent_path":row.parent_path,"name":name}),
@@ -209,7 +372,7 @@ async fn publish_with_feature(
                 .ok_or_else(|| Error::unavailable("Briefcase omitted the created folder path"))?
                 .to_owned();
             row.next_folder += 1;
-            row.save(feature, &stored_key)?;
+            row.save(feature, stored_key)?;
         }
         let operation_id = row.upload_operation();
         // Always reconcile before resending any bytes, including after a
@@ -217,7 +380,7 @@ async fn publish_with_feature(
         let status = provider
             .json(
                 feature,
-                &row,
+                row,
                 "briefcase.uploads.status",
                 "/api/v1/obo/uploads/status",
                 &json!({"operation_id":operation_id}),
@@ -241,10 +404,10 @@ async fn publish_with_feature(
             if digest(&bytes) != row.bundle_hash {
                 return Err(Error::conflict("The saved publication content changed"));
             }
-            let reservation=provider.json(feature,&row,"briefcase.uploads.reserve","/api/v1/obo/uploads/reserve",&json!({"operation_id":operation_id,"parent_path":row.parent_path,"name":"starter.git.bundle","content_type":"application/octet-stream","size":bytes.len(),"sha256":row.bundle_hash})).await?;
+            let reservation=provider.json(feature,row,"briefcase.uploads.reserve","/api/v1/obo/uploads/reserve",&json!({"operation_id":operation_id,"parent_path":row.parent_path,"name":filename,"content_type":"application/octet-stream","size":bytes.len(),"sha256":row.bundle_hash})).await?;
             let upload_id = validate_status(&reservation, operation_id, row.upload_id)?;
             row.upload_id = Some(upload_id);
-            row.save(feature, &stored_key)?;
+            row.save(feature, stored_key)?;
             if reservation["state"] == "reserved" {
                 let capability = reservation["capability"]
                     .as_str()
@@ -253,7 +416,7 @@ async fn publish_with_feature(
                         Error::unavailable("Upload reservation is awaiting a fresh capability")
                     })?;
                 let root = provider
-                    .bound_root(feature, &row, "briefcase.uploads.reserve", false)
+                    .bound_root(feature, row, "briefcase.uploads.reserve", false)
                     .await?;
                 let transferred = provider
                     .transfer(&root, upload_id, capability, bytes)
@@ -268,12 +431,12 @@ async fn publish_with_feature(
             current.ok_or_else(|| Error::unavailable("Briefcase upload state is unavailable"))?;
         let upload_id = validate_status(&status, operation_id, row.upload_id)?;
         row.upload_id = Some(upload_id);
-        row.save(feature, &stored_key)?;
+        row.save(feature, stored_key)?;
         if status["state"] == "staged" {
             status = provider
                 .json(
                     feature,
-                    &row,
+                    row,
                     "briefcase.uploads.commit",
                     "/api/v1/obo/uploads/commit",
                     &json!({"operation_id":operation_id,"upload_id":upload_id}),
@@ -298,47 +461,27 @@ async fn publish_with_feature(
             ));
         }
         row.entry_id = Some(entry);
-        row.save(feature, &stored_key)?;
-        let link = provider
-            .json(
-                feature,
-                &row,
-                "briefcase.link_access.update",
-                "/api/v1/obo/link-access",
-                &json!({"operation_id":row.link_operation(),"entry_id":entry,"enabled":true}),
-            )
-            .await?;
-        if link["enabled"] != true || link["effective"] != true {
-            return Err(Error::unavailable(
-                "Briefcase did not confirm public-link access",
-            ));
+        row.save(feature, stored_key)?;
+        if public {
+            let link = provider
+                .json(
+                    feature,
+                    row,
+                    "briefcase.link_access.update",
+                    "/api/v1/obo/link-access",
+                    &json!({"operation_id":row.link_operation(),"entry_id":entry,"enabled":true}),
+                )
+                .await?;
+            if link["enabled"] != true || link["effective"] != true {
+                return Err(Error::unavailable(
+                    "Briefcase did not confirm public-link access",
+                ));
+            }
         }
         row.linked = true;
-        row.save(feature, &stored_key)?;
+        row.save(feature, stored_key)?;
     }
-    // Record the release only after both provider commit and explicit public
-    // access are confirmed. The durable receipt can restore a lost local save.
-    feature.iam.assert_current().await?;
-    let mut versions = s.versions.write().await;
-    let entries = versions.entry(id.into()).or_default();
-    if let Some(existing) = entries.iter().find(|v| v.version == row.version.version) {
-        if existing.commit != row.version.commit || existing.notes != row.version.notes {
-            return Err(Error::conflict("Another release occupies this version"));
-        }
-    } else {
-        entries.push(row.version.clone());
-    }
-    drop(versions);
-    if let Some(entry) = row.entry_id {
-        s.briefcase_entries
-            .write()
-            .await
-            .insert(format!("{id}:{}", row.version.commit), entry);
-    }
-    crate::persist_state_checked(s)
-        .await
-        .map_err(Error::unavailable)?;
-    Ok(row.version)
+    Ok(())
 }
 fn uuid(value: &Value) -> Result<Uuid> {
     value

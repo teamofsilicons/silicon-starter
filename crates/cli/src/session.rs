@@ -528,7 +528,7 @@ pub fn private_write(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 /// One registry supervisor per home, independent of selected profile.
-pub fn daemon_lock() -> Result<File> {
+pub fn daemon_lock() -> Result<Option<File>> {
     let dir = local::data_dir();
     private_dirs(&dir)?;
     let path = dir.join("daemon.lock");
@@ -541,10 +541,11 @@ pub fn daemon_lock() -> Result<File> {
         options.mode(0o600);
     }
     let file = options.open(path)?;
-    file.try_lock().map_err(|error| {
-        format!("another Starter daemon may already supervise this home: {error}")
-    })?;
-    Ok(file)
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
 }
 pub fn remove(path: &Path) -> Result<()> {
     check_regular(path)?;
@@ -663,7 +664,6 @@ mod tests {
             api: snapshot.selection.api.clone(),
             auth_context: None,
             mode: local::Mode::Download,
-            auto_update: true,
             pinned: None,
         };
         assert!(snapshot.for_checkout(&binding).unwrap().saved.is_none());

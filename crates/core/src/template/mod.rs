@@ -23,8 +23,6 @@ pub struct Recipe {
     pub name: Option<String>,
     pub description: Option<String>,
     #[serde(default)]
-    pub auto_update: bool,
-    #[serde(default)]
     pub variables: IndexMap<String, Variable>,
     #[serde(default)]
     pub files: Vec<FileSpec>,
@@ -68,7 +66,6 @@ pub struct FileSpec {
 pub struct BuildResult {
     /// Contains inactive saved answers too; only active answers are passed to templates/scripts.
     pub answers: Map<String, Value>,
-    pub auto_update: bool,
 }
 
 pub fn parse_yaml(text: &str) -> Result<serde_yaml::Value> {
@@ -77,8 +74,13 @@ pub fn parse_yaml(text: &str) -> Result<serde_yaml::Value> {
 
 /// Safe for recipe previews: structural, expression, type and dependency checks only.
 pub fn parse_recipe(text: &str) -> Result<Recipe> {
-    let recipe: Recipe = serde_yaml::from_value(parse_yaml(text)?)
-        .map_err(|e| format!("invalid starter recipe: {e}"))?;
+    let mut document = parse_yaml(text)?;
+    // Older published recipes used this preference; only the local registry controls updates.
+    if let Some(mapping) = document.as_mapping_mut() {
+        mapping.remove(serde_yaml::Value::String("auto_update".into()));
+    }
+    let recipe: Recipe =
+        serde_yaml::from_value(document).map_err(|e| format!("invalid starter recipe: {e}"))?;
     if recipe.schema != 1 {
         return Err(format!(
             "unsupported recipe schema {}; expected 1",
@@ -342,29 +344,6 @@ pub fn compile(source: &Path) -> Result<Recipe> {
     Ok(recipe)
 }
 
-pub fn auto_update(source: &Path) -> Result<bool> {
-    Ok(
-        parse_recipe(&fs::read_to_string(source.join("starter.yaml")).map_err(|e| e.to_string())?)?
-            .auto_update,
-    )
-}
-
-/// Preserve commands and every other YAML field when saving an instance preference.
-pub fn set_auto_update(source: &Path, value: bool) -> Result<()> {
-    let path = source.join("starter.yaml");
-    let mut document = parse_yaml(&fs::read_to_string(&path).map_err(|e| e.to_string())?)?;
-    document
-        .as_mapping_mut()
-        .ok_or("recipe must be a mapping")?
-        .insert(
-            serde_yaml::Value::String("auto_update".into()),
-            serde_yaml::Value::Bool(value),
-        );
-    let text = serde_yaml::to_string(&document).map_err(|e| e.to_string())?;
-    parse_recipe(&text)?;
-    fs::write(&path, text).map_err(|e| e.to_string())
-}
-
 fn question(
     name: &str,
     var: &Variable,
@@ -543,10 +522,7 @@ pub fn build(
         runtime.evaluate(command)?;
     }
     validate_output(&output)?;
-    Ok(BuildResult {
-        answers,
-        auto_update: recipe.auto_update,
-    })
+    Ok(BuildResult { answers })
 }
 
 pub fn validate_output(output: &Path) -> Result<()> {
@@ -646,7 +622,7 @@ mod tests {
         if !source.exists() {
             return;
         }
-        assert!(compile(&source).unwrap().auto_update);
+        compile(&source).unwrap();
         for enabled in [false, true] {
             let output = tempfile::tempdir().unwrap();
             let answers = json!({"silicon_id":"a\"b\nc:tos","silicon_org_id":"lab","silicon_token":"secret","waveform":enabled,"timezone":"UTC","purpose":"{{ var.silicon_token }}"});
@@ -899,13 +875,23 @@ mod tests {
     }
 
     #[test]
-    fn settings_round_trip_bare_commands_and_preserve_literals() {
+    fn legacy_update_setting_is_ignored_and_bare_commands_preserve_literals() {
         let root = fixture(
             "  a:\n    type: string\n    default: ! printf works !>> 'fallback'",
             "",
         );
-        set_auto_update(root.path(), true).unwrap();
-        assert!(auto_update(root.path()).unwrap());
+        let path = root.path().join("starter.yaml");
+        fs::write(
+            &path,
+            format!("auto_update: false\n{}", fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_value(compile(root.path()).unwrap())
+                .unwrap()
+                .get("auto_update")
+                .is_none()
+        );
         assert_eq!(
             run(root.path(), json!({}), json!({})).unwrap().answers["a"],
             "works"

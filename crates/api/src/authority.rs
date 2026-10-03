@@ -32,6 +32,9 @@ pub(crate) struct Error {
     details: Value,
 }
 impl Error {
+    pub(crate) fn value(&self) -> Value {
+        json!({"error":{"code":self.code,"message":self.message,"retryable":self.retryable,"details":self.details}})
+    }
     pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,

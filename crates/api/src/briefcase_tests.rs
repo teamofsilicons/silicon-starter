@@ -552,3 +552,104 @@ async fn incompatible_receiver_gets_no_authority_or_bytes() {
     }
     assert!(h.app.versions.read().await.is_empty());
 }
+
+fn block(visibility: silicon_starter_core::Visibility) -> silicon_starter_core::blocks::Block {
+    silicon_starter_core::blocks::Block {
+        id: "gene:creativity".into(),
+        kind: silicon_starter_core::blocks::BlockKind::Gene,
+        name: "Creativity".into(),
+        description: "Original block description".into(),
+        owner: ORG.into(),
+        visibility,
+        version: digest(BUNDLE),
+        downloads: 0,
+        updated_at: chrono::Utc::now(),
+    }
+}
+#[tokio::test]
+async fn private_block_reconciles_lost_commit_after_restart_without_public_link() {
+    let mut h = Harness::new().await;
+    let original = block(silicon_starter_core::Visibility::Private);
+    let provider = Provider::new(&h.provider_server.uri()).unwrap();
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert!(h.calls("/api/v1/obo/uploads/reserve").await.is_empty());
+    h.approve("approve-original-private-block").await;
+    h.lose_commit.store(true, Ordering::SeqCst);
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    h.store = FeatureStore::open(&h.dir.path().join("features.sqlite"), &[9; 32]).unwrap();
+    let entry = publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
+        .await
+        .unwrap();
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
+            .await
+            .unwrap(),
+        entry
+    );
+    assert_eq!(h.calls("/api/v1/obo/uploads/reserve").await.len(), 1);
+    assert_eq!(h.calls("/api/v1/obo/uploads/commit").await.len(), 1);
+    assert!(h.calls("/api/v1/obo/link-access").await.is_empty());
+    {
+        let manifest = h.manifest.lock().unwrap();
+        assert_eq!(manifest.as_ref().unwrap()["name"], "gene.md");
+        assert_eq!(
+            manifest.as_ref().unwrap()["parent_path"],
+            format!("/blocks/{ORG}/gene/creativity/{}", original.version)
+        );
+    }
+    let mut changed = original.clone();
+    changed.visibility = silicon_starter_core::Visibility::Public;
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::CONFLICT
+    );
+    changed = original.clone();
+    changed.owner = "another".into();
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::CONFLICT
+    );
+}
+#[tokio::test]
+async fn public_block_requires_explicit_link_and_unchanged_metadata_on_replay() {
+    let h = Harness::new().await;
+    h.approve("approve-original-public-block").await;
+    let original = block(silicon_starter_core::Visibility::Public);
+    let provider = Provider::new(&h.provider_server.uri()).unwrap();
+    publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
+        .await
+        .unwrap();
+    assert_eq!(h.calls("/api/v1/obo/link-access").await.len(), 1);
+    let mut changed = original.clone();
+    changed.updated_at = chrono::Utc::now();
+    publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
+        .await
+        .unwrap();
+    assert_eq!(h.calls("/api/v1/obo/link-access").await.len(), 1);
+    changed.description = "changed publication intent".into();
+    assert_eq!(
+        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::CONFLICT
+    );
+}

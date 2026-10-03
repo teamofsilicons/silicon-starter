@@ -29,7 +29,7 @@ The API identifier cutover is live in release directory `/opt/starter/releases/5
 
 Vercel's project root is now `frontend`, so main-branch pushes deploy the website correctly. The production site serves the canonical login flow.
 
-Honeycomb configuration revision 3 / IAM revision 27 corrects the API base URL to `https://backend.starter.teamofsilicons.com` and requests public visibility, preserving stored secrets and approved scopes. Public publication request `01fa936f-b2ff-476a-97a6-4a7e204b701a` awaits the sole Honeycomb validator gate; the current account cannot decide that gate. Until an authorized validator approves it in the [Honeycomb Console](https://console.honeycomb.teamofsilicons.com), Honeycomb distribution remains private; GitHub downloads are public. Do not describe this request as approved based on the historical 0.2.1 review below.
+Honeycomb configuration revision 3 corrects the API base URL to `https://backend.starter.teamofsilicons.com`, preserving stored secrets and approved scopes. Public publication request `01fa936f-b2ff-476a-97a6-4a7e204b701a` subsequently completed: verification on 3 October 2026 found the validator approved, activation accepted, IAM revision 35, and the catalog active and public. Both Honeycomb and GitHub distribution are public.
 
 ## Historical registration recovery
 

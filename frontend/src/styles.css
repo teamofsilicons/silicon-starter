@@ -21,3 +21,6 @@
 .permission-card label { display:grid; gap:8px; }
 .permission-card input { width:100%; box-sizing:border-box; padding:10px 12px; font:inherit; border:1px solid var(--border, #d5d9df); border-radius:6px; }
 .permission-actions { display:flex; gap:10px; flex-wrap:wrap; }
+.explore>.block-list:not(:empty){margin-top:36px}.block-page{max-width:960px;padding-top:36px;padding-bottom:64px}.block-page>.section-heading{margin-top:30px}.block-page h1,.block-version{overflow-wrap:anywhere}.block-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:24px 0 16px}.block-toolbar select{min-width:0;max-width:100%}.block-page>.readme{margin-bottom:20px}.block-command{padding:16px;background:var(--subtle);border:1px solid var(--border);border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}.gene-preview summary{font-weight:600}.block-form input:disabled,.block-form select:disabled{color:var(--muted);background:var(--subtle)}
+
+.block-fields{border:0;margin:0;padding:0;display:grid;gap:20px;min-width:0}.block-fields:disabled{opacity:.7}

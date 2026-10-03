@@ -3,10 +3,6 @@ schema: 1
 name: Classic sample
 description: A small silicon with optional voice support.
 
-# Initial update preference. The installed instance can change this boolean;
-# updates preserve its local value. false still allows explicit updates.
-auto_update: true
-
 # The installer always asks for an available destination folder when creating
 # an instance. Folder name and silicon identity are independent.
 # Every variable is optional to answer and must declare a default. Automatic

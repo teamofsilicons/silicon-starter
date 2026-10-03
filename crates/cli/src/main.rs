@@ -14,6 +14,7 @@ use std::{
     process::Command as Process,
 };
 
+mod blocks;
 mod permissions;
 mod publication;
 mod session;
@@ -119,10 +120,14 @@ enum Command {
         check: bool,
     },
     Publish {
+        /// latest/commit for starters, history, or a gene:/isi:/function: ID.
         selector: Option<String>,
+        /// Starter release Y.X, block Markdown/ZIP file, or block ID after history.
         version: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+        #[command(flatten)]
+        block: blocks::PublishOptions,
     },
     Update {
         mode: String,
@@ -162,6 +167,8 @@ enum Command {
     Daemon {
         #[arg(long)]
         once: bool,
+        #[arg(long, hide = true)]
+        background: bool,
     },
     Webhook {
         url: String,
@@ -274,23 +281,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pull(&c.api, id.as_deref(), false, dir.as_deref(), &seed).await?
         }
         Command::Download { id, dir, seed } => {
-            pull(&c.api, Some(&id), true, dir.as_deref(), &seed).await?
+            if blocks::is_block(&id) {
+                blocks::download(&c.api, &id, dir.as_deref()).await?
+            } else {
+                pull(&c.api, Some(&id), true, dir.as_deref(), &seed).await?
+            }
         }
         Command::Seed { options, check } => templates::seed(&options, check)?,
         Command::Publish {
             selector,
             version,
             notes,
+            block,
         } => {
             if selector.as_deref() == Some("history") {
-                let b = local::load_binding(".")?;
-                request(
+                if let Some(id) = version {
+                    blocks::history(&c.api, &id).await?;
+                } else {
+                    let b = local::load_binding(".")?;
+                    request(
+                        &c.api,
+                        &format!("/api/v1/starters/{}/versions", b.id),
+                        Method::GET,
+                        None,
+                    )
+                    .await?
+                }
+            } else if selector.as_deref().is_some_and(blocks::is_block) {
+                blocks::publish(
                     &c.api,
-                    &format!("/api/v1/starters/{}/versions", b.id),
-                    Method::GET,
-                    None,
+                    selector.as_deref().unwrap(),
+                    version.as_deref(),
+                    &block,
                 )
-                .await?
+                .await?;
             } else {
                 publication::run(
                     &selector.ok_or("publish requires latest, a commit prefix, or history")?,
@@ -302,27 +326,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Update { mode } => update(&c.api, &mode).await?,
         Command::Revert { target } => revert(&target)?,
-        Command::History { kind } => {
-            let root = local::repo_root()?;
-            match kind.as_deref().unwrap_or("commit") {
-                "commit" => println!("{}", local::commit_history(root, 100)?),
-                "publish" => {
-                    let b = local::load_binding(".")?;
-                    request(
-                        &c.api,
-                        &format!("/api/v1/starters/{}/versions", b.id),
-                        Method::GET,
-                        None,
-                    )
-                    .await?
-                }
-                x => {
-                    return Err(
-                        format!("unknown history kind `{x}`; expected commit or publish").into(),
-                    );
-                }
+        Command::History { kind } => match kind.as_deref().unwrap_or("commit") {
+            "commit" => println!("{}", local::commit_history(local::repo_root()?, 100)?),
+            "publish" => {
+                let b = local::load_binding(".")?;
+                request(
+                    &c.api,
+                    &format!("/api/v1/starters/{}/versions", b.id),
+                    Method::GET,
+                    None,
+                )
+                .await?
             }
-        }
+            id if blocks::is_block(id) => blocks::history(&c.api, id).await?,
+            x => {
+                return Err(format!(
+                    "unknown history kind `{x}`; expected commit, publish, or a block ID"
+                )
+                .into());
+            }
+        },
         Command::Search { q } => {
             request(
                 &c.api,
@@ -333,7 +356,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
         }
         Command::Show { id } => {
-            request(&c.api, &format!("/api/v1/starters/{id}"), Method::GET, None).await?
+            if blocks::is_block(&id) {
+                silicon_starter_core::blocks::parse_id(&id)?;
+                request(&c.api, &format!("/api/v1/blocks/{id}"), Method::GET, None).await?
+            } else {
+                request(&c.api, &format!("/api/v1/starters/{id}"), Method::GET, None).await?
+            }
         }
         Command::Star { id } => {
             authed_request(
@@ -372,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
         }
         Command::Report { body, pr } => report(&body, pr.as_deref())?,
-        Command::Daemon { once } => daemon(&c.api, once).await?,
+        Command::Daemon { once, background } => daemon(&c.api, once, background).await?,
         Command::Webhook { url, secret } => webhook(&url, secret.as_deref())?,
         Command::Unhook => unhook()?,
         Command::List => request(&c.api, "/api/v1/starters", Method::GET, None).await?,
@@ -389,7 +417,10 @@ fn checkout_context(command: ContextCommand) -> session::Result<()> {
         session::current()?.check_current()?;
         binding.auth_context = Some(session::current()?.binding());
         local::save_binding(&root, &binding)?;
-        local::register_checkout(&root, &binding)?;
+        let registered = local::registered_checkouts()?
+            .iter()
+            .any(|entry| entry.path == root);
+        local::register_checkout(&root, &binding, registered)?;
     }
     println!("{}", serde_json::to_value(&binding.auth_context)?);
     Ok(())
@@ -425,7 +456,10 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
         init()?
     }
     if !silicon_starter_core::valid_id(id) {
-        return Err("starter id may contain only letters, numbers, '.', '_' and '-'".into());
+        return Err(
+            "starter id must be org.name; the name uses lowercase letters, numbers and hyphens"
+                .into(),
+        );
     }
     if !Path::new("silicon.yaml").exists() {
         fs::write("silicon.yaml", SEED_YAML)?
@@ -443,11 +477,10 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
         id: id.into(),
         api: api.into(),
         mode: Mode::Development,
-        auto_update: false,
         pinned: None,
     };
     local::save_binding(".", &binding)?;
-    local::register_checkout(".", &binding)?;
+    local::register_checkout(".", &binding, false)?;
     if local::run_git(".", ["rev-parse", "HEAD"].as_ref()).is_err() {
         local::stage_and_commit(".", "Initialize starter")?;
     }
@@ -463,7 +496,6 @@ async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Err
             id: id.unwrap().into(),
             api: api.into(),
             mode: Mode::Development,
-            auto_update: false,
             pinned: None,
         },
         Err(error) => return Err(error.into()),
@@ -518,7 +550,7 @@ async fn push(api: &str, id: Option<&str>) -> Result<(), Box<dyn std::error::Err
         Err(e) => return Err(e),
     }
     local::save_binding(&root, &b)?;
-    local::register_checkout(&root, &b)?;
+    local::register_checkout(&root, &b, false)?;
     Ok(())
 }
 async fn pull(
@@ -573,7 +605,14 @@ async fn pull(
         )
         .into());
     }
-    let query = reference.map_or(String::new(), |r| format!("?ref={}", encode(r)));
+    let query = if download {
+        reference.map_or(String::new(), |r| format!("?ref={}", encode(r)))
+    } else {
+        format!(
+            "?mode=pull{}",
+            reference.map_or(String::new(), |r| format!("&ref={}", encode(r)))
+        )
+    };
     let context = if existing {
         session::current()?.for_checkout(
             current_binding
@@ -589,7 +628,7 @@ async fn pull(
             Method::GET,
             None,
             None,
-            false,
+            !download,
         )
         .await?;
     let temp = templates::Temporary::new("archive.bundle");
@@ -606,11 +645,10 @@ async fn pull(
         .get("commit")
         .and_then(Value::as_str)
         .ok_or("archive response omitted commit")?;
-    let commit = if local::is_hex_commit(response_commit) {
-        response_commit.into()
-    } else {
-        local::bundle_head(&temp.0)?
-    };
+    if !local::is_hex_commit(response_commit) {
+        return Err("archive response must contain a full Git commit ID".into());
+    }
+    let commit = response_commit.to_owned();
     if existing {
         let target = target.canonicalize()?;
         let mut binding = local::load_binding(&target)?;
@@ -625,7 +663,7 @@ async fn pull(
             match silicon_starter_core::seed::load_state(&target) {
                 Ok(state) => state.map(|s| s.revision),
                 Err(error) => {
-                    pause_updates(&target, &mut binding)?;
+                    pause_updates(&target, &binding)?;
                     return Err(format!(
                         "update was not applied; automatic updates are off: {error}"
                     )
@@ -635,6 +673,13 @@ async fn pull(
         } else {
             Some(local::head(&target)?)
         };
+        if reference.is_some()
+            && !templates::exists(&target)
+            && previous.as_deref() != Some(&commit)
+            && local::run_git(&target, &["merge-base", "--is-ancestor", &commit, "HEAD"]).is_ok()
+        {
+            return Err("this version is older than the existing checkout; use --dir to download it into a separate folder".into());
+        }
         if previous.as_deref() != Some(&commit) {
             if !run_git_dir(&target, &["status", "--porcelain"])?.is_empty() {
                 if binding.mode == Mode::Development {
@@ -648,10 +693,10 @@ async fn pull(
             let result = if binding.mode == Mode::Download && templates::exists(&target) {
                 templates::update(&target, &temp.0, &commit, id)
             } else {
-                merge_transaction(&target, &temp.0).map(|_| ())
+                merge_transaction(&target, &temp.0, &commit).map(|_| ())
             };
             if let Err(error) = result {
-                pause_updates(&target, &mut binding)?;
+                pause_updates(&target, &binding)?;
                 return Err(
                     format!("update was not applied; automatic updates are off: {error}").into(),
                 );
@@ -660,33 +705,30 @@ async fn pull(
         // Checkout modes are permanent: downloaded history may contain private
         // instance configuration and must never become pushable.
         binding.pinned = reference.map(str::to_owned);
-        if binding.pinned.is_some() {
-            binding.auto_update = false;
-        }
         local::save_binding(&target, &binding)?;
-        local::register_checkout(&target, &binding)?;
+        if binding.pinned.is_some() || binding.mode == Mode::Development {
+            local::register_checkout(&target, &binding, false)?;
+        }
         println!("updated {id} at {commit}");
         return Ok(());
     }
     local::clone_bundle(&temp.0, &target, &commit)?;
-    let installed = (|| -> Result<bool, Box<dyn std::error::Error>> {
+    let installed = (|| -> Result<(), Box<dyn std::error::Error>> {
         if !templates::exists(&target) {
-            return Ok(download && reference.is_none());
+            return Ok(());
         }
         let state = templates::install(&target, options, id, &commit)?;
         templates::trim_install(&target, &state)?;
         if download {
             templates::commit(&target, "Seed Starter instance")?;
         }
-        Ok(download && reference.is_none() && state.auto_update)
+        Ok(())
     })();
-    let auto_update = match installed {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&target);
-            return Err(error);
-        }
-    };
+    if let Err(error) = installed {
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
+    let auto_update = download && reference.is_none();
     let binding = Binding {
         auth_context: Some(session::current()?.binding()),
         id: id.into(),
@@ -696,11 +738,13 @@ async fn pull(
         } else {
             Mode::Development
         },
-        auto_update,
         pinned: reference.map(str::to_owned),
     };
     local::save_binding(&target, &binding)?;
-    local::register_checkout(&target, &binding)?;
+    local::register_checkout(&target, &binding, auto_update)?;
+    if auto_update {
+        start_daemon(api)?;
+    }
     println!(
         "installed {id} at {commit} in {} (automatic updates {})",
         target.display(),
@@ -709,14 +753,8 @@ async fn pull(
     Ok(())
 }
 
-fn pause_updates(target: &Path, binding: &mut Binding) -> Result<(), Box<dyn std::error::Error>> {
-    binding.auto_update = false;
-    local::save_binding(target, binding)?;
-    local::register_checkout(target, binding)?;
-    if templates::exists(target) {
-        // An invalid recipe may not be editable; the saved binding still pauses it.
-        let _ = silicon_starter_core::seed::set_auto_update(target, false);
-    }
+fn pause_updates(target: &Path, binding: &Binding) -> Result<(), Box<dyn std::error::Error>> {
+    local::register_checkout(target, binding, false)?;
     Ok(())
 }
 
@@ -728,10 +766,9 @@ async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>>
             if binding.mode == Mode::Development {
                 return Err("developer pull checkouts never auto-update".into());
             }
-            binding.auto_update = true;
             binding.pinned = None;
         }
-        "off" => binding.auto_update = false,
+        "off" => {}
         "now" => {
             if binding.mode == Mode::Development {
                 return Err("developer pull checkouts never auto-update".into());
@@ -753,37 +790,66 @@ async fn update(api: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>>
         }
         _ => return Err("update expects on, off, or now".into()),
     }
-    if templates::exists(&root) {
-        silicon_starter_core::seed::set_auto_update(&root, binding.auto_update)?;
-    }
     local::save_binding(&root, &binding)?;
-    local::register_checkout(&root, &binding)?;
-    println!(
-        "auto-update {}",
-        if binding.auto_update { "on" } else { "off" }
-    );
+    local::register_checkout(&root, &binding, mode == "on")?;
+    if mode == "on" {
+        start_daemon(api)?;
+    }
+    println!("auto-update {mode}");
     Ok(())
 }
 
-async fn daemon(_api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let _supervisor = session::daemon_lock()?;
+fn start_daemon(api: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("STARTER_NO_DAEMON").is_some() {
+        return Ok(());
+    }
+    let directory = local::data_dir();
+    fs::create_dir_all(&directory)?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("daemon.log"))?;
+    let mut command = Process::new(std::env::current_exe()?);
+    command
+        .args(["--api", api, "daemon", "--background"])
+        .current_dir(&directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000008 | 0x00000200);
+    }
+    command.spawn()?;
+    Ok(())
+}
+
+async fn daemon(api: &str, once: bool, background: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut lock) = session::daemon_lock()? else {
+        return Ok(());
+    };
+    lock.set_len(0)?;
+    writeln!(lock, "{}", std::process::id())?;
+    if background && !once {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
     loop {
-        let file = local::registry_path();
-        let entries: Vec<local::RegistryEntry> = fs::read(&file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let entries = local::registered_checkouts()?;
         let mut active = 0;
         for entry in entries {
             let Ok(binding) = local::load_binding(&entry.path) else {
                 continue;
             };
-            let auto_update = if templates::exists(&entry.path) {
-                silicon_starter_core::seed::auto_update(&entry.path).unwrap_or(false)
-            } else {
-                binding.auto_update
-            };
-            if binding.mode != Mode::Download || !auto_update || binding.pinned.is_some() {
+            if once && binding.api != api {
+                continue;
+            }
+            if binding.mode != Mode::Download || binding.pinned.is_some() {
                 continue;
             }
             active += 1;
@@ -836,7 +902,11 @@ async fn daemon(_api: &str, once: bool) -> Result<(), Box<dyn std::error::Error>
 
 /// Merge an archive in a disposable clone, then fast-forward the user's checkout.
 /// The real checkout is touched only after the merge (and any Omni repair) succeeds.
-fn merge_transaction(target: &Path, bundle: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn merge_transaction(
+    target: &Path,
+    bundle: &Path,
+    commit: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let stage = std::env::temp_dir().join(format!(
         "starter-update-{}-{}",
         std::process::id(),
@@ -864,10 +934,9 @@ fn merge_transaction(target: &Path, bundle: &Path) -> Result<String, Box<dyn std
             ]
             .as_ref(),
         )?;
-        let remote = "refs/remotes/starter/main";
-        let merge = local::run_git(&stage, ["merge", "--ff-only", remote].as_ref());
+        let merge = local::run_git(&stage, ["merge", "--ff-only", commit].as_ref());
         if merge.is_err()
-            && let Err(error) = local::run_git(&stage, ["merge", "--no-edit", remote].as_ref())
+            && let Err(error) = local::run_git(&stage, ["merge", "--no-edit", commit].as_ref())
         {
             resolve_with_omni(&stage, &error)?;
         }

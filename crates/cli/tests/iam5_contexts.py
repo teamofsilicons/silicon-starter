@@ -7,7 +7,7 @@ class ContextTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='starter-iam5-')
         self.root = pathlib.Path(self.temp.name)
         self.env = {k:v for k,v in os.environ.items() if not k.startswith(('STARTER_', 'SILICON_', 'GIT_'))}
-        self.env.update(SILICON_HOME=str(self.root), HOME=str(self.root), GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid', GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')
+        self.env.update(SILICON_HOME=str(self.root), HOME=str(self.root), GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid', GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid', STARTER_NO_DAEMON='1')
         self.requests=[];self.sessions={};self.logins={};self.fail_login=False;self.fail_complete=False;self.fail_publish=False;self.terms_changed=False;self.status_override={};self.approval_id=str(uuid.uuid4());self.request_id=str(uuid.uuid4())
         self.delay_list=False;self.list_started=threading.Event();self.list_release=threading.Event();self.permission_declined=False;self.testing_world='testing:'+str(uuid.uuid4())
         test=self
@@ -41,6 +41,9 @@ class ContextTests(unittest.TestCase):
                         elif completed and test.permission_declined:status=403;value={'error':{'code':'reconsent_required'}}
                         elif completed and test.fail_complete:test.fail_complete=False;status=503;value={'error':'uncertain'}
                         else:value={'request_id':test.request_id,'context_id':saved['context_id'],'completed':completed,'roots':[], 'authorization':{'id':test.approval_id,'app_id':'starter','actor':saved['actor'],'org_id':saved['org_id'],'status':'exchanged' if completed else 'pending','version':1,'state':None,'expires_at':'2099-01-01T00:00:00Z','authorization_url':'https://iam.example/review'}}
+                    elif self.path=='/api/v1/blocks' and self.command=='POST':
+                        if test.fail_publish:test.fail_publish=False;status=403;value={'error':{'code':'reconsent_required'}}
+                        else:value={'id':body['id']}
                     elif self.path.endswith('/publish'):
                         if test.fail_publish:test.fail_publish=False;status=403;value={'error':{'code':'reconsent_required','details':{'feature':'briefcase'}}}
                         else:value={'version':body['version'],'commit':body['commit']}
@@ -101,7 +104,7 @@ class ContextTests(unittest.TestCase):
         self.assertNotEqual(job.returncode,0);self.assertIn('login changed',stderr);self.assertEqual(stdout,'')
     def test_daemon_uses_each_checkout_origin_and_rejects_replacement_login(self):
         self.login();repo=self.root/'background';repo.mkdir();self.run_cli('new','public','tos.example',cwd=repo)
-        binding_path=repo/'.git/starter.json';binding=json.loads(binding_path.read_text());binding.update(mode='download',auto_update=True);binding_path.write_text(json.dumps(binding))
+        binding_path=repo/'.git/starter.json';binding=json.loads(binding_path.read_text());binding.update(mode='download');binding_path.write_text(json.dumps(binding));(self.root/'.starter/registry.json').write_text(json.dumps([{'path':str(repo),'binding':binding}]))
         original=json.loads((self.store()/'session.json').read_text())
         self.login('home','oac_home');self.run_cli('daemon','--once',profile='home')
         self.assertTrue(self.requests[-1][1].endswith('/archive'))
@@ -138,4 +141,19 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(original[2]['idempotency-key'],self.requests[-1][2]['idempotency-key']);self.assertEqual(original[3],self.requests[-1][3])
         count=len(self.requests);self.login('work','oac_home');self.run_cli('publish','latest','1.1',cwd=repo,ok=False);self.assertEqual(len(self.requests),count+1)
         self.assertFalse((repo/'.git/starter-publication.json').exists())
+    def test_block_publication_retains_bytes_key_and_metadata_and_rejects_replacement_login(self):
+        self.login();self.fail_publish=True
+        self.run_cli('publish','gene:original','--text','# Original','--description','saved',ok=False)
+        original=self.requests[-1];receipt=self.store()/'block-publication.json';self.assertTrue(receipt.exists())
+        count=len(self.requests)
+        self.run_cli('publish','gene:original','--text','# Changed',ok=False);self.assertEqual(len(self.requests),count)
+        self.run_cli('publish','gene:original','--retry')
+        self.assertEqual(original[3],self.requests[-1][3]);self.assertEqual(original[2]['idempotency-key'],self.requests[-1][2]['idempotency-key']);self.assertFalse(receipt.exists())
+        self.fail_publish=True;self.run_cli('publish','gene:original','--text','# Another',ok=False)
+        self.login('work','oac_home');count=len(self.requests)
+        self.run_cli('publish','gene:original','--retry',ok=False);self.assertEqual(len(self.requests),count);self.assertTrue(receipt.exists())
+    def test_block_local_cancel_does_not_mutate_provider_or_login(self):
+        self.login();self.fail_publish=True;self.run_cli('publish','gene:original','--text','# Original',ok=False)
+        count=len(self.requests);self.run_cli('publish','gene:original','--cancel');self.assertEqual(len(self.requests),count)
+        self.assertFalse((self.store()/'block-publication.json').exists());self.assertTrue((self.store()/'session.json').exists())
 if __name__=='__main__':unittest.main()
