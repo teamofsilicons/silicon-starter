@@ -825,12 +825,81 @@ async fn iam_webhook(
     let Some(secret) = std::env::var_os("STARTER_IAM_WEBHOOK_SECRET") else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    if !auth::verify_webhook_now(&headers, &body, secret.to_string_lossy().as_bytes()) {
-        return StatusCode::UNAUTHORIZED;
-    }
-    let Some(event_id) = auth::webhook_event_id(&body) else {
-        return StatusCode::BAD_REQUEST;
+    receive_iam_webhook(&s, &headers, &body, &secret.to_string_lossy()).await
+}
+async fn receive_iam_webhook(
+    s: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+    secret: &str,
+) -> StatusCode {
+    use silicon_iam_client::{WebhookSecret, WebhookSecretKeyring, WebhookVerifier};
+    let Ok(secret) = WebhookSecret::new(secret) else {
+        return StatusCode::SERVICE_UNAVAILABLE;
     };
+    let Some(version) = headers
+        .get("x-silicon-iam-key-version")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+    else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let Ok(keys) = WebhookSecretKeyring::new(version, secret) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    // The SDK authenticates exact bytes and rejects mixed envelopes/duplicate security headers.
+    let Ok(verified) = WebhookVerifier::new(keys).verify(headers, body) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    if verified.is_testing() != s.world.environment_id.is_some() {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Some(environment_id) = s.world.environment_id {
+        let iam = match s.auth.iam().await {
+            Ok(iam) if iam.world == *s.world => iam,
+            _ => return StatusCode::SERVICE_UNAVAILABLE,
+        };
+        let Some(key) = iam.client.environment() else {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        };
+        if verified.verify_testing_environment(key).is_err() {
+            return StatusCode::FORBIDDEN;
+        }
+        let event = verified.event();
+        if event
+            .aggregate
+            .get("environment_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(environment_id.to_string().as_str())
+            || event
+                .aggregate
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .is_none_or(|g| g < 1)
+        {
+            return StatusCode::FORBIDDEN;
+        }
+        if let Some(cleaned_at) = &s.world.cleaned_at {
+            // Existing World snapshots use time's Display form; accept RFC3339 as well.
+            let cleaned = chrono::DateTime::parse_from_rfc3339(cleaned_at).or_else(|_| {
+                chrono::DateTime::parse_from_str(
+                    cleaned_at.strip_suffix(":00").unwrap_or(cleaned_at),
+                    "%Y-%m-%d %H:%M:%S%.f %:z",
+                )
+            });
+            let Ok(cleaned) = cleaned else {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            };
+            let Some(cleaned) = cleaned.timestamp_nanos_opt() else {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            };
+            if event.occurred_at.unix_timestamp_nanos() < i128::from(cleaned) {
+                return StatusCode::FORBIDDEN;
+            }
+        }
+    }
+    // Persist only the public event identifier, never the envelope's environment root key.
+    let event_id = verified.event_id().to_string();
     let inserted = {
         let mut ids = s.iam_event_ids.write().await;
         if ids.contains(&event_id) {
@@ -846,7 +915,7 @@ async fn iam_webhook(
         }
     };
     if inserted {
-        persist_state(&s).await;
+        persist_state(s).await;
     }
     StatusCode::NO_CONTENT
 }
@@ -936,13 +1005,20 @@ async fn restore_state(
 mod webhook_tests {
     use super::*;
 
-    #[test]
-    fn rejects_stale_signatures() {
-        assert!(!auth::verify_webhook_now(
-            &HeaderMap::new(),
-            b"{}",
-            b"secret"
-        ));
+    #[tokio::test]
+    async fn rejects_unsigned_delivery_without_mutating_deduplication() {
+        let state = AppState::default();
+        assert_eq!(
+            receive_iam_webhook(
+                &state,
+                &HeaderMap::new(),
+                b"{}",
+                "test-signing-key-with-at-least-32-characters"
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(state.iam_event_ids.read().await.is_empty());
     }
 }
 

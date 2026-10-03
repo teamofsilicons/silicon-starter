@@ -364,20 +364,10 @@ async fn stale_tab_and_wrong_browser_cannot_mutate_or_reuse_private_reads() {
     assert_eq!(response.status(), 200);
 }
 #[test]
-fn state_and_webhook_require_exact_unambiguous_security_values() {
+fn state_requires_exact_unambiguous_security_values() {
     let nonce = random_secret();
     assert!(valid_login_state(Some(&nonce), Some(&nonce)));
     assert!(!valid_login_state(Some(&nonce), Some("bad")));
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(b"secret").unwrap();
-    mac.update(b"1000.{}");
-    let sig = format!("v1={}", hex::encode(mac.finalize().into_bytes()));
-    let mut h = HeaderMap::new();
-    h.insert("x-silicon-iam-timestamp", "1000".parse().unwrap());
-    h.insert("x-silicon-iam-key-version", "1".parse().unwrap());
-    h.insert("x-silicon-iam-signature", sig.parse().unwrap());
-    assert!(verify_webhook(&h, b"{}", b"secret", 1000));
-    h.append("x-silicon-iam-signature", sig.parse().unwrap());
-    assert!(!verify_webhook(&h, b"{}", b"secret", 1000));
 }
 
 #[tokio::test]
@@ -926,4 +916,134 @@ async fn anonymous_boot_expires_obsolete_browser_cookie_without_weakening_contex
         .unwrap();
     assert_eq!(response.status(), 200);
     assert!(!response.headers().contains_key("set-cookie"));
+}
+
+#[tokio::test]
+async fn webhook_world_boundary_rejects_cross_plane_wrong_key_and_prior_clean_events() {
+    use axum::http::StatusCode;
+    use std::sync::Mutex as StdMutex;
+    const SECRET: &str = "test-signing-key-with-at-least-32-characters";
+    const KEY: &str = "0123456789abcdefghijklmnopqrstuv";
+    let event_id = Uuid::new_v4();
+    let environment_id = Uuid::new_v4();
+    let now = Utc::now();
+    let production = json!({"spec_version":"1.0","event_id":event_id,"event_type":"organization.membership.updated.v1","occurred_at":now.to_rfc3339(),"organization_id":null,"aggregate":{"type":"membership","id":Uuid::new_v4(),"version":1},"data":{}});
+    let mut metadata = production.clone();
+    metadata.as_object_mut().unwrap().remove("data");
+    metadata["environment_id"] = json!(environment_id);
+    metadata["generation"] = json!(2);
+    let testing = json!({"test":{"testing_key":KEY,"metadata":metadata,"data":{}}});
+    let send = |state: crate::AppState, body: Value| async move {
+        let raw = serde_json::to_vec(&body).unwrap();
+        let stamp = Utc::now().timestamp().to_string();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(stamp.as_bytes());
+        mac.update(b".");
+        mac.update(&raw);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-silicon-iam-event-id",
+            event_id.to_string().parse().unwrap(),
+        );
+        headers.insert("x-silicon-iam-key-version", "1".parse().unwrap());
+        headers.insert("x-silicon-iam-timestamp", stamp.parse().unwrap());
+        headers.insert(
+            "x-silicon-iam-signature",
+            format!("v1={}", hex::encode(mac.finalize().into_bytes()))
+                .parse()
+                .unwrap(),
+        );
+        crate::receive_iam_webhook(&state, &headers, &raw, SECRET).await
+    };
+    let prod_state = crate::AppState::default();
+    assert_eq!(
+        send(prod_state.clone(), testing.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    let mixed = json!({"test":testing["test"],"metadata":{"event_id":event_id},"data":{}});
+    assert_eq!(
+        send(prod_state.clone(), mixed.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(prod_state.iam_event_ids.read().await.is_empty());
+    assert_eq!(
+        send(prod_state.clone(), production.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(prod_state.clone(), production.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(prod_state.iam_event_ids.read().await.len(), 1);
+
+    let server = MockServer::start().await;
+    let context = Arc::new(StdMutex::new(
+        json!({"environment_id":environment_id,"application":{"app_id":"starter","base_url":"https://example.test","app_scope":{"iam":[],"external":[]},"webhook_scope":[],"testing_idle_days":30},"environment":{"environment_id":environment_id,"org_id":"tos","name":"Webhook isolation","version":2,"key_generation":1,"cleaned_at":(now-chrono::Duration::minutes(1)).to_rfc3339(),"created_at":(now-chrono::Duration::minutes(5)).to_rfc3339(),"creator_type":"carbon","creator_id":"c:author"}}),
+    ));
+    let reported = context.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/application/testing-context"))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(reported.lock().unwrap().clone())
+        })
+        .mount(&server)
+        .await;
+    let iam = Iam::connect(
+        &server.uri(),
+        "starter",
+        "",
+        Some((
+            "ask_testSecrettestSecrettestSecrettestSecrettes".into(),
+            KEY.into(),
+        )),
+    )
+    .await
+    .unwrap();
+    let world = Arc::new(iam.world.clone());
+    let auth = AuthState {
+        fixture: false,
+        ..Default::default()
+    };
+    assert!(auth.iam.set(iam).is_ok());
+    let state = crate::AppState {
+        auth: Arc::new(auth),
+        world,
+        ..Default::default()
+    };
+    let mut wrong_key = testing.clone();
+    wrong_key["test"]["testing_key"] = json!("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+    let mut wrong_world = testing.clone();
+    wrong_world["test"]["metadata"]["environment_id"] = json!(Uuid::new_v4());
+    let mut old = testing.clone();
+    old["test"]["metadata"]["occurred_at"] =
+        json!((now - chrono::Duration::minutes(2)).to_rfc3339());
+    for (name, rejected) in [
+        ("production", production),
+        ("key", wrong_key),
+        ("world", wrong_world),
+        ("old", old),
+    ] {
+        assert_eq!(
+            send(state.clone(), rejected).await,
+            StatusCode::FORBIDDEN,
+            "{name}"
+        );
+        assert!(state.iam_event_ids.read().await.is_empty());
+    }
+    assert_eq!(send(state.clone(), mixed).await, StatusCode::UNAUTHORIZED);
+    assert!(state.iam_event_ids.read().await.is_empty());
+    assert_eq!(
+        send(state.clone(), testing.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(state.iam_event_ids.read().await.len(), 1);
+    // A fresh signature cannot revive this listener after the verified world is cleaned/rotated.
+    state.iam_event_ids.write().await.clear();
+    context.lock().unwrap()["environment"]["key_generation"] = json!(2);
+    assert_eq!(
+        send(state.clone(), testing).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(state.iam_event_ids.read().await.is_empty());
+    assert!(state.starters.read().await.is_empty());
 }

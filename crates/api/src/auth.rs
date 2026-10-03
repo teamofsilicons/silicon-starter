@@ -4,6 +4,7 @@ use aes_gcm::{
     Aes256Gcm, KeyInit,
     aead::{Aead, AeadCore, OsRng},
 };
+#[cfg(test)]
 use axum::http::HeaderMap;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -892,71 +893,6 @@ pub(crate) fn valid_actor_id(kind: &str, id: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     })
-}
-
-/// Verify IAM's signature over the exact, unparsed request body.
-/// `now` is injectable so replay-window tests do not depend on wall clock.
-pub fn verify_webhook(headers: &HeaderMap, body: &[u8], secret: &[u8], now: i64) -> bool {
-    if !single_header(headers, "x-silicon-iam-key-version")
-        .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return false;
-    }
-    let ts = match single_header(headers, "x-silicon-iam-timestamp")
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        Some(v) => v,
-        None => return false,
-    };
-    if now.abs_diff(ts) > 300 {
-        return false;
-    }
-    let signature = match single_header(headers, "x-silicon-iam-signature") {
-        Some(v) => v,
-        None => return false,
-    };
-    let digest = match signature.strip_prefix("v1=") {
-        Some(v)
-            if v.len() == 64
-                && v.bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
-        {
-            v
-        }
-        _ => return false,
-    };
-    let expected = match hex::decode(digest) {
-        Ok(v) if v.len() == 32 => v,
-        _ => return false,
-    };
-    let mut mac = match <HmacSha256 as Mac>::new_from_slice(secret) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    mac.update(ts.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
-}
-
-fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    let mut values = headers.get_all(name).iter();
-    let value = values.next()?.to_str().ok()?;
-    values.next().is_none().then_some(value)
-}
-
-pub fn verify_webhook_now(headers: &HeaderMap, body: &[u8], secret: &[u8]) -> bool {
-    verify_webhook(headers, body, secret, Utc::now().timestamp())
-}
-
-/// Extract the authenticated event ID after signature verification. Test envelopes nest metadata.
-pub fn webhook_event_id(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    value
-        .pointer("/metadata/event_id")
-        .or_else(|| value.pointer("/test/metadata/event_id"))?
-        .as_str()
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
