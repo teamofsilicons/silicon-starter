@@ -200,22 +200,51 @@ async fn publish_with_feature(
     Ok(row.version)
 }
 
+pub(crate) async fn retain_block_action(
+    s: &AppState,
+    session: &IamTokens,
+    key: &str,
+    input: &impl Serialize,
+) -> Result<()> {
+    if provider_unconfigured() {
+        return Ok(());
+    }
+    let feature = crate::feature_routes::feature(s, session).await?;
+    retain_block_intent(&feature, key, input)
+}
+fn retain_block_intent(feature: &Feature, key: &str, input: &impl Serialize) -> Result<()> {
+    let hash = digest(&encode(input)?);
+    if feature
+        .lease
+        .get::<String>("block-action", key)?
+        .is_some_and(|saved| saved != hash)
+    {
+        return Err(Error::conflict(
+            "Retry the original block action unchanged or start a new action",
+        ));
+    }
+    feature.lease.put("block-action", key, &hash)?;
+    Ok(())
+}
+fn provider_unconfigured() -> bool {
+    std::env::var_os("STARTER_IAM_APP_SECRET").is_none()
+        && std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_none()
+        && std::env::var_os("BRIEFCASE_APP_SECRET").is_none()
+}
 pub(crate) async fn publish_block(
     s: &AppState,
     session: &IamTokens,
     block: &silicon_starter_core::blocks::Block,
     bytes: &[u8],
+    key: &str,
 ) -> Result<Option<Uuid>> {
-    if std::env::var_os("STARTER_IAM_APP_SECRET").is_none()
-        && std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_none()
-        && std::env::var_os("BRIEFCASE_APP_SECRET").is_none()
-    {
+    if provider_unconfigured() {
         // Preserve the existing explicitly unconfigured local registry mode.
         return Ok(None);
     }
     let feature = crate::feature_routes::feature(s, session).await?;
     let provider = Provider::from_env()?;
-    publish_block_with_feature(&feature, block, bytes, &provider)
+    publish_block_with_feature(&feature, block, bytes, key, &provider)
         .await
         .map(Some)
 }
@@ -223,6 +252,7 @@ async fn publish_block_with_feature(
     feature: &Feature,
     block: &silicon_starter_core::blocks::Block,
     bytes: &[u8],
+    key: &str,
     provider: &Provider,
 ) -> Result<Uuid> {
     if block.owner != feature.org || digest(bytes) != block.version {
@@ -238,12 +268,7 @@ async fn publish_block_with_feature(
         block.visibility,
         block.version
     ]))?);
-    let stored_key = digest(&encode(&(
-        "block-v1",
-        &feature.context_id,
-        &block.id,
-        &block.version,
-    ))?);
+    let stored_key = digest(&encode(&("block-v2", &feature.context_id, &block.id, key))?);
     let mut row = if let Some(row) = feature
         .lease
         .get::<Publication>("publication", &stored_key)?

@@ -572,30 +572,54 @@ async fn private_block_reconciles_lost_commit_after_restart_without_public_link(
     let original = block(silicon_starter_core::Visibility::Private);
     let provider = Provider::new(&h.provider_server.uri()).unwrap();
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
-            .await
-            .unwrap_err()
-            .status,
+        publish_block_with_feature(
+            &h.feature(),
+            &original,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap_err()
+        .status,
         StatusCode::FORBIDDEN
     );
     assert!(h.calls("/api/v1/obo/uploads/reserve").await.is_empty());
     h.approve("approve-original-private-block").await;
     h.lose_commit.store(true, Ordering::SeqCst);
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
-            .await
-            .unwrap_err()
-            .status,
+        publish_block_with_feature(
+            &h.feature(),
+            &original,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap_err()
+        .status,
         StatusCode::SERVICE_UNAVAILABLE
     );
     h.store = FeatureStore::open(&h.dir.path().join("features.sqlite"), &[9; 32]).unwrap();
-    let entry = publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
-        .await
-        .unwrap();
+    let entry = publish_block_with_feature(
+        &h.feature(),
+        &original,
+        BUNDLE,
+        "original-block-action-key",
+        &provider,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
-            .await
-            .unwrap(),
+        publish_block_with_feature(
+            &h.feature(),
+            &original,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap(),
         entry
     );
     assert_eq!(h.calls("/api/v1/obo/uploads/reserve").await.len(), 1);
@@ -612,19 +636,31 @@ async fn private_block_reconciles_lost_commit_after_restart_without_public_link(
     let mut changed = original.clone();
     changed.visibility = silicon_starter_core::Visibility::Public;
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
-            .await
-            .unwrap_err()
-            .status,
+        publish_block_with_feature(
+            &h.feature(),
+            &changed,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap_err()
+        .status,
         StatusCode::CONFLICT
     );
     changed = original.clone();
     changed.owner = "another".into();
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
-            .await
-            .unwrap_err()
-            .status,
+        publish_block_with_feature(
+            &h.feature(),
+            &changed,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap_err()
+        .status,
         StatusCode::CONFLICT
     );
 }
@@ -634,22 +670,145 @@ async fn public_block_requires_explicit_link_and_unchanged_metadata_on_replay() 
     h.approve("approve-original-public-block").await;
     let original = block(silicon_starter_core::Visibility::Public);
     let provider = Provider::new(&h.provider_server.uri()).unwrap();
-    publish_block_with_feature(&h.feature(), &original, BUNDLE, &provider)
-        .await
-        .unwrap();
+    publish_block_with_feature(
+        &h.feature(),
+        &original,
+        BUNDLE,
+        "original-block-action-key",
+        &provider,
+    )
+    .await
+    .unwrap();
     assert_eq!(h.calls("/api/v1/obo/link-access").await.len(), 1);
     let mut changed = original.clone();
     changed.updated_at = chrono::Utc::now();
-    publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
-        .await
-        .unwrap();
+    publish_block_with_feature(
+        &h.feature(),
+        &changed,
+        BUNDLE,
+        "original-block-action-key",
+        &provider,
+    )
+    .await
+    .unwrap();
     assert_eq!(h.calls("/api/v1/obo/link-access").await.len(), 1);
     changed.description = "changed publication intent".into();
     assert_eq!(
-        publish_block_with_feature(&h.feature(), &changed, BUNDLE, &provider)
-            .await
+        publish_block_with_feature(
+            &h.feature(),
+            &changed,
+            BUNDLE,
+            "original-block-action-key",
+            &provider
+        )
+        .await
+        .unwrap_err()
+        .status,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn block_action_replay_keeps_original_body_even_after_metadata_only_save() {
+    let mut h = Harness::new().await;
+    let original = json!({"id":"gene:creativity", "text":"same bytes", "description":"original"});
+    retain_block_intent(&h.feature(), "first-block-action", &original).unwrap();
+    h.store = FeatureStore::open(&h.dir.path().join("features.sqlite"), &[9; 32]).unwrap();
+    retain_block_intent(&h.feature(), "first-block-action", &original).unwrap();
+    let mut changed = original.clone();
+    changed["description"] = json!("new intent");
+    assert_eq!(
+        retain_block_intent(&h.feature(), "first-block-action", &changed)
             .unwrap_err()
             .status,
         StatusCode::CONFLICT
     );
+    retain_block_intent(&h.feature(), "fresh-block-action", &changed).unwrap();
+}
+
+#[tokio::test]
+async fn terminal_block_upload_requires_fresh_action_and_preserves_original_retry() {
+    for terminal in ["expired", "cancelled"] {
+        let h = Harness::new().await;
+        h.approve("approve-terminal-block-actions").await;
+        let original = block(silicon_starter_core::Visibility::Private);
+        let provider = Provider::new(&h.provider_server.uri()).unwrap();
+        Mock::given(method("PUT"))
+            .and(path_regex("^/api/v1/obo/uploads/[^/]+/content$"))
+            .respond_with(upstream(503, "lost_transfer"))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&h.provider_server)
+            .await;
+        assert_eq!(
+            publish_block_with_feature(
+                &h.feature(),
+                &original,
+                BUNDLE,
+                "original-action-key",
+                &provider
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let old_operation = h.upload.lock().unwrap().as_ref().unwrap()["operation_id"].clone();
+        h.upload.lock().unwrap().as_mut().unwrap()["state"] = json!(terminal);
+        assert_eq!(
+            publish_block_with_feature(
+                &h.feature(),
+                &original,
+                BUNDLE,
+                "original-action-key",
+                &provider
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::CONFLICT
+        );
+        let mut changed = original.clone();
+        changed.description = "explicitly revised publication intent".into();
+        assert_eq!(
+            publish_block_with_feature(
+                &h.feature(),
+                &changed,
+                BUNDLE,
+                "original-action-key",
+                &provider
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(h.calls("/api/v1/obo/uploads/reserve").await.len(), 1);
+        // A fresh provider operation has no prior reservation; old intent remains terminal.
+        *h.upload.lock().unwrap() = None;
+        *h.manifest.lock().unwrap() = None;
+        publish_block_with_feature(
+            &h.feature(),
+            &changed,
+            BUNDLE,
+            "fresh-explicit-action",
+            &provider,
+        )
+        .await
+        .unwrap();
+        let new_operation = h.upload.lock().unwrap().as_ref().unwrap()["operation_id"].clone();
+        assert_ne!(old_operation, new_operation);
+        publish_block_with_feature(
+            &h.feature(),
+            &changed,
+            BUNDLE,
+            "fresh-explicit-action",
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.calls("/api/v1/obo/uploads/reserve").await.len(), 2);
+        assert_eq!(h.calls("/api/v1/obo/uploads/commit").await.len(), 1);
+        assert!(h.calls("/api/v1/obo/link-access").await.is_empty());
+    }
 }

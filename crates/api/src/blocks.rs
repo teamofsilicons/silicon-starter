@@ -17,7 +17,7 @@ pub struct StoredVersion {
     pub embedding: Option<Vec<f32>>,
     pub briefcase_entry: Option<Uuid>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct PublishBlock {
     id: String,
     org_id: Option<String>,
@@ -219,6 +219,7 @@ pub async fn publish(
     let session = authenticated_session(&s, &headers)
         .await
         .map_err(|status| error(status, "authentication required"))?;
+    let action_key = feature_routes::key(&headers).map_err(|e| (e.status, Json(e.value())))?;
     let (kind, slug) = core::parse_id(&input.id).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
     let bytes = match (kind, &input.text, &input.archive_base64) {
         (BlockKind::Gene, Some(text), None) => text.as_bytes().to_vec(),
@@ -245,6 +246,9 @@ pub async fn publish(
     let hash = core::content_hash(&bytes);
     // ponytail: serialize publication at the current 100/day target; shard by block if throughput grows.
     let _publication = s.block_publish_lock.lock().await;
+    briefcase::retain_block_action(&s, &session, action_key, &input)
+        .await
+        .map_err(|e| (e.status, Json(e.value())))?;
     let previous = s.blocks.read().await.get(&input.id).cloned();
     let owner = choose_organization(
         &session,
@@ -307,7 +311,7 @@ pub async fn publish(
         .map(|e| e.versions.clone())
         .unwrap_or_default();
     if !versions.iter().any(|v| v.version.version == hash) {
-        let briefcase_entry = briefcase::publish_block(&s, &session, &block, &bytes)
+        let briefcase_entry = briefcase::publish_block(&s, &session, &block, &bytes, action_key)
             .await
             .map_err(|e| (e.status, Json(e.value())))?;
         let embedding = if std::env::var_os("GEMINI_API_KEY").is_some() {
@@ -357,7 +361,12 @@ pub async fn publish(
 mod tests {
     use super::*;
     async fn session(s: &AppState, org: &str) -> HeaderMap {
-        super::super::auth_and_organization_tests::session(s, &[org]).await
+        let mut headers = super::super::auth_and_organization_tests::session(s, &[org]).await;
+        headers.insert(
+            "idempotency-key",
+            Uuid::new_v4().to_string().parse().unwrap(),
+        );
+        headers
     }
     fn gene(text: &str, visibility: Option<Visibility>) -> PublishBlock {
         PublishBlock {
@@ -369,6 +378,34 @@ mod tests {
             text: Some(text.into()),
             archive_base64: None,
         }
+    }
+    #[tokio::test]
+    async fn publication_requires_one_valid_action_key_before_saving() {
+        let s = AppState::default();
+        let mut headers = session(&s, "tos").await;
+        headers.remove("idempotency-key");
+        for value in [None, Some("short"), Some("contains a space")] {
+            if let Some(value) = value {
+                headers.insert("idempotency-key", value.parse().unwrap());
+            }
+            assert_eq!(
+                publish(State(s.clone()), headers.clone(), Json(gene("first", None)))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        headers.insert("idempotency-key", "valid-block-action-key".parse().unwrap());
+        headers.append("idempotency-key", "duplicate-action-key".parse().unwrap());
+        assert_eq!(
+            publish(State(s.clone()), headers, Json(gene("first", None)))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(s.blocks.read().await.is_empty());
     }
     #[tokio::test]
     async fn authenticated_versions_remain_immutable_private_and_searchable_after_restore() {
