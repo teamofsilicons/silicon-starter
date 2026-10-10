@@ -1,6 +1,6 @@
 [package]
 name = "silicon-starter-core"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Core types, template generation, and local lifecycle for Silicon Starter"
@@ -19,6 +19,3 @@ cel-interpreter = { version = "0.10", features = ["json"] }
 cel-parser = "0.10"
 minijinja = { version = "=2.24.0", features = ["loader", "json", "fuel", "unstable_machinery"] }
 rpassword = "7"
-
-[dev-dependencies]
-tempfile = "3"

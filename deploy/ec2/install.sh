@@ -51,13 +51,12 @@ def secret(name):
 env = json.loads(secret('silicon-starter/production/runtime'))
 env['STARTER_DATABASE_URL'] = secret('silicon-starter/production/database-url').strip()
 env.update(STARTER_BIND='127.0.0.1:8080', STARTER_FRONTEND_URL='https://starter.teamofsilicons.com')
-# IAM 5 starts a fresh encrypted session store; retain earlier stores for rollback.
-env.setdefault('STARTER_AUTH_FILE', '/var/lib/starter/auth-iam5.enc')
+# Preserve the previous encrypted sessions for rollback; Accounts uses a new format.
+env.setdefault('STARTER_AUTH_FILE', '/var/lib/starter/auth-accounts.enc')
 if not re.fullmatch(r'[0-9a-fA-F]{64}', env.get('STARTER_AUTH_ENCRYPTION_KEY', '')):
-    raise ValueError('Set a stable 64-hex STARTER_AUTH_ENCRYPTION_KEY in the runtime secret before deployment')
-auth_file = pathlib.Path(env['STARTER_AUTH_FILE'])
-if auth_file.exists() and not auth_file.read_bytes().startswith(b'STARTER-IAM5\0'):
-    raise ValueError('STARTER_AUTH_FILE points to a legacy store; preserve it and select a new path for IAM 5')
+    raise ValueError('Set a stable 64-hex STARTER_AUTH_ENCRYPTION_KEY before deployment')
+if not env.get('STARTER_ACCOUNTS_APP_SECRET'):
+    raise ValueError('Set STARTER_ACCOUNTS_APP_SECRET before deployment')
 # systemd EnvironmentFile double quotes require escaping backslash and quote.
 def quote(value):
     if '\n' in value or '\r' in value or '\0' in value:

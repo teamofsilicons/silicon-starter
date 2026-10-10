@@ -11,7 +11,7 @@ type Error = (StatusCode, Json<serde_json::Value>);
 fn unavailable(error: String) -> Error {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error":{"code":"iam_unavailable","message":error}})),
+        Json(json!({"error":{"code":"accounts_unavailable","message":error}})),
     )
 }
 fn changed() -> Error {
@@ -33,14 +33,18 @@ fn cookie(name: &str, value: &str, max_age: Option<i64>) -> HeaderValue {
     .parse()
     .expect("server cookie")
 }
-fn session_cookies(id: &str) -> HeaderMap {
+fn session_cookies(id: &str, expires_at: i64) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.append(
         "set-cookie",
         cookie(
             "starter_session",
             id,
-            if id.is_empty() { Some(0) } else { None },
+            Some(if id.is_empty() {
+                0
+            } else {
+                (expires_at - chrono::Utc::now().timestamp()).max(0)
+            }),
         ),
     );
     h.insert("cache-control", HeaderValue::from_static("no-store"));
@@ -56,17 +60,6 @@ pub(super) async fn context_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path().starts_with("/api/") && s.world.environment_id.is_some() {
-        match s.auth.iam().await {
-            Ok(iam) if iam.world == *s.world => {}
-            _ => {
-                return unavailable(
-                    "The testing world changed; restart with its current configuration".into(),
-                )
-                .into_response();
-            }
-        }
-    }
     let headers = request.headers();
     let path = request.uri().path();
     let protected = path.starts_with("/api/")
@@ -84,7 +77,8 @@ pub(super) async fn context_guard(
         if let Some(id) = secret {
             match s.auth.get(&id).await {
                 Ok(Some(tokens)) if marker == Some(tokens.context_id.as_str()) => {}
-                Ok(_) => return changed().into_response(),
+                Ok(Some(_)) => return changed().into_response(),
+                Ok(None) => return (StatusCode::UNAUTHORIZED, Json(json!({"error":{"code":"session_expired","message":"This sign-in has expired or was revoked. Sign in again."}}))).into_response(),
                 Err(error) => return unavailable(error).into_response(),
             }
         } else if marker.is_some_and(|marker| marker != "anonymous") {
@@ -131,10 +125,10 @@ async fn start_login(
     headers: &HeaderMap,
     options: LoginOptions,
 ) -> Result<(HeaderMap, Value), Error> {
-    if !matches!(options.identity_kind.as_str(), "carbon" | "silicon") {
+    if options.identity_kind != "carbon" {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error":"Choose Carbon or Silicon before starting login"})),
+            Json(json!({"error":"Silicons sign in with an SLT; hosted sign-in is for Carbons"})),
         ));
     }
     let return_to = validated_return(options.return_to.as_deref())
@@ -154,28 +148,30 @@ async fn start_login(
         .browser_attempt(&nonce, &group)
         .await
         .map_err(unavailable)?;
-    let callback = format!("{}/auth/callback?state={nonce}", frontend_url());
-    let mut url = url::Url::parse("https://auth.iam.teamofsilicons.com/login").expect("IAM URL");
+    let callback = format!("{}/auth/callback", frontend_url());
+    let accounts = s.auth.accounts().await.map_err(unavailable)?;
+    let mut url =
+        url::Url::parse(&format!("{}/authorize", accounts.base_url)).expect("Accounts URL");
     url.query_pairs_mut()
-        .append_pair("app_id", &app_id())
+        .append_pair("app_id", &accounts.app_id)
         .append_pair("redirect_uri", &callback)
-        .append_pair("identity_kind", &options.identity_kind);
-    if options.popup {
-        url.query_pairs_mut().append_pair("display", "popup");
-    }
+        .append_pair("response_type", "code")
+        .append_pair("state", &nonce)
+        .append_pair("code_challenge", &attempt.challenge)
+        .append_pair("code_challenge_method", "S256");
     let mut cookies = HeaderMap::new();
     cookies.append(
         "set-cookie",
-        cookie("starter_login_state", &nonce, Some(600)),
+        cookie("starter_login_state", &nonce, Some(3600)),
     );
     cookies.append(
         "set-cookie",
-        cookie("starter_browser", &group, Some(365 * 86400)),
+        cookie("starter_browser", &group, Some(900 * 86400)),
     );
     cookies.insert("cache-control", HeaderValue::from_static("no-store"));
     Ok((
         cookies,
-        json!({"attempt_id":attempt.attempt_id,"login_url":url.as_str(),"iam_origin":url.origin().ascii_serialization()}),
+        json!({"attempt_id":attempt.attempt_id,"login_url":url.as_str(),"accounts_origin":url.origin().ascii_serialization()}),
     ))
 }
 pub(super) async fn auth_attempt(
@@ -282,11 +278,11 @@ pub(super) async fn auth_callback(
     };
     let can_retry = !q.contains_key("error");
     let result = if can_retry {
-        browser_login(&s, &headers, q.get("slt").map(String::as_str), state).await
+        browser_login(&s, &headers, q.get("code").map(String::as_str), state).await
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"IAM login was not completed"})),
+            Json(json!({"error":"Silicon Accounts sign-in was not completed"})),
         ))
     };
     match result {
@@ -301,7 +297,7 @@ pub(super) async fn auth_callback(
 }
 #[derive(Deserialize)]
 pub(super) struct AuthCallbackBody {
-    pub slt: String,
+    pub code: String,
     pub state: Option<String>,
 }
 pub(super) async fn auth_callback_json(
@@ -312,7 +308,7 @@ pub(super) async fn auth_callback_json(
     if !origin_ok(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match browser_login(&s, &headers, Some(&body.slt), body.state.as_deref()).await {
+    match browser_login(&s, &headers, Some(&body.code), body.state.as_deref()).await {
         Ok(cookies) => (cookies, Json(json!({"authenticated":true}))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -320,39 +316,122 @@ pub(super) async fn auth_callback_json(
 async fn browser_login(
     s: &AppState,
     headers: &HeaderMap,
-    slt: Option<&str>,
+    code: Option<&str>,
     state: Option<&str>,
 ) -> Result<HeaderMap, Error> {
     bound_attempt(s, headers, state).await?;
     let expected = cookie_value(headers, "starter_login_state").expect("bound state");
     let group = cookie_value(headers, "starter_browser").expect("bound browser");
-    let id = match slt {
-        Some(slt) => s.auth.login(slt, Some((expected, group)), None, None).await,
-        None => s.auth.resume_browser_login(expected, group).await,
-    }
-    .map_err(unavailable)?;
-    // Keep the expiring nonce cookie so an uncertain callback can recover its original receipt.
-    Ok(session_cookies(&id))
+    let id = s
+        .auth
+        .browser_login(code, expected, group)
+        .await
+        .map_err(unavailable)?;
+    let tokens = s
+        .auth
+        .get(&id)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(|| unavailable("This sign-in expired".into()))?;
+    Ok(session_cookies(&id, tokens.expires_at))
 }
 pub(super) async fn auth_cli(
     headers: HeaderMap,
     State(s): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
+    if !origin_ok(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(slt) = body.get("slt").and_then(Value::as_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let org = body.get("org_id").and_then(Value::as_str);
+    let browser = body["browser"] == true;
+    if browser
+        && headers.get("origin").and_then(|v| v.to_str().ok()) != Some(frontend_url().as_str())
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let key = headers.get("idempotency-key").and_then(|v| v.to_str().ok());
-    match s.auth.login(slt, None, key, org).await {
-        Ok(id) => match s.auth.status(Some(&id)).await {
-            Ok(mut status) => {
-                status["session_id"] = json!(id);
-                Json(status).into_response()
-            }
-            Err(e) => unavailable(e).into_response(),
-        },
+    if key.is_none_or(|key| uuid::Uuid::parse_str(key).is_err()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let group = if browser {
+        match s
+            .auth
+            .browser_group(cookie_value(&headers, "starter_browser"), key)
+            .await
+        {
+            Ok(group) => Some(group),
+            Err(e) => return unavailable(e).into_response(),
+        }
+    } else {
+        None
+    };
+    match s.auth.login(slt, key, group.as_deref()).await {
+        Ok(id) => login_response(&s, &id, group.as_deref()).await,
         Err(e) => unavailable(e).into_response(),
+    }
+}
+async fn login_response(s: &AppState, id: &str, group: Option<&str>) -> Response {
+    match s.auth.status(Some(id)).await {
+        Ok(mut status) => {
+            status["session_id"] = json!(id);
+            let mut cookies = HeaderMap::new();
+            if let Some(group) = group {
+                cookies = session_cookies(id, status["expires_at"].as_i64().unwrap_or_default());
+                cookies.append(
+                    "set-cookie",
+                    cookie("starter_browser", group, Some(900 * 86400)),
+                );
+                // Browser code receives only the HttpOnly cookie, never its secret.
+                status
+                    .as_object_mut()
+                    .expect("session status")
+                    .remove("session_id");
+            }
+            (cookies, Json(status)).into_response()
+        }
+        Err(e) => unavailable(e).into_response(),
+    }
+}
+pub(super) async fn auth_cli_start(headers: HeaderMap, State(s): State<AppState>) -> Response {
+    if !origin_ok(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let accounts = match s.auth.accounts().await {
+        Ok(a) => a,
+        Err(e) => return unavailable(e).into_response(),
+    };
+    match accounts.device_start().await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":e.code,"message":e.message}})),
+        )
+            .into_response(),
+    }
+}
+pub(super) async fn auth_cli_complete(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    if !origin_ok(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let code = body["device_code"].as_str().unwrap_or_default();
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    match s.auth.device_complete(code, key).await {
+        Ok(id) => login_response(&s, &id, None).await,
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":e.code,"message":e.message}})),
+        )
+            .into_response(),
     }
 }
 pub(super) async fn auth_cli_status(headers: HeaderMap, State(s): State<AppState>) -> Response {
@@ -366,9 +445,20 @@ pub(super) async fn auth_session(headers: HeaderMap, State(s): State<AppState>) 
                 && cookie_value(&headers, "starter_session").is_some() =>
         {
             // Anonymous boot must also remove the obsolete browser credential.
-            (session_cookies(""), Json(status)).into_response()
+            (session_cookies("", 0), Json(status)).into_response()
         }
-        Ok(status) => Json(status).into_response(),
+        Ok(status) => {
+            if !headers.contains_key("x-starter-session") && status["authenticated"] == true {
+                let id = session_id(&headers).unwrap_or_default();
+                (
+                    session_cookies(&id, status["expires_at"].as_i64().unwrap_or_default()),
+                    Json(status),
+                )
+                    .into_response()
+            } else {
+                Json(status).into_response()
+            }
+        }
         Err(e) => unavailable(e).into_response(),
     }
 }
@@ -401,7 +491,14 @@ pub(super) async fn auth_context(
         .select(cookie_value(&headers, "starter_browser"), context)
         .await
     {
-        Ok(id) => (session_cookies(&id), Json(json!({"context_id":context}))).into_response(),
+        Ok(id) => match s.auth.get(&id).await {
+            Ok(Some(tokens)) => (
+                session_cookies(&id, tokens.expires_at),
+                Json(json!({"context_id":context})),
+            )
+                .into_response(),
+            _ => unavailable("Saved account needs a new sign-in".into()).into_response(),
+        },
         Err(e) => unavailable(e).into_response(),
     }
 }
@@ -434,7 +531,20 @@ pub(super) async fn auth_logout(headers: HeaderMap, State(s): State<AppState>) -
         }
     }
     (
-        session_cookies(&next),
+        session_cookies(
+            &next,
+            if next.is_empty() {
+                0
+            } else {
+                s.auth
+                    .get(&next)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.expires_at)
+                    .unwrap_or_default()
+            },
+        ),
         Json(json!({"authenticated":!next.is_empty()})),
     )
         .into_response()

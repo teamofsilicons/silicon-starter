@@ -1,0 +1,4 @@
+/* Card's base surface from Silicon UI's card.module.css. React/Motion quick-look is unused. */
+.silicon-card { position: relative; min-width: 0; overflow: hidden; isolation: isolate; border: 1px solid var(--border); border-radius: var(--radius-container); corner-shape: var(--corner-shape); background: var(--surface); color: var(--foreground); transition: border-color var(--duration-fast) var(--ease-standard), box-shadow var(--duration-standard) var(--ease-standard); }
+@media (hover: hover) and (pointer: fine) { .silicon-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-raised); } }
+@media (prefers-reduced-motion: reduce) { .silicon-card { transition: none; } }

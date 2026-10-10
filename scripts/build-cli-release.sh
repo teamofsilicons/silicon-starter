@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS: Xcode tools, Rust, cargo-zigbuild, Zig, cargo-xwin, LLVM/lld, Python 3.11+, Honeycomb.
+# macOS: Xcode tools, Rust, cargo-zigbuild, Zig, cargo-xwin, LLVM/lld, Python 3.11+, Silicon Apps.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [[ $(uname -s) == Darwin ]] || { echo 'Build the six release targets on macOS.' >&2; exit 1; }
@@ -16,8 +16,8 @@ for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-mus
   case "$target" in *-apple-darwin) codesign --force --sign - "target/$target/release/starter" ;; esac
   COPYFILE_DISABLE=1 tar -czf "$output/starter-$target.tar.gz" -C "target/$target/release" starter
 done
-python3 scripts/package-honeycomb.py
+python3 scripts/package-apps.py
 cp install.sh "$output/install.sh"
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/cli/Cargo.toml", "rb"))["package"]["version"])')
-(cd "$output" && shasum -a 256 starter-{aarch64,x86_64}-{apple-darwin,unknown-linux-musl}.tar.gz "starter-honeycomb-$version.tar.gz" install.sh > SHA256SUMS)
+(cd "$output" && shasum -a 256 starter-{aarch64,x86_64}-{apple-darwin,unknown-linux-musl}.tar.gz "starter-apps-$version-"*.tar.gz install.sh > SHA256SUMS)
 printf 'Release assets: %s\n' "$output"

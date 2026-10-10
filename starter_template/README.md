@@ -19,13 +19,13 @@ and terminal access during interactive setup. They can read files, ask
 follow-up questions, run tools, call APIs, and perform whatever setup the
 starter needs. Automatic updates run without questions or terminal input.
 
-## Before: running from testing/
+## Before: running from workspace/
 
 Assume this sample has been published as `tos.classic-sample`. Your terminal's
-current directory is an empty `testing/` folder:
+current directory is an empty `workspace/` folder:
 
 ```text
-testing/                            current working directory; empty
+workspace/                            current working directory; empty
 ```
 
 ## Pull, answer the questions, and stop
@@ -33,13 +33,12 @@ testing/                            current working directory; empty
 An interactive developer pull looks like this:
 
 ```text
-testing $ starter pull tos.classic-sample
+workspace $ starter pull tos.classic-sample
 
 Pulling tos.classic-sample...
 
 Folder name: research-assistant
 What is this silicon's ID (si:handle)? [empty] si:research
-What is this silicon's organization ID? [empty] tos
 What is this silicon's token? [empty] ********
 What should this silicon focus on?
   [Help the team research, plan, and finish its work.] Research for the team.
@@ -51,23 +50,22 @@ Building research-assistant...
 Created ./research-assistant
 Auto-update: disabled (developer checkout; use starter download for an updating instance)
 
-testing $
+workspace $
 ```
 
 The command finishes here. This sample creates the configured project and
-returns to the shell in `testing/`; it does not start the silicon or change
+returns to the shell in `workspace/`; it does not start the silicon or change
 your terminal's working directory.
 
 Every recipe question can be skipped with Enter to accept its resolved
 default. The timezone has no `prompt`, so it resolves silently; this example
 assumes its command detects `Asia/Kolkata`.
-The ID, organization ID, and token default to empty strings: the sample can generate files
+The ID and token default to empty strings: the sample can generate files
 without them, but those defaults do not create an identity or working login.
 Creators can supply command defaults to resolve those values in their setup.
-Use the complete IAM Silicon ID (`si:research`) and its separately verified
-organization (`tos`); an ID no longer contains or selects an organization.
+Use the complete Silicon Accounts ID (`si:research`).
 Application IDs are bare (`dm`, `briefcase`, `waveform`). Starter catalog IDs
-such as `tos.classic-sample` and bundle IDs such as `tos>interface` are unchanged.
+such as `tos.classic-sample` are unchanged.
 
 The folder question belongs to Starter and appears for every new instance
 unless a destination was already supplied. An occupied name needs a different
@@ -75,15 +73,15 @@ answer; it never means updating that folder. Folder name and silicon identity
 are separate. Pulling the same starter again can create another named folder
 alongside `research-assistant/` with its own answers and update state.
 
-## After: the configured project inside testing/
+## After: the configured project inside workspace/
 
 With the answers above, the generated file layout is below. Git internals are
 omitted so the source ingredients and generated files are easy to see.
 
 ```text
-testing/
+workspace/
   research-assistant/
-    silicon.yaml                    rendered with your ID, organization, token, and timezone
+    silicon.yaml                    rendered with your ID, token, and timezone
     prompts/
       silicon.md                    rendered with your chosen focus
       tools.md                      common instructions plus Waveform section
@@ -307,7 +305,7 @@ source state are committed only after the complete build and merge succeed.
    the home-directory update registry stays unchanged. Discard temporary output.
 
 Starter's validation checks generated YAML structure and known output
-references. It permits the sample's intentionally empty ID/organization/token defaults;
+references. It permits the sample's intentionally empty ID/token defaults;
 Stemcell checks runtime readiness when the user connects the silicon. This
 generation check leaves runtime expressions deferred. Stemcell's `compile`
 command evaluates compile-time commands such as `SILICON_HOME`, so it is not
@@ -360,7 +358,6 @@ For YAML scalars, `tojson` provides a quoted JSON value that is also valid YAML:
 ```jinja
 silicon:
   id: {{ var.silicon_id | tojson }}
-  org_id: {{ var.silicon_org_id | tojson }}
   timezone: {{ var.timezone | tojson }}
   SILICON_HOME: ! pwd
   apps:
@@ -395,7 +392,7 @@ The build script receives:
 | --- | --- |
 | `STARTER_SOURCE` | Absolute directory containing the recipe and ingredients. |
 | `STARTER_OUTPUT` | Absolute temporary output directory for this build. |
-| `STARTER_PROJECT` | Absolute destination, such as `/path/to/testing/research-assistant`; it may not exist on first pull. |
+| `STARTER_PROJECT` | Absolute destination, such as `/path/to/workspace/research-assistant`; it may not exist on first pull. |
 | `STARTER_INTERACTIVE` | `true` for interactive setup; `false` for automatic updates and default commands. |
 | `STARTER_VAR_<UPPERCASE_NAME>` | Every active answer, including secrets; booleans use `true` or `false`, numbers use numeric text, and lists/objects/multiselects use JSON. |
 

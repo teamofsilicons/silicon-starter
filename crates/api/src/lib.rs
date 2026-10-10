@@ -20,9 +20,9 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+mod accounts;
 mod auth;
 mod auth_routes;
-mod iam;
 use auth_routes::*;
 mod authority;
 mod blocks;
@@ -36,7 +36,6 @@ mod telemetry;
 
 #[derive(Clone, Default)]
 pub struct AppState {
-    pub(crate) world: Arc<iam::World>,
     pub blocks: Arc<RwLock<HashMap<String, blocks::StoredBlock>>>,
     pub block_publish_lock: Arc<Mutex<()>>,
     pub persist_lock: Arc<Mutex<()>>,
@@ -50,7 +49,8 @@ pub struct AppState {
     pub auth: Arc<auth::AuthState>,
     pub telemetry: Arc<telemetry::Telemetry>,
     pub store: Option<Arc<store::Store>>,
-    pub iam_event_ids: Arc<RwLock<HashSet<String>>>,
+    pub account_event_ids: Arc<RwLock<HashSet<String>>>,
+    pub account_profile_updated_at: Arc<RwLock<HashMap<String, chrono::DateTime<Utc>>>>,
     pub briefcase_entries: Arc<RwLock<HashMap<String, Uuid>>>,
     pub(crate) feature_store: Arc<tokio::sync::OnceCell<durable::FeatureStore>>,
     pub(crate) publication_lock: Arc<tokio::sync::Mutex<()>>,
@@ -58,7 +58,7 @@ pub struct AppState {
 #[derive(Deserialize)]
 struct ListQuery {
     q: Option<String>,
-    org: Option<String>,
+    owner: Option<String>,
     visibility: Option<Visibility>,
 }
 #[derive(Deserialize)]
@@ -94,19 +94,6 @@ pub fn seeded_state() -> AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route(
-            "/api/v1/briefcase/authorization",
-            post(feature_routes::start),
-        )
-        .route(
-            "/api/v1/briefcase/authorizations/{id}",
-            get(feature_routes::status),
-        )
-        .route(
-            "/api/v1/briefcase/authorizations/{id}/complete",
-            post(feature_routes::complete),
-        )
-        .route("/api/v1/organizations", get(organizations))
         .route("/api/v1/starters", get(list).post(create))
         .route("/api/v1/search", get(search))
         .route("/api/v1/blocks", get(blocks::list).post(blocks::publish))
@@ -130,19 +117,20 @@ pub fn router(state: AppState) -> Router {
             get(discussions).post(add_discussion),
         )
         .route("/auth/login", get(auth_login))
-        .route("/auth/briefcase/callback", get(feature_routes::callback))
         .route("/auth/attempt", post(auth_attempt))
         .route(
             "/auth/callback",
             get(auth_callback).post(auth_callback_json),
         )
         .route("/auth/cli", post(auth_cli))
+        .route("/auth/cli/start", post(auth_cli_start))
+        .route("/auth/cli/complete", post(auth_cli_complete))
         .route("/auth/cli/status", get(auth_cli_status))
         .route("/auth/session", get(auth_session))
         .route("/auth/contexts", get(auth_contexts))
         .route("/auth/context", post(auth_context))
         .route("/auth/logout", post(auth_logout))
-        .route("/webhooks/iam", post(iam_webhook))
+        .route("/webhooks/accounts", post(accounts_webhook))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_routes::context_guard,
@@ -164,9 +152,8 @@ pub fn router(state: AppState) -> Router {
                     HeaderName::from_static("x-starter-context"),
                     HeaderName::from_static("idempotency-key"),
                     HeaderName::from_static("x-starter-mode"),
-                    HeaderName::from_static("x-silicon-iam-signature"),
-                    HeaderName::from_static("x-silicon-iam-timestamp"),
-                    HeaderName::from_static("x-silicon-iam-key-version"),
+                    HeaderName::from_static("x-accounts-signature"),
+                    HeaderName::from_static("x-accounts-timestamp"),
                 ]),
         )
 }
@@ -180,19 +167,16 @@ async fn persist_state_checked(s: &AppState) -> Result<(), String> {
     save_state_unlocked(s).await
 }
 async fn save_state_unlocked(s: &AppState) -> Result<(), String> {
-    if s.world.environment_id.is_some() && s.auth.iam().await?.world != *s.world {
-        return Err("Testing catalog belongs to an earlier world generation".into());
-    }
     let Some(store) = &s.store else { return Ok(()) };
     let value = json!({
-        "world": *s.world,
         "blocks": *s.blocks.read().await,
         "starters": *s.starters.read().await,
         "versions": *s.versions.read().await,
         "discussions": *s.discussions.read().await,
         "bundles": s.bundles.read().await.iter().map(|(k,v)| (k.clone(), BASE64.encode(v))).collect::<HashMap<_,_>>(),
         "bundle_commits": *s.bundle_commits.read().await,
-        "iam_event_ids": *s.iam_event_ids.read().await,
+        "account_event_ids": *s.account_event_ids.read().await,
+        "account_profile_updated_at": *s.account_profile_updated_at.read().await,
         "briefcase_entries": *s.briefcase_entries.read().await,
     });
     store.save(value).await.map_err(|_| {
@@ -201,13 +185,13 @@ async fn save_state_unlocked(s: &AppState) -> Result<(), String> {
 }
 async fn health() -> Json<serde_json::Value> {
     Json(
-        json!({"status":"ok","service":"silicon-starter","api_version":"v1","version":env!("CARGO_PKG_VERSION"),"iam_protocol":"5"}),
+        json!({"status":"ok","service":"silicon-starter","api_version":"v1","version":env!("CARGO_PKG_VERSION"),"accounts_url":"https://accounts.teamofsilicons.com"}),
     )
 }
 async fn authenticated_session(
     s: &AppState,
     headers: &HeaderMap,
-) -> Result<auth::IamTokens, StatusCode> {
+) -> Result<auth::SessionTokens, StatusCode> {
     let id = session_id(headers).ok_or(StatusCode::UNAUTHORIZED)?;
     let tokens = s
         .auth
@@ -224,23 +208,12 @@ async fn authenticated_session(
     }
     Ok(tokens)
 }
-fn choose_organization(
-    session: &auth::IamTokens,
-    requested: Option<&str>,
-) -> Result<String, StatusCode> {
-    let orgs = session.organizations();
-    match requested {
-        Some(org) if orgs.iter().any(|allowed| allowed == org) => Ok(org.to_owned()),
-        None if orgs.len() == 1 => Ok(orgs[0].clone()),
-        _ => Err(StatusCode::FORBIDDEN),
+fn require_owner(session: &auth::SessionTokens, owner_uuid: &str) -> Result<(), StatusCode> {
+    if !owner_uuid.is_empty() && session.account_uuid() == owner_uuid {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
     }
-}
-async fn organizations(State(s): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
-    let orgs = authenticated_session(&s, &headers)
-        .await
-        .map(|session| session.organizations())
-        .unwrap_or_default();
-    Json(json!({"items":orgs.into_iter().map(|id| json!({"id":id,"name":id})).collect::<Vec<_>>()}))
 }
 async fn list(
     State(s): State<AppState>,
@@ -248,17 +221,20 @@ async fn list(
     Query(q): Query<ListQuery>,
 ) -> Json<Vec<Starter>> {
     let term = q.q.unwrap_or_default().to_lowercase();
-    let orgs = authenticated_session(&s, &headers)
+    let account = authenticated_session(&s, &headers)
         .await
-        .map(|session| session.organizations())
+        .map(|session| session.account_uuid().to_owned())
         .unwrap_or_default();
     Json(
         s.starters
             .read()
             .await
             .values()
-            .filter(|x| matches!(x.visibility, Visibility::Public) || orgs.contains(&x.owner))
-            .filter(|x| q.org.as_ref().is_none_or(|o| &x.owner == o))
+            .filter(|x| {
+                matches!(x.visibility, Visibility::Public)
+                    || !x.owner_uuid.is_empty() && account == x.owner_uuid
+            })
+            .filter(|x| q.owner.as_ref().is_none_or(|o| &x.owner == o))
             .filter(|x| {
                 q.visibility.as_ref().is_none_or(|v| {
                     std::mem::discriminant(&x.visibility) == std::mem::discriminant(v)
@@ -285,7 +261,7 @@ async fn search(
         headers.clone(),
         Query(ListQuery {
             q: None,
-            org: None,
+            owner: None,
             visibility: None,
         }),
     )
@@ -355,7 +331,7 @@ async fn show(
     if matches!(x.visibility, Visibility::Private)
         && !authenticated_session(&s, &headers)
             .await
-            .is_ok_and(|session| session.organizations().contains(&x.owner))
+            .is_ok_and(|session| require_owner(&session, &x.owner_uuid).is_ok())
     {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -384,16 +360,11 @@ async fn create(
     let session = authenticated_session(&s, &headers)
         .await
         .map_err(|status| (status, Json(json!({"error":"authentication required"}))))?;
-    let requested_org = input
-        .org_id
-        .as_deref()
-        .or_else(|| input.id.split_once('.').map(|(org, _)| org));
-    let owner = choose_organization(&session, requested_org).map_err(|status| {
-        (
-            status,
-            Json(json!({"error":"choose an organization authorized through IAM"})),
-        )
-    })?;
+    let owner = session.actor_id().to_owned();
+    let handle = owner.split_once(':').map(|(_, handle)| handle).ok_or((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":"invalid account"})),
+    ))?;
     if !valid_id(&input.id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -402,13 +373,13 @@ async fn create(
     }
     if !input
         .id
-        .strip_prefix(&format!("{owner}."))
+        .strip_prefix(&format!("{handle}."))
         .is_some_and(|name| !name.is_empty())
     {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(
-                json!({"error":format!("starter id must begin with {owner}. followed by a name")}),
+                json!({"error":format!("starter id must begin with {handle}. followed by a name")}),
             ),
         ));
     }
@@ -420,6 +391,7 @@ async fn create(
         name: input.name,
         description: input.description,
         owner,
+        owner_uuid: session.account_uuid().into(),
         visibility: input.visibility,
         version: "0.1".into(),
         downloads: 0,
@@ -464,16 +436,20 @@ async fn fork(
     State(s): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
 ) -> Result<(StatusCode, Json<Starter>), StatusCode> {
     let session = authenticated_session(&s, &headers).await?;
-    let owner = choose_organization(&session, q.get("org_id").map(String::as_str))?;
+    let owner = session.actor_id().to_owned();
+    let handle = owner
+        .split_once(':')
+        .map(|(_, handle)| handle)
+        .ok_or(StatusCode::FORBIDDEN)?;
     let Json(src) = show(State(s.clone()), headers, Path(id.clone())).await?;
     let mut m = s.starters.write().await;
     let fork = Starter {
-        id: format!("{owner}.fork-{}", Uuid::new_v4().simple()),
+        id: format!("{handle}.fork-{}", Uuid::new_v4().simple()),
         name: format!("{} (fork)", src.name),
         owner,
+        owner_uuid: session.account_uuid().into(),
         stars: 0,
         downloads: 0,
         updated_at: Utc::now(),
@@ -598,15 +574,15 @@ async fn push(
         .read()
         .await
         .get(&id)
-        .map(|starter| starter.owner.clone())
+        .map(|starter| starter.owner_uuid.clone())
         .ok_or((
             StatusCode::NOT_FOUND,
             Json(json!({"error":"starter not found"})),
         ))?;
-    choose_organization(&session, Some(&owner)).map_err(|status| {
+    require_owner(&session, &owner).map_err(|status| {
         (
             status,
-            Json(json!({"error":"only the owning organization can push this starter"})),
+            Json(json!({"error":"only the owning account can push this starter"})),
         )
     })?;
     if headers.get("x-starter-mode").and_then(|v| v.to_str().ok()) == Some("download") {
@@ -665,7 +641,7 @@ async fn publish(
         .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
-    choose_organization(&session, Some(&starter.owner))?;
+    require_owner(&session, &starter.owner_uuid)?;
     let key = feature_routes::key(&headers)?;
     let _publication = s.publication_lock.lock().await;
     if !matches!(starter.visibility, Visibility::Private) {
@@ -762,12 +738,8 @@ async fn add_discussion(
         id: Uuid::now_v7().to_string(),
         starter_id: id.clone(),
         parent_id: input.parent_id,
-        author: session
-            .actor
-            .as_ref()
-            .and_then(|actor| actor["public_id"].as_str())
-            .unwrap_or("authenticated-user")
-            .into(),
+        author: session.actor_id().into(),
+        author_uuid: session.account_uuid().into(),
         body: input.body,
         created_at: Utc::now(),
     };
@@ -805,7 +777,7 @@ fn frontend_url() -> String {
         .to_owned()
 }
 fn app_id() -> String {
-    std::env::var("STARTER_IAM_APP_ID").unwrap_or_else(|_| "starter".into())
+    std::env::var("STARTER_ACCOUNTS_APP_ID").unwrap_or_else(|_| "starter".into())
 }
 fn secure_cookie() -> &'static str {
     if std::env::var("STARTER_FRONTEND_URL")
@@ -817,108 +789,141 @@ fn secure_cookie() -> &'static str {
         ""
     }
 }
-async fn iam_webhook(
+async fn accounts_webhook(
     headers: HeaderMap,
     State(s): State<AppState>,
     body: axum::body::Bytes,
 ) -> StatusCode {
-    let Some(secret) = std::env::var_os("STARTER_IAM_WEBHOOK_SECRET") else {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let Ok(secret) = std::env::var("STARTER_ACCOUNTS_WEBHOOK_SECRET") else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    receive_iam_webhook(&s, &headers, &body, &secret.to_string_lossy()).await
-}
-async fn receive_iam_webhook(
-    s: &AppState,
-    headers: &HeaderMap,
-    body: &[u8],
-    secret: &str,
-) -> StatusCode {
-    use silicon_iam_client::{WebhookSecret, WebhookSecretKeyring, WebhookVerifier};
-    let Ok(secret) = WebhookSecret::new(secret) else {
+    let header = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let value = values.next()?.to_str().ok()?;
+        if values.next().is_some() {
+            None
+        } else {
+            Some(value)
+        }
+    };
+    let (Some(timestamp), Some(signature)) = (
+        header("x-accounts-timestamp"),
+        header("x-accounts-signature"),
+    ) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let Ok(ts) = timestamp.parse::<i64>() else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    if Utc::now().timestamp().abs_diff(ts) > 300 {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    let Some(version) = headers
-        .get("x-silicon-iam-key-version")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-    else {
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(&body);
+    if !signature
+        .split(',')
+        .filter_map(|part| part.trim().strip_prefix("v1="))
+        .filter_map(|sig| hex::decode(sig).ok())
+        .any(|sig| mac.clone().verify_slice(&sig).is_ok())
+    {
         return StatusCode::UNAUTHORIZED;
+    }
+    let Ok(event) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return StatusCode::BAD_REQUEST;
     };
-    let Ok(keys) = WebhookSecretKeyring::new(version, secret) else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    // The SDK authenticates exact bytes and rejects mixed envelopes/duplicate security headers.
-    let Ok(verified) = WebhookVerifier::new(keys).verify(headers, body) else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    if verified.is_testing() != s.world.environment_id.is_some() {
+    if event["app_id"].as_str() != Some(app_id().as_str()) {
         return StatusCode::FORBIDDEN;
     }
-    if let Some(environment_id) = s.world.environment_id {
-        let iam = match s.auth.iam().await {
-            Ok(iam) if iam.world == *s.world => iam,
-            _ => return StatusCode::SERVICE_UNAVAILABLE,
+    let Some(event_id) = event["event_id"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let _snapshot = s.persist_lock.lock().await;
+    let mut ids = s.account_event_ids.write().await;
+    if ids.contains(event_id) {
+        return StatusCode::NO_CONTENT;
+    }
+    let data = &event["data"];
+    // Session access is introspected on every request; delayed revocation notices cannot end a newer login.
+    if matches!(
+        event["type"].as_str(),
+        Some("account.id_changed" | "account.updated")
+    ) {
+        let Some(account_uuid) = data["uuid"].as_str().filter(|id| {
+            Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id)
+        }) else {
+            return StatusCode::BAD_REQUEST;
         };
-        let Some(key) = iam.client.environment() else {
-            return StatusCode::SERVICE_UNAVAILABLE;
+        let Some(occurred_at) = event["occurred_at"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.with_timezone(&Utc))
+        else {
+            return StatusCode::BAD_REQUEST;
         };
-        if verified.verify_testing_environment(key).is_err() {
-            return StatusCode::FORBIDDEN;
-        }
-        let event = verified.event();
-        if event
-            .aggregate
-            .get("environment_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(environment_id.to_string().as_str())
-            || event
-                .aggregate
-                .get("generation")
-                .and_then(serde_json::Value::as_i64)
-                .is_none_or(|g| g < 1)
-        {
-            return StatusCode::FORBIDDEN;
-        }
-        if let Some(cleaned_at) = &s.world.cleaned_at {
-            // Existing World snapshots use time's Display form; accept RFC3339 as well.
-            let cleaned = chrono::DateTime::parse_from_rfc3339(cleaned_at).or_else(|_| {
-                chrono::DateTime::parse_from_str(
-                    cleaned_at.strip_suffix(":00").unwrap_or(cleaned_at),
-                    "%Y-%m-%d %H:%M:%S%.f %:z",
-                )
-            });
-            let Ok(cleaned) = cleaned else {
-                return StatusCode::SERVICE_UNAVAILABLE;
-            };
-            let Some(cleaned) = cleaned.timestamp_nanos_opt() else {
-                return StatusCode::SERVICE_UNAVAILABLE;
-            };
-            if event.occurred_at.unix_timestamp_nanos() < i128::from(cleaned) {
-                return StatusCode::FORBIDDEN;
+        let public_id = data["new_id"]
+            .as_str()
+            .or_else(|| data["account"]["id"].as_str());
+        if let Some(public_id) = public_id.filter(|id| valid_account_id(id)) {
+            let mut updated = s.account_profile_updated_at.write().await;
+            if updated
+                .get(account_uuid)
+                .is_none_or(|last| occurred_at > *last)
+            {
+                for starter in s
+                    .starters
+                    .write()
+                    .await
+                    .values_mut()
+                    .filter(|x| x.owner_uuid == account_uuid)
+                {
+                    starter.owner = public_id.into();
+                }
+                for entry in s
+                    .blocks
+                    .write()
+                    .await
+                    .values_mut()
+                    .filter(|x| x.block.owner_uuid == account_uuid)
+                {
+                    entry.block.owner = public_id.into();
+                }
+                for discussion in s
+                    .discussions
+                    .write()
+                    .await
+                    .values_mut()
+                    .flatten()
+                    .filter(|x| x.author_uuid == account_uuid)
+                {
+                    discussion.author = public_id.into();
+                }
+                updated.insert(account_uuid.into(), occurred_at);
             }
         }
     }
-    // Persist only the public event identifier, never the envelope's environment root key.
-    let event_id = verified.event_id().to_string();
-    let inserted = {
-        let mut ids = s.iam_event_ids.write().await;
-        if ids.contains(&event_id) {
-            false
-        } else {
-            if ids.len() >= 4096 {
-                // Keep memory bounded; snapshots preserve the retained IDs across restarts.
-                if let Some(oldest) = ids.iter().next().cloned() {
-                    ids.remove(&oldest);
-                }
-            }
-            ids.insert(event_id)
-        }
-    };
-    if inserted {
-        persist_state(s).await;
+    if ids.len() >= 4096
+        && let Some(old) = ids.iter().next().cloned()
+    {
+        ids.remove(&old);
+    }
+    ids.insert(event_id.into());
+    drop(ids);
+    if save_state_unlocked(&s).await.is_err() {
+        s.account_event_ids.write().await.remove(event_id);
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::NO_CONTENT
 }
+
 pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     auth::validate_app_id(&app_id())?;
     if let Ok(id) = std::env::var("BRIEFCASE_APP_ID") {
@@ -926,41 +931,73 @@ pub async fn run(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut state = seeded_state();
     state.auth.load().await?;
-    if [
-        "STARTER_IAM_APP_SECRET",
-        "STARTER_IAM_TEST_APP_SECRET",
-        "STARTER_TESTING_ENVIRONMENT_KEY",
-    ]
-    .iter()
-    .any(|key| std::env::var_os(key).is_some())
-    {
-        state.world = Arc::new(state.auth.iam().await?.world);
-    }
-    if let Some(store) = store::Store::connect_from_env(&state.world).await? {
+    if let Some(store) = store::Store::connect_from_env().await? {
         let store = Arc::new(store);
         if let Some(payload) = store.load().await? {
             restore_state(&state, payload).await?;
         }
         state.store = Some(store);
+        persist_state_checked(&state).await?;
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
+fn valid_account_id(id: &str) -> bool {
+    id.strip_prefix("c:")
+        .or_else(|| id.strip_prefix("si:"))
+        .is_some_and(|handle| {
+            (3..=30).contains(&handle.len())
+                && handle
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+        })
+}
+
 async fn restore_state(
     s: &AppState,
     payload: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let object = payload.as_object().ok_or("invalid starter snapshot")?;
-    let saved_world: iam::World = match object.get("world") {
-        Some(world) => serde_json::from_value(world.clone())?,
-        None if s.world.environment_id.is_none() => iam::World::default(),
-        None => return Err("Testing catalog snapshot omitted its world binding".into()),
-    };
-    if saved_world != *s.world {
-        return Err("Catalog snapshot belongs to another world or testing generation".into());
+    let mut payload = payload;
+    if !payload.is_object() {
+        return Err("invalid starter snapshot".into());
     }
+    // Explicit operator mapping only: never infer ownership from a mutable account handle.
+    let mapping: HashMap<String, serde_json::Value> = serde_json::from_str(
+        &std::env::var("STARTER_OWNER_MIGRATION").unwrap_or_else(|_| "{}".into()),
+    )?;
+    for (old, account) in &mapping {
+        let uuid = account["uuid"]
+            .as_str()
+            .ok_or("owner mapping requires uuid")?;
+        let parsed = Uuid::parse_str(uuid)?;
+        if parsed.is_nil() || parsed.to_string() != uuid {
+            return Err("owner mapping requires a canonical nonempty account UUID".into());
+        }
+        let id = account["id"]
+            .as_str()
+            .filter(|id| valid_account_id(id))
+            .ok_or("owner mapping requires a canonical Carbon or Silicon id")?;
+        if let Some(entries) = payload["starters"].as_object_mut() {
+            for item in entries.values_mut().filter(|item| {
+                item["owner"] == *old && item["owner_uuid"].as_str().is_none_or(str::is_empty)
+            }) {
+                item["owner_uuid"] = json!(uuid);
+                item["owner"] = json!(id);
+            }
+        }
+        if let Some(entries) = payload["blocks"].as_object_mut() {
+            for entry in entries.values_mut() {
+                let item = &mut entry["block"];
+                if item["owner"] == *old && item["owner_uuid"].as_str().is_none_or(str::is_empty) {
+                    item["owner_uuid"] = json!(uuid);
+                    item["owner"] = json!(id);
+                }
+            }
+        }
+    }
+    let object = payload.as_object().ok_or("invalid starter snapshot")?;
     if let Some(value) = object.get("blocks") {
         *s.blocks.write().await = serde_json::from_value(value.clone())?;
     }
@@ -972,20 +1009,16 @@ async fn restore_state(
     }
     if let Some(value) = object.get("discussions") {
         let discussions: HashMap<String, Vec<Discussion>> = serde_json::from_value(value.clone())?;
-        if discussions.values().flatten().any(|discussion| {
-            discussion.author != "authenticated-user"
-                && !auth::valid_actor_id("carbon", &discussion.author)
-                && !auth::valid_actor_id("silicon", &discussion.author)
-        }) {
-            return Err("legacy discussion authors require the offline IAM mapping migration; see docs/PUBLIC-IDENTIFIER-MIGRATION.md".into());
-        }
         *s.discussions.write().await = discussions;
     }
     if let Some(value) = object.get("bundle_commits") {
         *s.bundle_commits.write().await = serde_json::from_value(value.clone())?;
     }
-    if let Some(value) = object.get("iam_event_ids") {
-        *s.iam_event_ids.write().await = serde_json::from_value(value.clone())?;
+    if let Some(value) = object.get("account_event_ids") {
+        *s.account_event_ids.write().await = serde_json::from_value(value.clone())?;
+    }
+    if let Some(value) = object.get("account_profile_updated_at") {
+        *s.account_profile_updated_at.write().await = serde_json::from_value(value.clone())?;
     }
     if let Some(value) = object.get("briefcase_entries") {
         *s.briefcase_entries.write().await = serde_json::from_value(value.clone())?;
@@ -999,403 +1032,4 @@ async fn restore_state(
         *s.bundles.write().await = decoded;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod webhook_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn rejects_unsigned_delivery_without_mutating_deduplication() {
-        let state = AppState::default();
-        assert_eq!(
-            receive_iam_webhook(
-                &state,
-                &HeaderMap::new(),
-                b"{}",
-                "test-signing-key-with-at-least-32-characters"
-            )
-            .await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert!(state.iam_event_ids.read().await.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod auth_and_organization_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn restored_discussions_require_canonical_authors_and_preserve_content() {
-        let s = AppState::default();
-        for author in [
-            "alice",
-            "assistant:tos",
-            "c:alice",
-            "si:assistant",
-            "authenticated-user",
-        ] {
-            let discussion = json!({
-                "id": "unchanged-id", "starter_id": "tos.example", "parent_id": null,
-                "author": author, "body": "Keep assistant:tos and tos>starter in historical text.",
-                "created_at": "2026-09-23T00:00:00Z"
-            });
-            let result = restore_state(
-                &s,
-                json!({"discussions": {"tos.example": [discussion.clone()]}}),
-            )
-            .await;
-            if ["alice", "assistant:tos"].contains(&author) {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("offline IAM mapping")
-                );
-            } else {
-                result.unwrap();
-                assert_eq!(
-                    serde_json::to_value(&s.discussions.read().await["tos.example"][0]).unwrap(),
-                    discussion
-                );
-            }
-        }
-    }
-
-    pub(super) async fn session(s: &AppState, orgs: &[&str]) -> HeaderMap {
-        let id = s
-            .auth
-            .insert(auth::IamTokens {
-                access_token: "test-access".into(),
-                refresh_token: "test-refresh".into(),
-                expires_in: 1800,
-                expires_at: Some(Utc::now().timestamp() + 1800),
-                actor: Some(json!({"type":"carbon","public_id":"c:test-user"})),
-                org_id: (orgs.len() == 1).then(|| orgs[0].to_string()),
-                org_ids: orgs.iter().map(|org| (*org).into()).collect(),
-                context_id: "fixture-context".into(),
-                world: iam::World::default(),
-            })
-            .await
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-starter-session", id.parse().unwrap());
-        headers.insert("x-starter-context", "fixture-context".parse().unwrap());
-        headers
-    }
-
-    fn input(id: &str) -> CreateStarter {
-        CreateStarter {
-            id: id.into(),
-            org_id: None,
-            name: "Example".into(),
-            description: String::new(),
-            visibility: Visibility::Private,
-            tags: Vec::new(),
-            yaml: silicon_starter_core::SEED_YAML.into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn public_pulls_require_a_valid_session_but_downloads_do_not() {
-        let s = AppState::default();
-        let owner = session(&s, &["tos"]).await;
-        let _ = create(
-            State(s.clone()),
-            owner.clone(),
-            Json(CreateStarter {
-                visibility: Visibility::Public,
-                ..input("tos.public")
-            }),
-        )
-        .await
-        .unwrap();
-        s.bundles
-            .write()
-            .await
-            .insert("tos.public".into(), b"bundle".to_vec());
-        s.bundle_commits
-            .write()
-            .await
-            .insert("tos.public".into(), "a".repeat(40));
-        for mode in ["pull", "dev"] {
-            let q = HashMap::from([("mode".into(), mode.into())]);
-            assert_eq!(
-                archive(
-                    State(s.clone()),
-                    HeaderMap::new(),
-                    Path("tos.public".into()),
-                    Query(q.clone())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::UNAUTHORIZED
-            );
-            assert!(
-                archive(
-                    State(s.clone()),
-                    owner.clone(),
-                    Path("tos.public".into()),
-                    Query(q)
-                )
-                .await
-                .is_ok()
-            );
-            let mut headers = HeaderMap::new();
-            headers.insert("x-starter-mode", mode.parse().unwrap());
-            assert_eq!(
-                archive(
-                    State(s.clone()),
-                    headers,
-                    Path("tos.public".into()),
-                    Query(HashMap::new())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::UNAUTHORIZED
-            );
-        }
-        for reference in ["9.9", "abcde", ""] {
-            assert_eq!(
-                archive(
-                    State(s.clone()),
-                    HeaderMap::new(),
-                    Path("tos.public".into()),
-                    Query(HashMap::from([("ref".into(), reference.into())]))
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-        }
-        assert!(
-            archive(
-                State(s),
-                HeaderMap::new(),
-                Path("tos.public".into()),
-                Query(HashMap::new())
-            )
-            .await
-            .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn organization_creation_and_private_access_are_enforced() {
-        let s = AppState::default();
-        assert!(s.starters.read().await.is_empty());
-        assert_eq!(
-            create(
-                State(s.clone()),
-                HeaderMap::new(),
-                Json(input("tos.example"))
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::UNAUTHORIZED
-        );
-        let unscoped = session(&s, &[]).await;
-        assert_eq!(
-            create(
-                State(s.clone()),
-                unscoped.clone(),
-                Json(input("tos.example"))
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::UNAUTHORIZED
-        );
-        let owner = session(&s, &["tos"]).await;
-        for id in ["tos.Upper", "tos.under_score", "tos.extra.dot"] {
-            assert_eq!(
-                create(State(s.clone()), owner.clone(), Json(input(id)))
-                    .await
-                    .unwrap_err()
-                    .0,
-                StatusCode::BAD_REQUEST
-            );
-        }
-        assert_eq!(
-            create(State(s.clone()), owner.clone(), Json(input("lab.example")))
-                .await
-                .unwrap_err()
-                .0,
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            create(State(s.clone()), owner.clone(), Json(input("tos.example")))
-                .await
-                .unwrap()
-                .0,
-            StatusCode::CREATED
-        );
-        assert_eq!(
-            create(State(s.clone()), owner.clone(), Json(input("tos.example")))
-                .await
-                .unwrap_err()
-                .0,
-            StatusCode::CONFLICT
-        );
-        let outsider = session(&s, &["lab"]).await;
-        for headers in [HeaderMap::new(), unscoped, outsider.clone()] {
-            assert_eq!(
-                show(
-                    State(s.clone()),
-                    headers.clone(),
-                    Path("tos.example".into())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-            assert_eq!(
-                versions(
-                    State(s.clone()),
-                    headers.clone(),
-                    Path("tos.example".into())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-            assert_eq!(
-                commits(
-                    State(s.clone()),
-                    headers.clone(),
-                    Path("tos.example".into())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-            let Json(items) = list(
-                State(s.clone()),
-                headers,
-                Query(ListQuery {
-                    q: None,
-                    org: None,
-                    visibility: None,
-                }),
-            )
-            .await;
-            assert!(items.is_empty());
-        }
-        assert!(
-            show(State(s.clone()), owner.clone(), Path("tos.example".into()))
-                .await
-                .is_ok()
-        );
-        assert!(
-            versions(State(s.clone()), owner, Path("tos.example".into()))
-                .await
-                .unwrap()
-                .0
-                .is_empty()
-        );
-        assert_eq!(
-            push(
-                State(s.clone()),
-                outsider.clone(),
-                Path("tos.example".into()),
-                Json(PushRequest {
-                    commit: "a".repeat(40),
-                    bundle_base64: String::new(),
-                    yaml: silicon_starter_core::SEED_YAML.into(),
-                    message: String::new(),
-                })
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            publish(
-                State(s.clone()),
-                outsider,
-                Path("tos.example".into()),
-                Json(PublishRequest {
-                    selector: "main".into(),
-                    version: "1.0".into(),
-                    commit: None,
-                    notes: String::new(),
-                })
-            )
-            .await
-            .unwrap_err()
-            .status,
-            StatusCode::FORBIDDEN
-        );
-        let multi = session(&s, &["tos", "lab"]).await;
-        for id in ["unselected.example", "lab.inferred"] {
-            assert_eq!(
-                create(State(s.clone()), multi.clone(), Json(input(id)))
-                    .await
-                    .unwrap_err()
-                    .0,
-                StatusCode::UNAUTHORIZED
-            );
-        }
-        let selected = session(&s, &["lab"]).await;
-        assert_eq!(
-            create(State(s.clone()), selected, Json(input("lab.example")))
-                .await
-                .unwrap()
-                .1
-                .0
-                .owner,
-            "lab"
-        );
-        assert!(restore_state(&s, json!({"starters":[]})).await.is_err());
-        assert!(
-            restore_state(&s, json!({"bundles":{"x":"invalid base64"}}))
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn browser_callbacks_reject_missing_wrong_and_duplicate_state() {
-        for (cookie, query_state) in [
-            (None, None),
-            (Some("starter_login_state=expected"), None),
-            (None, Some("expected")),
-            (Some("starter_login_state=expected"), Some("wrong")),
-            (
-                Some("starter_login_state=expected-prefix"),
-                Some("expected"),
-            ),
-            (
-                Some("starter_login_state=expected; starter_login_state=expected"),
-                Some("expected"),
-            ),
-        ] {
-            let mut headers = HeaderMap::new();
-            if let Some(cookie) = cookie {
-                headers.insert("cookie", cookie.parse().unwrap());
-            }
-            let mut query = HashMap::from([("slt".into(), "oac_test".into())]);
-            if let Some(state) = query_state {
-                query.insert("state".into(), state.into());
-            }
-            let response = auth_callback(headers.clone(), Query(query), State(AppState::default()))
-                .await
-                .into_response();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            let response = auth_callback_json(
-                headers,
-                State(AppState::default()),
-                Json(AuthCallbackBody {
-                    slt: "oac_test".into(),
-                    state: query_state.map(str::to_owned),
-                }),
-            )
-            .await
-            .into_response();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-    }
 }

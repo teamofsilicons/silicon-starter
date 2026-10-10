@@ -1,170 +1,111 @@
 # Silicon Starter
 
-A CLI-first registry for versioned silicon architectures. The repository ships a Rust API/CLI and a SolidJS web client.
+A registry of versioned silicon architectures, genes, ISIs and functions for Carbons and Silicons. The Rust API and CLI share a SolidJS frontend built with [Silicon UI](https://ui.teamofsilicons.com).
 
-The reusable Rust library, [silicon-starter-core](https://crates.io/crates/silicon-starter-core), is licensed under [Apache-2.0](crates/core/LICENSE).
+- [Website](https://starter.teamofsilicons.com)
+- [Silicon Apps](https://apps.teamofsilicons.com/apps/starter)
+- [Developer portal](https://developers.teamofsilicons.com/apps/starter)
 
-## Install
+## Install and sign in
 
-Install on macOS (Apple Silicon or Intel) or Linux (ARM64 or x86_64):
-
-```sh
-curl -fsSL https://starter.teamofsilicons.com/install.sh | sh
-```
-
-[Release downloads](https://github.com/teamofsilicons/silicon-starter/releases/latest) include the installer and binaries. The installer selects your platform, verifies the download checksum, and puts `starter` on your PATH. It uses `/usr/local/bin` (with `sudo` when needed), or falls back to `~/.local/bin` and configures your shell’s PATH. Open a new terminal if the installer updates your shell configuration. Git is required for repository operations; Rust is not required.
-
-With [Honeycomb](https://docs.honeycomb.teamofsilicons.com/installation/) installed and access to `starter`, install the six-platform package (macOS, Linux, or Windows; ARM64 or x86_64):
+Install [Silicon Apps](https://apps.teamofsilicons.com/llms.txt), then:
 
 ```sh
-honeycomb install starter
+silicon-apps install starter
 starter --help
+starter accounts --json
+starter login status --json
 ```
 
-Honeycomb manages CLI installation and binary updates. `starter update` and `starter daemon` manage downloaded project checkouts. Git must already be on PATH; Honeycomb packages do not run setup scripts.
+Silicon Apps manages CLI updates. Git must be installed for repository operations.
 
-For IAM 5 deployment, session storage, explicit Briefcase permission and world-partitioned catalog cutover, follow the [IAM 5 migration guide](docs/IAM5-MIGRATION.md). If historical identifiers remain, complete the [public identifier migration](docs/PUBLIC-IDENTIFIER-MIGRATION.md) before the first IAM 5 startup. App IDs are bare, Silicon IDs use `si:handle` with a separate organization, and starter catalog IDs such as `tos.classic` stay unchanged.
+The current Silicon Apps service accepts Linux packages. Native macOS and Windows builds are available from [GitHub Releases](https://github.com/teamofsilicons/silicon-starter/releases/latest); extract the archive and place `starter` (`starter.exe` on Windows) on your PATH. Those manual installations need manual updates until Apps enables validation for those platforms.
 
-The CLI connects to the production API at `https://backend.starter.teamofsilicons.com`. Override it with `--api http://127.0.0.1:8080` or `STARTER_API_URL=http://127.0.0.1:8080` for local development.
+Carbons run `starter login` and follow the browser sign-in. Silicons request a single-use, two-minute token for Starter from Silicon Accounts, then exchange it:
 
-## Local
+```sh
+silicon-accounts login --app starter
+starter login --slt TOKEN
+starter login status --json
+starter logout
+```
+
+Starter never receives a Silicon's STK. Browser and CLI sessions survive restarts until the Accounts refresh token expires, access is revoked, or the user logs out. Refreshing an access token preserves the account and the original session expiry. The backend encrypts credentials at rest; the CLI stores only its opaque Starter session in a private file below `SILICON_HOME` (or the user home) in `.starter`.
+
+Every action belongs to one Carbon or Silicon. Ownership is keyed by immutable Accounts UUID; handles such as `c:alice` and `si:tos` are display identifiers and can change. Existing catalog IDs such as `tos.classic` remain stable. New starter IDs use your current handle followed by a dot and a lowercase name.
+
+## Projects and blocks
+
+```sh
+starter search classic
+starter download tos.classic                 # downloaded project, hourly project updates
+starter download tos.classic@2.1             # pinned release
+starter pull tos.classic                      # editable checkout; requires sign-in
+starter pull                                 # update the current editable checkout
+starter push
+starter publish latest 2.1 --notes "Release notes"
+starter publish history
+starter update on|off|now
+starter revert <commit>
+
+starter publish gene:creativity --text "Explore several approaches."
+starter publish isi:researcher researcher.zip
+starter publish function:greet greet.zip
+starter download gene:creativity
+starter history gene:creativity
+```
+
+Public content is readable anonymously. Private content and publishing require the owning account. Genes contain Markdown; ISIs and functions contain ZIP files with a root `isi.yaml` or `function.yaml`. Block versions are SHA-256 hashes. Public archives are stored through Briefcase using Silicon Accounts User verification proofs scoped to the requested operation. Its delegated API checks the represented account and confines Starter to its own application folder.
+
+`starter update` and `starter daemon` update downloaded project checkouts; Silicon Apps alone updates the installed CLI. Pinned releases and editable pulls never auto-update. Unresolved merge conflicts leave the installed revision intact and disable project updates until resolved.
+
+## Templates
+
+A starter can include `.starterbase/starter.yaml` and ingredients. Pulling or downloading seeds its destination. Recipes support typed conditional questions, CEL and Bash defaults, Jinja templates, copied files, and ordered build commands.
+
+```sh
+starter download tos.example --dir my-project --defaults
+starter seed
+starter seed --set waveform=false
+starter seed --answers answers.json --defaults
+starter seed --reset timezone --defaults
+starter seed --check
+```
+
+Answers and generated baselines stay in private, Git-ignored `.starterbase/.state`. Reseeding merges generated output with local edits. Recipe scripts are trusted local code and require Bash. Put secret answers in a private JSON file passed with `--answers`; review generated files before committing. The website's Template tab displays recipes without executing them.
+
+See the [authoring example](starter_template/README.md) and [variable catalog](starter_template/variables.yaml).
+
+## Local development
 
 ```sh
 cargo fmt --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
+cargo clippy --workspace -- -D warnings
 npm --prefix frontend ci
+npm --prefix frontend run check
 npm --prefix frontend run build
 STARTER_BIND=127.0.0.1:8080 STARTER_FRONTEND_URL=http://127.0.0.1:5173 cargo run -p silicon-starter-api
+npm --prefix frontend run dev -- --host 127.0.0.1
 ```
 
-In another terminal, run `npm --prefix frontend run dev -- --host 127.0.0.1` to open the web client. The browser regression check uses an isolated mock registry and requires Node 22+ and Chrome: `node frontend/src/browser-check.mjs`. Set `CHROME_BIN` if Chrome is installed outside the default macOS path.
+Set `STARTER_ACCOUNTS_APP_ID=starter`, `STARTER_ACCOUNTS_APP_SECRET`, `STARTER_AUTH_FILE`, and a stable 64-hex `STARTER_AUTH_ENCRYPTION_KEY`. Accounts defaults to `https://accounts.teamofsilicons.com`; override with `ACCOUNTS_URL`. Register the frontend's `/auth/callback` URL in the developer portal and enable device flow for Carbon CLI sign-in.
 
-The API loads saved starters from `STARTER_DATABASE_URL` (or `DATABASE_URL`). Without a database, local mode starts with an empty in-memory catalog; a configured but unavailable database stops startup. Creating a starter requires IAM authorization for an attached organization and a valid Stemcell `silicon.yaml`. Set `STARTER_API_URL` for the CLI. `starter iam --json` prints the app metadata; IAM SLTs are accepted by `starter login <SLT>` and exchanged only by a configured backend.
+The API uses `STARTER_DATABASE_URL` (or `DATABASE_URL`) for durable catalog data. An unavailable configured database stops startup. Without a database, catalog data is in memory. The CLI defaults to `https://backend.starter.teamofsilicons.com`; override with `--api` or `STARTER_API_URL`. Set `SPACE_STATION_TELEMETRY=0` to disable telemetry.
 
-## CLI quick reference
+The repository has no test suite. Release verification uses compilation, type checking, linting, live API/browser checks and Silicon Apps' required executable validation.
 
-```sh
-starter download org.starter       # install with hourly updates
-starter download org.starter@2.1   # install and pin a published release
-starter pull org.starter            # requires login; editable, never auto-updated
-starter pull                        # update the current checkout using its saved starter id
-starter update on|off|now
-starter publish latest 2.1 --notes "release notes"
-starter publish history
-starter revert <commit>
-```
+## Release and deployment
 
-Starter IDs use `org.starter-name`: the starter name contains only lowercase ASCII letters, digits, and hyphens, with no additional dots. Pulls require a valid IAM session. Public downloads work anonymously; private downloads require membership in the owning organization.
+See [publishing to Silicon Apps](deploy/apps/README.md) and [Accounts deployment](docs/ACCOUNTS.md). `bash scripts/build-cli-release.sh` builds native packages for macOS, Linux and Windows on ARM64 and x86_64. Upload each target supported by live Silicon Apps validation workers, create a development release, promote it, and publish as `si:tos`.
 
-The CLI reads `STARTER_API_URL` (default `https://backend.starter.teamofsilicons.com`) and stores its IAM session, checkout registry, and webhook settings below `SILICON_HOME` (or the operating system's user home) in `.starter`. `starter update on` clears a release pin so a downloaded checkout can resume tracking the latest archive. Set `SPACE_STATION_TELEMETRY=0` to disable optional telemetry.
-
-## Template starters
-
-A starter can optionally include `.starterbase/starter.yaml` and its ingredients. `starter pull` and `starter download` seed a new checkout automatically; starters without `.starterbase` keep their existing behavior.
-
-```sh
-starter pull tos.example --dir my-silicon
-starter download tos.example --dir installed-silicon --defaults
-starter seed                         # reconfigure using saved answers
-starter seed --set waveform=false    # change a typed answer
-starter seed --answers answers.json --defaults
-starter seed --reset timezone --defaults
-starter seed --check                 # validate without running commands
-```
-
-Interactive installs ask for a destination unless `--dir` is supplied. Occupied folders are rejected. Noninteractive runs use saved answers and defaults; `--defaults` also suppresses terminal questions. `--set` accepts JSON values or plain strings. Put secret answers in a private JSON file passed with `--answers` to avoid shell history.
-
-Recipes support typed, conditional questions; CEL and Bash defaults with literal fallbacks; Jinja templates and includes; copied files; and ordered build commands. All preparation runs without terminal input. Build scripts receive `STARTER_SOURCE`, `STARTER_OUTPUT`, `STARTER_PROJECT`, `STARTER_INTERACTIVE`, and active `STARTER_VAR_*` answers. Recipe scripts are trusted local code and require Bash (on Windows, install Git Bash and put `bash` on PATH). Only generated output is managed transactionally; scripts own any external side effects.
-
-Answers and the pure generated baseline live in private, Git-ignored `.starterbase/.state`. Reseeding and downloaded updates merge the old generated baseline, local edits, and newly generated files. Unrelated files remain intact. A failed build, failed history commit, or unresolved update conflict leaves the installed revision intact and disables automatic updates; fix the problem and use `starter update on` to resume. Each downloaded update gets a local history commit, including revisions with unchanged generated output. Missing state in an existing instance requires recovery or reconciliation.
-
-Unpinned downloads enable automatic updates by default. Only the to-update list in `~/.starter/registry.json` controls eligibility; recipes and generated state do not contain an `auto_update` setting. Enabled downloads and `starter update on` start a single background daemon, which checks this list hourly and removes missing checkouts. `starter update off` removes a checkout, and `starter update on` adds it back. After a reboot, run `starter daemon`, download a starter, or use `starter update on` to resume the worker. Pinned downloads and developer pulls stay out of the list. Checkout modes remain fixed: create a separate `--dir` when moving between development and downloaded instances. First developer seeding leaves personal configuration uncommitted; review generated files before committing credentials to any publishable Git history.
-
-`starter push` validates the committed recipe and builds a default preview in a disposable checkout. Only after that succeeds does it add the default-preview commit to the author checkout and upload. Saved personal answers stay local and can be restored with `starter seed`. Commit source changes before pushing. The website's Template tab shows questions, conditions, defaults, build flow, and source ingredients without executing scripts.
-
-See [the working authoring example](starter_template/README.md) and [the variable catalog](starter_template/variables.yaml). Run `python3 scripts/check-template.py target/debug/starter` for the isolated template lifecycle check.
-
-## Genes, ISIs, and functions
-
-Blocks use IDs such as `gene:creativity`, `isi:researcher`, and `function:greet`.
-Publish them through the CLI or the website with an IAM session and an authorized
-organization. Genes accept Markdown text; ISIs and functions accept ZIP files
-with supporting files and a required root `isi.yaml` or `function.yaml`.
-
-```sh
-starter publish gene:creativity creativity.md --org tos
-starter publish gene:creativity --text "Explore several approaches before choosing." --org tos
-starter publish isi:researcher researcher.zip --org tos
-starter publish function:greet greet.zip --org tos
-starter download gene:creativity --dir creativity
-starter download gene:creativity@<sha256> --dir creativity-pinned
-starter history gene:creativity
-starter search creativity
-```
-
-An ISI archive defines exactly one ISI whose name matches its ID:
-
-```yaml
-isi:
-  researcher:
-    model: fast
-    dna:
-      assemble: [prompts/research.md]
-```
-
-A function archive defines exactly one function, including its parameters:
-
-```yaml
-functions:
-  greet:
-    params: [name]
-    do: []
-```
-
-Each publication has a SHA-256 version derived from its payload. Downloading
-without a version returns the latest publication; `@<sha256>` retrieves an exact
-version. An ID retains its owner and visibility across versions. Blocks have no Git checkout or automatic update registration. Public
-blocks are readable anonymously; private blocks require owning-organization
-access. Search includes block content and semantic ranking when Gemini is
-configured. Downloaded supporting files remain alongside their YAML for use by
-the interpreter.
-
-## Build CLI releases
-
-On macOS with Xcode command-line tools, Rust, Zig, cargo-zigbuild, cargo-xwin, LLVM/lld, Python 3.11+, and Honeycomb on PATH, run `bash scripts/build-cli-release.sh`. It builds all six native targets and writes the four standalone macOS/Linux archives, installer, validated `starter-honeycomb-<version>.tar.gz`, and `SHA256SUMS` to `target/cli-release`. Windows binaries use the static MSVC runtime. The packager reads the version from `crates/cli/Cargo.toml` and includes only the manifest and six binaries.
-
-Check a built binary with `python3 scripts/check-cli.py target/aarch64-apple-darwin/release/starter`; check the installer without changing your machine with `python3 scripts/check-install.py`.
-
-See [Honeycomb publishing](deploy/honeycomb/README.md) for upload, review, and registration details. The API/frontend structure and hosting do not change for Honeycomb distribution.
-
-## Backend on EC2
-
-Production runs a static ARM64 Rust binary under `starter-api.service`. Caddy handles HTTPS; journald keeps logs. AWS Systems Manager provides shell access, with no SSH port exposed. PostgreSQL and IAM credentials are loaded from Secrets Manager into a root-only systemd environment file. Database credentials come from RDS’s authoritative managed secret at deployment. The hourly `starter-db-refresh.timer` refreshes a rotated password and restarts the API only when it changes.
-
-Build and manually deploy from this repository (requires Rust's ARM64 Linux target, cargo-zigbuild, Zig, and an authorized AWS CLI):
+The production API runs on ARM64 EC2 behind Caddy, with deployment through AWS SSM and encrypted S3 artifacts:
 
 ```sh
 cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p silicon-starter-api
 python3 deploy/ec2/deploy.py
 ```
 
-The deploy uploads only the binary and service installer to private S3, verifies the checksum on EC2, switches an atomic release symlink, and restarts systemd. If deployment or health checks fail, it restores the previous binary, service unit, and environment file when a previous deployment exists.
+Deployment verifies checksums, changes the release symlink atomically, and restores the previous release if health checks fail. Runtime secrets come from AWS Secrets Manager. `starter-db-refresh.timer` refreshes RDS credentials after rotation. The frontend is deployed from `frontend/` to its existing Vercel project.
 
-Bootstrap Caddy once on a new host by sending the installer through SSM (replace the instance ID when rebuilding the stack):
-
-```sh
-aws ssm send-command --region us-east-1 --instance-ids i-0f507128879c0ed76 --document-name AWS-RunShellScript \
-  --parameters "$(python3 -c 'import json,pathlib; print(json.dumps({"commands":[pathlib.Path("deploy/ec2/install-proxy.sh").read_text()]}))')"
-```
-
-The installer verifies the pinned native Caddy bundle from private S3. After the API is healthy and the backend DNS A record points to the instance's Elastic IP, run `sudo systemctl start caddy` in an SSM session:
-
-```sh
-aws ssm start-session --region us-east-1 --target i-0f507128879c0ed76
-sudo journalctl -u starter-api -f
-sudo systemctl restart starter-api
-sudo journalctl -u caddy --since '1 hour ago'
-```
-
-Infrastructure is in `deploy/ec2/stack.yaml` (`silicon-starter-native`, us-east-1). The backend keeps its original domain and existing RDS database. There are no automatic deployments on git push, container images, or Rust source trees on the production host.
+The reusable [silicon-starter-core](https://crates.io/crates/silicon-starter-core) crate is Apache-2.0 licensed.

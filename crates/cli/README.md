@@ -1,32 +1,23 @@
-# Starter CLI IAM5 contexts
+# Starter CLI accounts
 
-Select a separate account/organization with `--profile <name>` or `STARTER_PROFILE`. Each profile keeps private sessions per API origin and world. `--world` / `STARTER_WORLD` defaults to `production`; testing deployments use `testing:<environment-UUID>`. The world is an assertion about the backend configuration, and the CLI does not send test application credentials.
-
-```sh
-starter --profile work login '<IAM SLT>'
-starter --profile work login status --json
-starter --profile test --api http://127.0.0.1:8080 --world testing:<UUID> --org tos login si:tester
-starter --profile work login --recover
-```
-
-Login persists its idempotency key and exact SLT before I/O. Recover an interrupted exchange within ten minutes, or use `login --cancel` to discard the local retry receipt. Old plaintext `.starter/session` files are never sent; authenticate again to create a scoped session. Saved responses must include canonical Carbon/Silicon actor, one organization, public context ID and an unchanged world fingerprint. An organization flag can assert the selected organization but cannot retarget a bearer.
-
-A checkout records its originating API, profile, world and context without credentials. Background updates use this origin through the one shared daemon. A replacement login does not adopt old jobs. `starter context show` inspects the origin; `starter context bind` explicitly binds the current checkout to the selected login. Legacy and explicitly anonymous checkouts make anonymous requests until explicitly bound. Session credentials and login/permission retry receipts are private files under `.starter/profiles`.
-
-Briefcase permission is separate from login:
+Every action belongs to a Carbon or Silicon account. Use `--profile <name>` or `STARTER_PROFILE` to keep separate saved accounts; sessions are private and scoped to that profile and API origin.
 
 ```sh
-starter --profile work permission authorize
-starter --profile work permission status
-starter --profile work permission complete --code-file -
-starter --profile work permission complete       # recover a saved uncertain completion
-starter --profile work publish retry             # explicitly retry the saved publication
+starter accounts --json
+starter login                         # Carbon: approve the displayed browser link
+silicon-accounts login --app starter   # Silicon: request a token for Starter
+starter login --slt-stdin < token.txt   # keep the token out of process arguments
+starter login --slt '<SLT>'
+starter login status --json
+starter logout
 ```
 
-Open the returned HTTPS IAM review link and approve there. Completion validates the original account, organization, context, request ID and state. Retry keys and the exact code are saved before I/O; success clears the code. A decline, expiry or HTTP412 terms change requires fresh review. `permission cancel` discards only the local review. Approval never publishes automatically.
+A sign-in stays saved across CLI restarts until its Accounts session expires or is signed out. Starter's backend refreshes the short-lived access token within the original session lifetime. The CLI stores the opaque Starter session and absolute expiry, never a Silicon's STK or an app secret. Accounts UUIDs identify owners; `c:` and `si:` handles are display identities and may change.
 
-A failed or permission-blocked publication keeps its exact commit, release version, notes, context and idempotency key in private `.git/starter-publication.json`. `publish retry` uses those original bytes even if local HEAD changed. `publish cancel` discards the local receipt without undoing any remote result. Another account cannot resume it.
+Login saves an interrupted exchange privately. Use `login --recover` to resume it or `login --cancel` to discard it. A saved SLT receipt can recover the same exchange for ten minutes; an unused SLT expires after two minutes. Carbon device approval expires at the time returned by Accounts. Previous credentials must be replaced with a new Silicon Accounts sign-in.
 
-Verification: `cargo test -p starter -p silicon-starter-core`, `cargo clippy -p starter -p silicon-starter-core --all-targets -- -D warnings`, `python3 crates/cli/tests/iam5_contexts.py <built-starter>` and `python3 scripts/check-cli.py <built-starter>` run without production access.
+A checkout records its originating API, profile, session context and immutable account UUID without credentials. Background updates use that origin through the shared daemon. A replacement login does not adopt old jobs. `starter context show` inspects the origin; `starter context bind` explicitly binds the current checkout to the selected login. Anonymous checkouts stay anonymous until bound. Session credentials and login retry receipts are private files under `.starter/profiles`.
 
-A rejected block publication keeps its exact file bytes and metadata in the selected profile. Complete `starter permission authorize` / `starter permission complete` and run `starter publish gene:example --retry` (also works for `isi:` and `function:` IDs). `--cancel` discards only that local retry; it does not undo an already completed publication. A replacement login cannot reuse a pending block action.
+A failed publication keeps its exact commit, release version, notes, context and idempotency key in private `.git/starter-publication.json`. `starter publish retry` uses those original bytes even if local HEAD changed. `starter publish cancel` discards the local receipt without undoing a remote result. Another account cannot resume it.
+
+A failed block publication likewise keeps its exact bytes and metadata in the selected profile. Use `starter publish gene:example --retry` (also works for `isi:` and `function:` IDs), or `--cancel` to discard the local retry.

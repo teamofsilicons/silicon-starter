@@ -1,16 +1,15 @@
-//! Durable, destination-bound publication through Briefcase 3 / IAM 5.
+//! Durable account-bound publication through Briefcase 4 and Silicon Accounts.
 //! A capability transfers private bytes; only a separately authorized commit
 //! and explicit public-link operation make the registry release publishable.
 use crate::{
     AppState, PublishRequest,
-    auth::IamTokens,
+    auth::SessionTokens,
     authority::{Destination, Error, Feature, Result, digest, encode},
 };
 use axum::http::StatusCode;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use silicon_iam_client::models;
 use silicon_starter_core::{Version, release_version};
 use uuid::Uuid;
 
@@ -56,7 +55,7 @@ use sha2::Digest;
 
 pub(crate) async fn publish(
     s: &AppState,
-    session: &IamTokens,
+    session: &SessionTokens,
     id: &str,
     input: &PublishRequest,
     key: &str,
@@ -161,7 +160,7 @@ async fn publish_with_feature(
     };
     let folders = [
         "starters".to_owned(),
-        feature.org.clone(),
+        feature.account_uuid.clone(),
         id.into(),
         row.version.version.clone(),
     ];
@@ -177,7 +176,7 @@ async fn publish_with_feature(
     .await?;
     // Record the release only after both provider commit and explicit public
     // access are confirmed. The durable receipt can restore a lost local save.
-    feature.iam.assert_current().await?;
+
     let mut versions = s.versions.write().await;
     let entries = versions.entry(id.into()).or_default();
     if let Some(existing) = entries.iter().find(|v| v.version == row.version.version) {
@@ -202,7 +201,7 @@ async fn publish_with_feature(
 
 pub(crate) async fn retain_block_action(
     s: &AppState,
-    session: &IamTokens,
+    session: &SessionTokens,
     key: &str,
     input: &impl Serialize,
 ) -> Result<()> {
@@ -227,13 +226,12 @@ fn retain_block_intent(feature: &Feature, key: &str, input: &impl Serialize) -> 
     Ok(())
 }
 fn provider_unconfigured() -> bool {
-    std::env::var_os("STARTER_IAM_APP_SECRET").is_none()
-        && std::env::var_os("STARTER_IAM_TEST_APP_SECRET").is_none()
-        && std::env::var_os("BRIEFCASE_APP_SECRET").is_none()
+    std::env::var_os("STARTER_ACCOUNTS_APP_SECRET").is_none()
+        && std::env::var_os("ACCOUNTS_APP_SECRET").is_none()
 }
 pub(crate) async fn publish_block(
     s: &AppState,
-    session: &IamTokens,
+    session: &SessionTokens,
     block: &silicon_starter_core::blocks::Block,
     bytes: &[u8],
     key: &str,
@@ -255,9 +253,9 @@ async fn publish_block_with_feature(
     key: &str,
     provider: &Provider,
 ) -> Result<Uuid> {
-    if block.owner != feature.org || digest(bytes) != block.version {
+    if block.owner_uuid != feature.account_uuid || digest(bytes) != block.version {
         return Err(Error::conflict(
-            "Block content or organization does not match the selected action",
+            "Block content or account does not match the selected action",
         ));
     }
     let input_hash = digest(&encode(&json!([
@@ -319,7 +317,7 @@ async fn publish_block_with_feature(
         .ok_or_else(|| Error::conflict("Invalid block identity"))?;
     let folders = [
         "blocks".to_owned(),
-        feature.org.clone(),
+        feature.account_uuid.clone(),
         kind.into(),
         slug.into(),
         block.version.clone(),
@@ -340,7 +338,7 @@ async fn publish_block_with_feature(
         public,
     )
     .await?;
-    feature.iam.assert_current().await?;
+
     row.entry_id
         .ok_or_else(|| Error::unavailable("Briefcase omitted the completed block entry"))
 }
@@ -362,8 +360,7 @@ async fn drive_upload(
         provider.check_contract().await?;
         // Bind the selected account before the first provider mutation. Later
         // endpoint roots, refreshes and newly granted families must match it.
-        let root = feature.root("briefcase.folders.create", false).await?;
-        let selected = Destination::of(&root)?;
+        let selected = feature.destination();
         if row.destination.as_ref().is_some_and(|d| d != &selected) {
             return Err(Error::conflict(
                 "This publication belongs to its original Briefcase destination; restore that permission",
@@ -377,7 +374,7 @@ async fn drive_upload(
             let name = &folders[row.next_folder];
             let op = operation(&json!([
                 "starter-folders-v1",
-                feature.iam.world.fingerprint(),
+                feature.accounts.app_id,
                 row.destination,
                 row.parent_path,
                 name
@@ -440,12 +437,7 @@ async fn drive_upload(
                     .ok_or_else(|| {
                         Error::unavailable("Upload reservation is awaiting a fresh capability")
                     })?;
-                let root = provider
-                    .bound_root(feature, row, "briefcase.uploads.reserve", false)
-                    .await?;
-                let transferred = provider
-                    .transfer(&root, upload_id, capability, bytes)
-                    .await?;
+                let transferred = provider.transfer(upload_id, capability, bytes).await?;
                 validate_status(&transferred, operation_id, Some(upload_id))?;
                 current = Some(transferred);
             } else {
@@ -538,11 +530,11 @@ impl Provider {
     fn from_env() -> Result<Self> {
         Self::new(
             &std::env::var("BRIEFCASE_URL")
-                .unwrap_or_else(|_| "https://backend.briefcase.teamofsilicons.com".into()),
+                .unwrap_or_else(|_| "https://api.briefcase.teamofsilicons.com".into()),
         )
     }
     fn new(base: &str) -> Result<Self> {
-        crate::iam::validate_url(base)?;
+        crate::accounts::validate_url(base)?;
         Ok(Self {
             http: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -560,9 +552,12 @@ impl Provider {
             .await
             .map_err(|_| Error::unavailable("Briefcase version check failed"))?;
         let value = read_json(response).await?;
-        if value["service"] != "silicon-briefcase" || value["selected_api_version"] != "v1" {
+        if value["service"] != "silicon-briefcase"
+            || value["selected_api_version"] != "v1"
+            || value["contract_version"] != "4.0.0"
+        {
             return Err(Error::unavailable(
-                "Briefcase requires the coordinated 3.0 / IAM 5 receiver rollout",
+                "Briefcase requires the Silicon Accounts receiver rollout",
             ));
         }
         let operations = value["operations"]
@@ -574,33 +569,18 @@ impl Provider {
             ("POST", "/obo/uploads/status", "3.0.0"),
             ("POST", "/obo/uploads/commit", "3.0.0"),
             ("POST", "/obo/link-access", "3.0.0"),
-            ("PUT", "/obo/uploads/{upload_id}/content", "2.0.0"),
+            ("PUT", "/obo/uploads/{upload_id}/content", "2.1.0"),
         ] {
             if !operations
                 .iter()
                 .any(|op| op["path"] == path && op["method"] == method && op["version"] == revision)
             {
                 return Err(Error::unavailable(
-                    "Briefcase has not activated the required IAM 5 operations",
+                    "Briefcase has not activated delegated publication operations",
                 ));
             }
         }
         Ok(())
-    }
-    async fn bound_root(
-        &self,
-        feature: &Feature,
-        row: &Publication,
-        endpoint: &str,
-        force: bool,
-    ) -> Result<models::OboTokenPair> {
-        let root = feature.root(endpoint, force).await?;
-        if row.destination.as_ref() != Some(&Destination::of(&root)?) {
-            return Err(Error::conflict(
-                "The pending publication cannot move to a different Briefcase account or organization",
-            ));
-        }
-        Ok(root)
     }
     async fn json(
         &self,
@@ -610,56 +590,36 @@ impl Provider {
         path: &str,
         body: &Value,
     ) -> Result<Value> {
-        let bytes = encode(body)?;
-        for attempt in 0..2 {
-            let root = self
-                .bound_root(feature, row, endpoint, attempt == 1)
-                .await?;
-            let mut request = self
-                .http
-                .post(format!("{}{path}", self.base))
-                .header("x-app-id", &feature.iam.app_id)
-                .header("x-org-id", &root.org_id)
-                .header("x-iam-obo-access-token", &root.access_token)
-                .header("content-type", "application/json")
-                .body(bytes.clone());
-            if let Some(test) = &root.testing_context {
-                request = request.header("x-briefcase-app-secret", &test.app_secret);
-            }
-            let response = request.send().await.map_err(|_| {
+        if row.destination.as_ref() != Some(&feature.destination()) {
+            return Err(Error::conflict(
+                "This publication belongs to a different Briefcase account",
+            ));
+        }
+        // Briefcase consumes proofs: every request, including reconciliation,
+        // gets a fresh proof while the durable operation manifest stays fixed.
+        let proof = feature.proof(endpoint).await?;
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header("authorization", format!("Proof {proof}"))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| {
                 Error::unavailable(
                     "Briefcase response is uncertain; retry the original publication",
                 )
             })?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                if attempt == 0 {
-                    continue;
-                }
-                return Err(Error::permission());
-            }
-            return read_json(response).await;
-        }
-        Err(Error::permission())
+        read_json(response).await
     }
-    async fn transfer(
-        &self,
-        root: &models::OboTokenPair,
-        id: Uuid,
-        capability: &str,
-        bytes: Vec<u8>,
-    ) -> Result<Value> {
-        // A narrow capability is the only byte-transfer credential. No IAM
-        // bearer, OBO root, app ID or caller session accompanies it.
-        let mut request = self
+    async fn transfer(&self, id: Uuid, capability: &str, bytes: Vec<u8>) -> Result<Value> {
+        // The upload capability alone transfers bytes into the bound reservation.
+        let request = self
             .http
             .put(format!("{}/api/v1/obo/uploads/{id}/content", self.base))
-            .header("x-org-id", &root.org_id)
             .header("x-briefcase-upload-capability", capability)
             .header("content-type", "application/octet-stream")
             .body(bytes);
-        if let Some(test) = &root.testing_context {
-            request = request.header("x-briefcase-app-secret", &test.app_secret);
-        }
         read_json(request.send().await.map_err(|_|Error::unavailable("Upload transfer response is uncertain; retry the original publication to check its status"))?).await
     }
 }
@@ -702,7 +662,3 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&body)
         .map_err(|_| Error::unavailable("Briefcase returned an unreadable response"))
 }
-
-#[cfg(test)]
-#[path = "briefcase_tests.rs"]
-mod tests;

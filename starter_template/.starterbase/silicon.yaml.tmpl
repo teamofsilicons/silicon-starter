@@ -1,7 +1,6 @@
 {# Jinja renders the file; Stemcell evaluates runtime commands and CEL later. #}
 silicon:
   id: {{ var.silicon_id | tojson }}
-  org_id: {{ var.silicon_org_id | tojson }}
   token: {{ var.silicon_token | tojson }}
   timezone: {{ var.timezone | tojson }}
   SILICON_HOME: ! pwd

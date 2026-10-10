@@ -18,9 +18,6 @@ pub struct PublishOptions {
     /// Publish gene Markdown directly, instead of reading a file.
     #[arg(long)]
     text: Option<String>,
-    /// IAM organization that owns this block.
-    #[arg(long)]
-    org: Option<String>,
     #[arg(long, value_parser = ["public", "private"])]
     visibility: Option<String>,
     #[arg(long)]
@@ -88,7 +85,6 @@ pub async fn publish(
     blocks::validate_payload(id, &bytes)?;
     let mut body = json!({"id": id});
     for (key, value) in [
-        ("org_id", &options.org),
         ("visibility", &options.visibility),
         ("name", &options.name),
         ("description", &options.description),

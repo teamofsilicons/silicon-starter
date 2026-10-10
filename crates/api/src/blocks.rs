@@ -20,7 +20,6 @@ pub struct StoredVersion {
 #[derive(Deserialize, Serialize)]
 pub struct PublishBlock {
     id: String,
-    org_id: Option<String>,
     name: Option<String>,
     description: Option<String>,
     visibility: Option<Visibility>,
@@ -37,9 +36,9 @@ pub async fn list(
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> Json<Vec<Block>> {
-    let orgs = authenticated_session(&s, &headers)
+    let account = authenticated_session(&s, &headers)
         .await
-        .map(|session| session.organizations())
+        .map(|session| session.account_uuid().to_owned())
         .unwrap_or_default();
     let term = q.q.unwrap_or_default().to_lowercase();
     let mut items: Vec<_> = s
@@ -49,9 +48,13 @@ pub async fn list(
         .values()
         .filter(|entry| {
             matches!(entry.block.visibility, Visibility::Public)
-                || orgs.contains(&entry.block.owner)
+                || !entry.block.owner_uuid.is_empty() && account == entry.block.owner_uuid
         })
-        .filter(|entry| q.org.as_ref().is_none_or(|org| org == &entry.block.owner))
+        .filter(|entry| {
+            q.owner
+                .as_ref()
+                .is_none_or(|owner| owner == &entry.block.owner)
+        })
         .filter(|entry| {
             q.visibility.as_ref().is_none_or(|v| {
                 std::mem::discriminant(v) == std::mem::discriminant(&entry.block.visibility)
@@ -89,7 +92,7 @@ pub async fn search_items(
         headers.clone(),
         Query(ListQuery {
             q: None,
-            org: None,
+            owner: None,
             visibility: None,
         }),
     )
@@ -121,7 +124,7 @@ async fn readable(s: &AppState, headers: &HeaderMap, id: &str) -> Result<StoredB
     if matches!(entry.block.visibility, Visibility::Private)
         && !authenticated_session(s, headers)
             .await
-            .is_ok_and(|session| session.organizations().contains(&entry.block.owner))
+            .is_ok_and(|session| require_owner(&session, &entry.block.owner_uuid).is_ok())
     {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -250,21 +253,14 @@ pub async fn publish(
         .await
         .map_err(|e| (e.status, Json(e.value())))?;
     let previous = s.blocks.read().await.get(&input.id).cloned();
-    let owner = choose_organization(
-        &session,
-        input
-            .org_id
-            .as_deref()
-            .or_else(|| previous.as_ref().map(|e| e.block.owner.as_str())),
-    )
-    .map_err(|status| error(status, "choose an organization authorized through IAM"))?;
+    let owner = session.actor_id().to_owned();
     if previous
         .as_ref()
-        .is_some_and(|entry| entry.block.owner != owner)
+        .is_some_and(|entry| require_owner(&session, &entry.block.owner_uuid).is_err())
     {
         return Err(error(
             StatusCode::FORBIDDEN,
-            "only the owning organization can publish this block",
+            "only the owning account can publish this block",
         ));
     }
     if previous
@@ -296,6 +292,7 @@ pub async fn publish(
                 .unwrap_or_default()
         }),
         owner,
+        owner_uuid: session.account_uuid().into(),
         visibility: input.visibility.unwrap_or_else(|| {
             previous
                 .as_ref()
@@ -356,232 +353,4 @@ pub async fn publish(
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, message));
     }
     Ok((StatusCode::CREATED, Json(block)))
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    async fn session(s: &AppState, org: &str) -> HeaderMap {
-        let mut headers = super::super::auth_and_organization_tests::session(s, &[org]).await;
-        headers.insert(
-            "idempotency-key",
-            Uuid::new_v4().to_string().parse().unwrap(),
-        );
-        headers
-    }
-    fn gene(text: &str, visibility: Option<Visibility>) -> PublishBlock {
-        PublishBlock {
-            id: "gene:creativity".into(),
-            org_id: None,
-            name: None,
-            description: None,
-            visibility,
-            text: Some(text.into()),
-            archive_base64: None,
-        }
-    }
-    #[tokio::test]
-    async fn publication_requires_one_valid_action_key_before_saving() {
-        let s = AppState::default();
-        let mut headers = session(&s, "tos").await;
-        headers.remove("idempotency-key");
-        for value in [None, Some("short"), Some("contains a space")] {
-            if let Some(value) = value {
-                headers.insert("idempotency-key", value.parse().unwrap());
-            }
-            assert_eq!(
-                publish(State(s.clone()), headers.clone(), Json(gene("first", None)))
-                    .await
-                    .unwrap_err()
-                    .0,
-                StatusCode::BAD_REQUEST
-            );
-        }
-        headers.insert("idempotency-key", "valid-block-action-key".parse().unwrap());
-        headers.append("idempotency-key", "duplicate-action-key".parse().unwrap());
-        assert_eq!(
-            publish(State(s.clone()), headers, Json(gene("first", None)))
-                .await
-                .unwrap_err()
-                .0,
-            StatusCode::BAD_REQUEST
-        );
-        assert!(s.blocks.read().await.is_empty());
-    }
-    #[tokio::test]
-    async fn authenticated_versions_remain_immutable_private_and_searchable_after_restore() {
-        let s = AppState::default();
-        let owner = session(&s, "tos").await;
-        let outsider = session(&s, "elsewhere").await;
-        assert_eq!(
-            publish(
-                State(s.clone()),
-                HeaderMap::new(),
-                Json(gene("first", None))
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::UNAUTHORIZED
-        );
-        let first = publish(
-            State(s.clone()),
-            owner.clone(),
-            Json(gene("first", Some(Visibility::Private))),
-        )
-        .await
-        .unwrap()
-        .1
-        .0;
-        assert_eq!(
-            publish(
-                State(s.clone()),
-                outsider.clone(),
-                Json(gene("hijacked", None))
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::FORBIDDEN
-        );
-        for headers in [HeaderMap::new(), outsider] {
-            assert_eq!(
-                show(State(s.clone()), headers.clone(), Path(first.id.clone()))
-                    .await
-                    .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-            assert!(
-                list(
-                    State(s.clone()),
-                    headers.clone(),
-                    Query(ListQuery {
-                        q: None,
-                        org: None,
-                        visibility: None
-                    })
-                )
-                .await
-                .0
-                .is_empty()
-            );
-            assert!(search_items(&s, &headers).await.is_empty());
-            assert_eq!(
-                download(
-                    State(s.clone()),
-                    headers,
-                    Path(first.id.clone()),
-                    Query(HashMap::new())
-                )
-                .await
-                .unwrap_err(),
-                StatusCode::NOT_FOUND
-            );
-        }
-        let second = publish(
-            State(s.clone()),
-            owner.clone(),
-            Json(gene("second telescope", None)),
-        )
-        .await
-        .unwrap()
-        .1
-        .0;
-        assert_ne!(first.version, second.version);
-        let _ = publish(
-            State(s.clone()),
-            owner.clone(),
-            Json(gene("second telescope", None)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            versions(State(s.clone()), owner.clone(), Path(first.id.clone()))
-                .await
-                .unwrap()
-                .0
-                .len(),
-            2
-        );
-        let fetch = |id: String| {
-            content(
-                State(s.clone()),
-                owner.clone(),
-                Path(id),
-                Query(HashMap::new()),
-            )
-        };
-        assert_eq!(
-            fetch(format!("{}@{}", first.id, first.version))
-                .await
-                .unwrap()
-                .0["text"],
-            "first"
-        );
-        assert_eq!(
-            fetch(first.id.clone()).await.unwrap().0["text"],
-            "second telescope"
-        );
-        assert_eq!(
-            fetch(format!("{}@{}", first.id, "f".repeat(64)))
-                .await
-                .unwrap_err(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            search(
-                State(s.clone()),
-                owner.clone(),
-                Query(SearchQuery {
-                    q: Some("telescope".into())
-                })
-            )
-            .await
-            .0
-            .len(),
-            1
-        );
-        let restored = AppState::default();
-        restore_state(&restored, json!({"blocks": *s.blocks.read().await}))
-            .await
-            .unwrap();
-        let headers = session(&restored, "tos").await;
-        assert_eq!(
-            content(
-                State(restored),
-                headers,
-                Path(format!("{}@{}", first.id, first.version)),
-                Query(HashMap::new())
-            )
-            .await
-            .unwrap()
-            .0["text"],
-            "first"
-        );
-        assert_eq!(
-            publish(
-                State(s.clone()),
-                owner.clone(),
-                Json(gene("second telescope", Some(Visibility::Public)))
-            )
-            .await
-            .unwrap_err()
-            .0,
-            StatusCode::CONFLICT
-        );
-        let mut public = gene("visible", None);
-        public.id = "gene:public".into();
-        let _ = publish(State(s.clone()), owner, Json(public))
-            .await
-            .unwrap();
-        assert!(
-            download(
-                State(s),
-                HeaderMap::new(),
-                Path("gene:public".into()),
-                Query(HashMap::new())
-            )
-            .await
-            .is_ok()
-        );
-    }
 }

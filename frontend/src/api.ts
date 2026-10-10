@@ -1,29 +1,28 @@
-export type Actor = { type: 'carbon' | 'silicon'; public_id: string; name?: string; display_name?: string };
-export type Session = { authenticated: boolean; context_id?: string; org_id?: string; org_ids?: string[]; actor?: Actor | null; world?: string };
-export type SavedContext = { context_id: string; org_id: string; actor: Actor; selected: boolean };
+export type Actor = { uuid: string; kind: 'carbon' | 'silicon'; id: string; display_name?: string; pfp_url?: string };
+export type Session = { authenticated: boolean; context_id?: string; actor?: Actor | null; expires_at?: number; access_expires_at?: number };
+export type SavedContext = { context_id: string; actor: Actor; selected: boolean; expires_at?: number };
 export class ApiError extends Error {
   status: number;
   code: string;
   constructor(message: string, status: number, code = 'request_failed') { super(message); this.status = status; this.code = code; }
 }
-export const validOrg = (org: unknown): org is string => typeof org === 'string' && /^[a-z0-9_-]{3,50}$/.test(org);
 export function validActor(actor: unknown): actor is Actor {
   if (!actor || typeof actor !== 'object') return false;
   const a = actor as Actor;
-  return (a.type === 'carbon' && /^c:[a-z0-9_-]{3,50}$/.test(a.public_id)) || (a.type === 'silicon' && /^si:[a-z0-9_-]{3,50}$/.test(a.public_id));
+  return typeof a.uuid === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(a.uuid) &&
+    ((a.kind === 'carbon' && /^c:[a-z0-9_-]+$/.test(a.id)) || (a.kind === 'silicon' && /^si:[a-z0-9_-]+$/.test(a.id)));
 }
 export function sessionOf(value: unknown): Session {
   const s = value as Session;
   if (s?.authenticated === false) return { authenticated: false };
-  if (s?.authenticated !== true || !validOrg(s.org_id) || !validActor(s.actor) || typeof s.context_id !== 'string' || !s.context_id ||
-    (s.org_ids !== undefined && (s.org_ids.length !== 1 || s.org_ids[0] !== s.org_id))) {
-    throw new ApiError('This saved login needs to be renewed. Sign in with IAM and choose one account and organization.', 401, 'reauthentication_required');
+  if (s?.authenticated !== true || !validActor(s.actor) || typeof s.context_id !== 'string' || !s.context_id) {
+    throw new ApiError('This saved login needs to be renewed. Sign in with Silicon Accounts to continue.', 401, 'reauthentication_required');
   }
   return s;
 }
 export function contextsOf(value: unknown): SavedContext[] {
   const contexts = (value as {contexts?: SavedContext[]})?.contexts;
-  if (!Array.isArray(contexts) || contexts.some(c => !c.context_id || !validOrg(c.org_id) || !validActor(c.actor))) {
+  if (!Array.isArray(contexts) || contexts.some(c => !c.context_id || !validActor(c.actor))) {
     throw new ApiError('Saved accounts could not be verified.', 502, 'invalid_contexts');
   }
   return contexts;
@@ -31,9 +30,11 @@ export function contextsOf(value: unknown): SavedContext[] {
 
 export function createApi(base: string) {
   let context: string | undefined;
+  let invalidSession: (() => void) | undefined;
   const changed = () => new ApiError('The selected account changed. Reload this page before continuing.', 409, 'context_changed');
   return {
     context: () => context,
+    onSessionInvalid(callback?: () => void) { invalidSession = callback; },
     establish(session: Session) {
       const next = sessionOf(session).context_id || 'anonymous';
       // An account selection performs a full navigation so forms, caches and pending work are
@@ -54,7 +55,9 @@ export function createApi(base: string) {
       if (!response.ok) {
         const error = (data as {error?: unknown})?.error;
         const detail = typeof error === 'string' ? error : (error as {message?: string})?.message;
-        throw new ApiError(detail || `Request failed (${response.status})`, response.status, (error as {code?: string})?.code);
+        const code = (error as {code?: string})?.code;
+        if ((response.status === 401 && code === 'session_expired') || (response.status === 409 && code === 'context_changed')) invalidSession?.();
+        throw new ApiError(detail || `Request failed (${response.status})`, response.status, code);
       }
       if (path === '/auth/session' && captured !== undefined) {
         if ((sessionOf(data).context_id || 'anonymous') !== captured) throw changed();

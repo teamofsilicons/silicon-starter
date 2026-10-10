@@ -31,12 +31,10 @@ pub async fn run(selector: &str, version: Option<&str>, notes: Option<&str>) -> 
     if selector == "cancel" {
         if let Some(receipt) = existing
             && (receipt.api != selected.selection.api
-                || receipt.context.profile != selected.selection.profile
-                || receipt.context.world != selected.selection.world)
+                || receipt.context.profile != selected.selection.profile)
         {
             return Err(
-                "select the publication's original API, profile and world before cancelling it"
-                    .into(),
+                "select the publication's original API and profile before cancelling it".into(),
             );
         }
         session::remove(&path)?;

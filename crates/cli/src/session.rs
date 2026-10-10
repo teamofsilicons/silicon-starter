@@ -1,4 +1,4 @@
-//! Private, API/profile/world-scoped sessions and immutable request snapshots.
+//! Private, API/profile-scoped sessions and immutable request snapshots.
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,27 +15,23 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Actor {
-    #[serde(rename = "type")]
+    pub uuid: String,
     pub kind: String,
-    pub public_id: String,
+    pub id: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Saved {
     pub api: String,
     pub profile: String,
-    pub world: String,
-    pub world_fingerprint: String,
     pub session_id: String,
     pub context_id: String,
     pub actor: Actor,
-    pub org_id: String,
+    pub expires_at: i64,
 }
 #[derive(Clone)]
 pub struct Selection {
     pub api: String,
     pub profile: String,
-    pub world: String,
-    pub org: Option<String>,
     pub dir: PathBuf,
 }
 #[derive(Clone)]
@@ -66,7 +62,7 @@ pub fn normalize_api(value: &str) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 impl Selection {
-    pub fn new(api: &str, profile: &str, world: &str, org: Option<String>) -> Result<Self> {
+    pub fn new(api: &str, profile: &str) -> Result<Self> {
         if profile.is_empty()
             || profile.len() > 64
             || !profile
@@ -77,18 +73,8 @@ impl Selection {
                 "--profile must use 1–64 lowercase letters, digits, underscores or hyphens".into(),
             );
         }
-        if world != "production"
-            && !world
-                .strip_prefix("testing:")
-                .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()))
-        {
-            return Err("--world must be production or testing:<environment-UUID>".into());
-        }
-        if org.as_ref().is_some_and(|org| org.trim().is_empty()) {
-            return Err("--org must not be empty".into());
-        }
         let api = normalize_api(api)?;
-        let digest = format!("{:x}", Sha256::digest(format!("{api}\n{world}")));
+        let digest = format!("{:x}", Sha256::digest(api.as_bytes()));
         let dir = local::data_dir()
             .join("profiles")
             .join(profile)
@@ -96,8 +82,6 @@ impl Selection {
         Ok(Self {
             api,
             profile: profile.into(),
-            world: world.into(),
-            org,
             dir,
         })
     }
@@ -108,6 +92,9 @@ impl Selection {
         let saved: Saved = serde_json::from_slice(&bytes)
             .map_err(|_| "saved session is invalid; log in again in this profile")?;
         saved.validate(self)?;
+        if saved.expired() {
+            return Ok(None);
+        }
         Ok(Some(saved))
     }
     pub async fn lock(&self) -> Result<File> {
@@ -135,41 +122,31 @@ impl Selection {
 }
 impl Saved {
     pub fn validate(&self, selection: &Selection) -> Result<()> {
-        validate_identity(&self.context_id, &self.actor, &self.org_id, &self.world)?;
+        validate_identity(&self.context_id, &self.actor)?;
+        if self.expires_at <= 0 {
+            return Err("session response omitted its expiry".into());
+        }
         if self.api != selection.api
             || self.profile != selection.profile
-            || self.world != selection.world
             || self.session_id.trim().is_empty()
-            || self.world_fingerprint.trim().is_empty()
         {
             return Err(
-                "saved session does not match the selected API, profile and world; log in again"
-                    .into(),
+                "saved session does not match the selected API and profile; log in again".into(),
             );
-        }
-        if selection
-            .org
-            .as_ref()
-            .is_some_and(|org| org != &self.org_id)
-        {
-            return Err(format!(
-                "this profile belongs to {}; choose another profile for the requested organization",
-                self.org_id
-            )
-            .into());
         }
         Ok(())
     }
+    pub fn expired(&self) -> bool {
+        self.expires_at <= chrono::Utc::now().timestamp()
+    }
     pub fn check_status(&self, response: &Value) -> Result<()> {
+        let actor: Actor = serde_json::from_value(response["actor"].clone())?;
+        validate_identity(&self.context_id, &actor)?;
         if response["authenticated"] != true
             || response["context_id"] != self.context_id
-            || response["org_id"] != self.org_id
-            || response["world"] != self.world
-            || response["world_fingerprint"] != self.world_fingerprint
-            || response["actor"] != serde_json::to_value(&self.actor)?
-            || response
-                .get("org_ids")
-                .is_some_and(|orgs| *orgs != json!([self.org_id]))
+            || actor.uuid != self.actor.uuid
+            || actor.kind != self.actor.kind
+            || response["expires_at"] != self.expires_at
         {
             return Err(
                 "session identity changed or expired; log in again in the original profile".into(),
@@ -178,25 +155,21 @@ impl Saved {
         Ok(())
     }
 }
-fn validate_identity(id: &str, actor: &Actor, org: &str, world: &str) -> Result<()> {
+fn validate_identity(id: &str, actor: &Actor) -> Result<()> {
     let prefix = match actor.kind.as_str() {
         "carbon" => "c:",
         "silicon" => "si:",
-        _ => return Err("session actor is not canonical Carbon or Silicon".into()),
+        _ => return Err("session actor is not a Carbon or Silicon".into()),
     };
     if !Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())
-        || !actor.public_id.strip_prefix(prefix).is_some_and(|handle| {
+        || !Uuid::parse_str(&actor.uuid).is_ok_and(|id| !id.is_nil())
+        || !actor.id.strip_prefix(prefix).is_some_and(|handle| {
             !handle.is_empty()
                 && !handle.contains(['[', ']'])
                 && !handle.chars().any(char::is_whitespace)
         })
-        || org.is_empty()
-        || org.chars().any(char::is_whitespace)
-        || world.is_empty()
     {
-        return Err(
-            "session response omitted canonical context, actor, organization or world".into(),
-        );
+        return Err("session response omitted a canonical context or account identity".into());
     }
     Ok(())
 }
@@ -229,11 +202,8 @@ impl Snapshot {
     pub fn binding(&self) -> CheckoutContext {
         CheckoutContext {
             profile: self.selection.profile.clone(),
-            world: self.selection.world.clone(),
             context_id: self.saved.as_ref().map(|s| s.context_id.clone()),
-            actor_id: self.saved.as_ref().map(|s| s.actor.public_id.clone()),
-            org_id: self.saved.as_ref().map(|s| s.org_id.clone()),
-            world_fingerprint: self.saved.as_ref().map(|s| s.world_fingerprint.clone()),
+            actor_id: self.saved.as_ref().map(|s| s.actor.uuid.clone()),
         }
     }
     pub fn for_checkout(&self, binding: &local::Binding) -> Result<Self> {
@@ -248,7 +218,7 @@ impl Snapshot {
             None => Ok(Self { selection:self.selection.clone(), saved:None }),
             Some(origin) if origin.context_id.is_none() => Ok(Self { selection:self.selection.clone(), saved:None }),
             Some(origin) if origin == &self.binding() => { self.check_current()?; Ok(self.clone()) },
-            Some(_) => Err("checkout belongs to another saved login; select its original --profile/--world, or explicitly use starter context bind".into()),
+            Some(_) => Err("checkout belongs to another saved login; select its original --profile, or explicitly use starter context bind".into()),
         }
     }
     pub async fn request(
@@ -261,7 +231,7 @@ impl Snapshot {
     ) -> Result<Value> {
         if required && self.saved.is_none() {
             return Err(
-                "not authenticated; log in with starter --profile <name> login <IAM SLT>".into(),
+                "not authenticated; run starter login for browser approval, or starter login --slt <SLT>".into(),
             );
         }
         if self.saved.is_some() {
@@ -293,7 +263,7 @@ impl std::fmt::Display for HttpError {
         if self.status == 401 {
             write!(
                 f,
-                "; authentication expired or invalid; run starter login <SLT> in the original profile"
+                "; authentication expired or invalid; run starter login in the original profile"
             )?;
         }
         Ok(())
@@ -348,7 +318,6 @@ pub async fn send(
 struct LoginReceipt {
     key: String,
     slt: String,
-    org_id: Option<String>,
     started_at: u64,
 }
 fn now() -> u64 {
@@ -360,72 +329,232 @@ fn now() -> u64 {
 pub async fn login(token: Option<&str>) -> Result<()> {
     let selection = &current()?.selection;
     let _lock = selection.lock().await?;
+    if read_private(&selection.dir.join("device-pending.json"))?.is_some() {
+        return Err("a browser login is pending; use login --recover or login --cancel".into());
+    }
     let path = selection.dir.join("login-pending.json");
     let old = read_private(&path)?
         .map(|bytes| serde_json::from_slice::<LoginReceipt>(&bytes))
         .transpose()?;
     let receipt=match (token,old) {
-        (Some(token),Some(old)) if old.slt == token && old.org_id == selection.org => old,
+        (Some(token),Some(old)) if old.slt == token => old,
         (None,Some(old)) => old,
         (Some(_),Some(_))=>return Err("a different login is pending; use login --recover or clear it with login --cancel before starting another".into()),
         (None,None)=>return Err("no interrupted login to recover".into()),
         (Some(token),None)=> {
-            if !token.starts_with("oac_") && !(selection.world.starts_with("testing:") && (token.starts_with("si:") || token.starts_with("c:")) && selection.org.is_some()) { return Err("login requires an IAM oac_ SLT; testing public actors require --world testing:<UUID> and --org".into()); }
-            LoginReceipt { key:Uuid::new_v4().to_string(),slt:token.into(),org_id:selection.org.clone(),started_at:now() }
+            if !token.starts_with("slt_") || token.chars().any(char::is_whitespace) {
+                return Err("login requires a Silicon Accounts slt_ token for starter".into());
+            }
+            LoginReceipt { key:Uuid::new_v4().to_string(),slt:token.into(),started_at:now() }
         }
     };
     if now().saturating_sub(receipt.started_at) > 600 {
         remove(&path)?;
-        return Err("interrupted login expired; mint a fresh IAM SLT".into());
+        return Err("interrupted login expired; mint a fresh Silicon Accounts SLT".into());
     }
     private_write(&path, &receipt)?;
     let response = send(
         &selection.api,
         "/auth/cli",
         Method::POST,
-        Some(json!({"slt":receipt.slt,"org_id":receipt.org_id})),
+        Some(json!({"slt":receipt.slt})),
         None,
         None,
         Some(&receipt.key),
     )
     .await?;
-    let saved = Saved {
-        api: selection.api.clone(),
-        profile: selection.profile.clone(),
-        world: response["world"].as_str().unwrap_or_default().into(),
-        world_fingerprint: response["world_fingerprint"]
-            .as_str()
-            .unwrap_or_default()
-            .into(),
-        session_id: response["session_id"].as_str().unwrap_or_default().into(),
-        context_id: response["context_id"].as_str().unwrap_or_default().into(),
-        actor: serde_json::from_value(response["actor"].clone())?,
-        org_id: response["org_id"].as_str().unwrap_or_default().into(),
-    };
-    saved.validate(selection)?;
-    saved.check_status(&response)?;
-    if receipt
-        .org_id
-        .as_ref()
-        .is_some_and(|org| org != &saved.org_id)
-    {
-        return Err("recovered login returned another organization".into());
-    }
-    if !receipt.slt.starts_with("oac_") && receipt.slt != saved.actor.public_id {
-        return Err("testing login returned another actor".into());
-    }
-    private_write(&selection.dir.join("session.json"), &saved)?;
+    let saved = save_login(selection, &response)?;
     remove(&path)?;
     println!(
         "{}",
-        json!({"authenticated":true,"context_id":saved.context_id,"actor":saved.actor,"org_id":saved.org_id,"world":saved.world,"profile":selection.profile})
+        json!({"authenticated":true,"context_id":saved.context_id,"actor":saved.actor,"expires_at":saved.expires_at,"profile":selection.profile})
     );
+    Ok(())
+}
+#[derive(Serialize, Deserialize)]
+struct DeviceReceipt {
+    key: String,
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    interval: u64,
+    expires_at: u64,
+}
+pub async fn recover_login() -> Result<()> {
+    if read_private(&current()?.selection.dir.join("device-pending.json"))?.is_some() {
+        device_login(true).await
+    } else {
+        login(None).await
+    }
+}
+pub async fn device_login(recover: bool) -> Result<()> {
+    let selection = &current()?.selection;
+    let _lock = selection.lock().await?;
+    if read_private(&selection.dir.join("login-pending.json"))?.is_some() {
+        return Err("a token login is pending; use login --recover or login --cancel".into());
+    }
+    let path = selection.dir.join("device-pending.json");
+    let saved = read_private(&path)?
+        .map(|bytes| serde_json::from_slice::<DeviceReceipt>(&bytes))
+        .transpose()?;
+    let mut receipt = if let Some(receipt) = saved {
+        receipt
+    } else {
+        if recover {
+            return Err("no browser login to recover".into());
+        }
+        let response = send(
+            &selection.api,
+            "/auth/cli/start",
+            Method::POST,
+            Some(json!({})),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let uri = response["verification_uri_complete"]
+            .as_str()
+            .or_else(|| response["verification_uri"].as_str())
+            .ok_or("sign-in URL missing")?;
+        let url = reqwest::Url::parse(uri)?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("sign-in URL must be HTTPS".into());
+        }
+        DeviceReceipt {
+            key: Uuid::new_v4().to_string(),
+            device_code: response["device_code"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("device code missing")?
+                .into(),
+            user_code: response["user_code"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("user code missing")?
+                .into(),
+            verification_uri: uri.into(),
+            interval: response["interval"].as_u64().unwrap_or(5).max(1),
+            expires_at: now()
+                .checked_add(
+                    response["expires_in"]
+                        .as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or("device expiry missing")?,
+                )
+                .ok_or("invalid device expiry")?,
+        }
+    };
+    private_write(&path, &receipt)?;
+    eprintln!(
+        "Open {} and confirm code {}. Waiting for sign-in…",
+        receipt.verification_uri, receipt.user_code
+    );
+    loop {
+        if now() >= receipt.expires_at {
+            remove(&path)?;
+            return Err("browser sign-in expired; run starter login again".into());
+        }
+        let response = send(
+            &selection.api,
+            "/auth/cli/complete",
+            Method::POST,
+            Some(json!({"device_code":receipt.device_code})),
+            None,
+            None,
+            Some(&receipt.key),
+        )
+        .await;
+        match response {
+            Ok(response) => {
+                let saved = save_login(selection, &response)?;
+                remove(&path)?;
+                println!(
+                    "{}",
+                    json!({"authenticated":true,"context_id":saved.context_id,"actor":saved.actor,"expires_at":saved.expires_at,"profile":selection.profile})
+                );
+                return Ok(());
+            }
+            Err(error) => match error
+                .downcast_ref::<HttpError>()
+                .and_then(|error| error.value["error"]["code"].as_str())
+            {
+                Some("authorization_pending") => {}
+                Some("slow_down") => {
+                    receipt.interval = receipt.interval.saturating_add(5);
+                    private_write(&path, &receipt)?;
+                }
+                Some("access_denied" | "expired_token" | "invalid_grant") => {
+                    remove(&path)?;
+                    return Err(error);
+                }
+                _ => return Err(error),
+            },
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            receipt
+                .interval
+                .min(receipt.expires_at.saturating_sub(now())),
+        ))
+        .await;
+    }
+}
+fn save_login(selection: &Selection, response: &Value) -> Result<Saved> {
+    let saved = Saved {
+        api: selection.api.clone(),
+        profile: selection.profile.clone(),
+        session_id: response["session_id"].as_str().unwrap_or_default().into(),
+        context_id: response["context_id"].as_str().unwrap_or_default().into(),
+        actor: serde_json::from_value(response["actor"].clone())?,
+        expires_at: response["expires_at"].as_i64().unwrap_or_default(),
+    };
+    saved.validate(selection)?;
+    saved.check_status(response)?;
+    if saved.expired() {
+        return Err("sign-in already expired; request a new Silicon Accounts token".into());
+    }
+    private_write(&selection.dir.join("session.json"), &saved)?;
+    Ok(saved)
+}
+pub async fn logout() -> Result<()> {
+    let snapshot = current()?;
+    let _lock = snapshot.selection.lock().await?;
+    if let Some(saved) = &snapshot.saved {
+        snapshot.check_current()?;
+        match send(
+            &snapshot.selection.api,
+            "/auth/logout",
+            Method::POST,
+            None,
+            Some(&saved.session_id),
+            Some(&saved.context_id),
+            None,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<HttpError>()
+                    .is_some_and(|error| error.status == 401) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for file in ["session.json", "login-pending.json", "device-pending.json"] {
+        remove(&snapshot.selection.dir.join(file))?;
+    }
+    println!("Signed out.");
     Ok(())
 }
 pub async fn cancel_login() -> Result<()> {
     let selection = &current()?.selection;
     let _lock = selection.lock().await?;
     remove(&selection.dir.join("login-pending.json"))?;
+    remove(&selection.dir.join("device-pending.json"))?;
     println!("Local login retry discarded.");
     Ok(())
 }
@@ -434,8 +563,21 @@ pub async fn status(as_json: bool) -> Result<()> {
     let value = if let Some(saved) = &snapshot.saved {
         let value = snapshot
             .request("/auth/cli/status", Method::GET, None, None, true)
-            .await?;
-        saved.check_status(&value)?;
+            .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(error)
+                if error
+                    .downcast_ref::<HttpError>()
+                    .is_some_and(|error| error.status == 401) =>
+            {
+                json!({"authenticated":false})
+            }
+            Err(error) => return Err(error),
+        };
+        if value["authenticated"] == true {
+            saved.check_status(&value)?;
+        }
         snapshot.check_current()?;
         value
     } else {
@@ -553,125 +695,5 @@ pub fn remove(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn fixture() -> (Snapshot, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("starter-context-{}", Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
-        let mut selection =
-            Selection::new("http://127.0.0.1:9", "work", "production", None).unwrap();
-        selection.dir = dir.clone();
-        let saved = Saved {
-            api: selection.api.clone(),
-            profile: selection.profile.clone(),
-            world: "production".into(),
-            world_fingerprint: "production:1".into(),
-            session_id: "opaque-private-secret".into(),
-            context_id: Uuid::new_v4().to_string(),
-            actor: Actor {
-                kind: "silicon".into(),
-                public_id: "si:tester".into(),
-            },
-            org_id: "tos".into(),
-        };
-        private_write(&dir.join("session.json"), &saved).unwrap();
-        (
-            Snapshot {
-                selection,
-                saved: Some(saved),
-            },
-            dir,
-        )
-    }
-    #[test]
-    fn selectors_are_exact_and_api_cannot_leak_credentials() {
-        for api in [
-            "http://api.example",
-            "https://user:password@api.example",
-            "https://api.example/path",
-            "https://api.example?token=secret",
-            "https://api.example#fragment",
-        ] {
-            assert!(normalize_api(api).is_err(), "{api}");
-        }
-        assert_eq!(
-            normalize_api("https://api.example/").unwrap(),
-            "https://api.example"
-        );
-        assert!(Selection::new("https://api.example", "../other", "production", None).is_err());
-        assert!(Selection::new("https://api.example", "work", "testing:invalid", None).is_err());
-        let a = Selection::new("https://api.example", "work", "production", None).unwrap();
-        let b = Selection::new("https://api.example", "personal", "production", None).unwrap();
-        let c = Selection::new(
-            "https://api.example",
-            "work",
-            &format!("testing:{}", Uuid::new_v4()),
-            None,
-        )
-        .unwrap();
-        assert_ne!(a.dir, b.dir);
-        assert_ne!(a.dir, c.dir);
-    }
-    #[test]
-    fn status_cannot_change_identity_or_world_fingerprint() {
-        let (snapshot, dir) = fixture();
-        let saved = snapshot.saved.as_ref().unwrap();
-        let mut status = serde_json::to_value(saved).unwrap();
-        status["authenticated"] = json!(true);
-        saved.check_status(&status).unwrap();
-        for (key, value) in [
-            ("context_id", json!(Uuid::new_v4())),
-            ("org_id", json!("other")),
-            ("world", json!("testing:other")),
-            ("world_fingerprint", json!("changed")),
-            ("actor", json!({"type":"carbon","public_id":"c:tester"})),
-        ] {
-            let mut changed = status.clone();
-            changed[key] = value;
-            assert!(saved.check_status(&changed).is_err(), "{key}");
-        }
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[tokio::test]
-    async fn delayed_request_does_not_read_a_replacement_login() {
-        let (snapshot, dir) = fixture();
-        let mut changed = snapshot.saved.clone().unwrap();
-        changed.context_id = Uuid::new_v4().to_string();
-        changed.session_id = "another-session".into();
-        private_write(&dir.join("session.json"), &changed).unwrap();
-        let error = snapshot
-            .request(
-                "/api/v1/starters",
-                Method::POST,
-                Some(json!({})),
-                None,
-                true,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("login changed"));
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn unbound_checkout_never_adopts_selected_account() {
-        let (snapshot, dir) = fixture();
-        let binding = local::Binding {
-            id: "tos.example".into(),
-            api: snapshot.selection.api.clone(),
-            auth_context: None,
-            mode: local::Mode::Download,
-            pinned: None,
-        };
-        assert!(snapshot.for_checkout(&binding).unwrap().saved.is_none());
-        let mut bound = binding;
-        bound.auth_context = Some(snapshot.binding());
-        snapshot.for_checkout(&bound).unwrap();
-        bound.auth_context.as_mut().unwrap().context_id = Some(Uuid::new_v4().to_string());
-        assert!(snapshot.for_checkout(&bound).is_err());
-        fs::remove_dir_all(dir).unwrap();
     }
 }

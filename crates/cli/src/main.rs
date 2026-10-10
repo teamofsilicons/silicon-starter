@@ -9,13 +9,12 @@ use silicon_starter_core::{
 };
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command as Process,
 };
 
 mod blocks;
-mod permissions;
 mod publication;
 mod session;
 mod templates;
@@ -34,7 +33,7 @@ struct Cli {
         default_value = "https://backend.starter.teamofsilicons.com"
     )]
     api: String,
-    /// Independent saved account and organization profile.
+    /// Independent saved Carbon or Silicon account profile.
     #[arg(
         long,
         global = true,
@@ -42,46 +41,38 @@ struct Cli {
         default_value = "default"
     )]
     profile: String,
-    /// Assert the backend world: production or testing:<environment-UUID>.
-    #[arg(
-        long,
-        global = true,
-        env = "STARTER_WORLD",
-        default_value = "production"
-    )]
-    world: String,
-    /// Organization for login; must match a saved session on other commands.
-    #[arg(long, global = true, env = "SILICON_ORG")]
-    org: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
-    Iam {
+    Accounts {
         #[arg(long)]
         json: bool,
     },
     Login {
         token: Option<String>,
+        /// A short-lived Silicon Accounts token requested for starter.
+        #[arg(long, conflicts_with_all = ["token", "slt_stdin"])]
+        slt: Option<String>,
+        /// Read the SLT from stdin without putting it in shell history or process arguments.
+        #[arg(long, conflicts_with = "token")]
+        slt_stdin: bool,
         /// Recover the exact interrupted login, without entering another SLT.
-        #[arg(long, conflicts_with_all=["token","cancel"])]
+        #[arg(long, conflicts_with_all=["token","slt","slt_stdin","cancel"])]
         recover: bool,
         /// Discard the private local login retry receipt.
-        #[arg(long, conflicts_with_all=["token","recover"])]
+        #[arg(long, conflicts_with_all=["token","slt","slt_stdin","recover"])]
         cancel: bool,
         #[command(subcommand)]
         command: Option<LoginCommand>,
     },
+    /// Revoke the saved session and sign out of this profile.
+    Logout,
     /// Inspect or explicitly bind the current checkout to a saved account.
     Context {
         #[command(subcommand)]
         command: ContextCommand,
-    },
-    /// Review Briefcase storage permission separately from ordinary login.
-    Permission {
-        #[command(subcommand)]
-        command: permissions::PermissionCommand,
     },
     Init,
     New {
@@ -201,12 +192,12 @@ enum CommitCommand {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Cli::parse();
-    let selection = session::Selection::new(&c.api, &c.profile, &c.world, c.org.clone())?;
+    let selection = session::Selection::new(&c.api, &c.profile)?;
     c.api = selection.api.clone();
     let ignore_saved = matches!(
         &c.command,
         Command::Login { command: None, .. }
-            | Command::Iam { .. }
+            | Command::Accounts { .. }
             | Command::Init
             | Command::Commit { .. }
             | Command::Seed { .. }
@@ -221,45 +212,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     session::configure(selection, ignore_saved)?;
     match c.command {
-        Command::Iam { json: true } => println!(
+        Command::Accounts { json: true } => println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"app_id":"starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core","app_scope":{"iam":["self.identity.read","self.profile.read","self.membership.read"],"external":permissions::ENDPOINTS.iter().map(|endpoint|json!({"app_id":"briefcase","endpoint_id":endpoint})).collect::<Vec<_>>() }})
+                &json!({"app_id":"starter","base_url":c.api,"docs":"https://starter.teamofsilicons.com/docs","source":"https://github.com/teamofsilicons/silicon-starter","package":"https://crates.io/crates/silicon-starter-core","accounts_url":"https://accounts.teamofsilicons.com","apps_url":"https://apps.teamofsilicons.com/apps/starter"})
             )?
         ),
-        Command::Iam { json: false } => println!(
+        Command::Accounts { json: false } => println!(
             "starter\nAPI: {}\nDocs: https://starter.teamofsilicons.com/docs",
             c.api
         ),
         Command::Login {
-            token: Some(token),
-            command: None,
-            recover: false,
-            cancel: false,
-        } => session::login(Some(&token)).await?,
-        Command::Login {
-            token: None,
-            command: Some(LoginCommand::Status { json }),
-            recover: false,
-            cancel: false,
-        } => session::status(json).await?,
-        Command::Login {
-            token: None,
-            command: None,
-            recover: true,
-            cancel: false,
-        } => session::login(None).await?,
-        Command::Login {
-            token: None,
-            command: None,
-            recover: false,
-            cancel: true,
-        } => session::cancel_login().await?,
-        Command::Login { .. } => {
-            return Err("usage: starter login <IAM SLT> | starter login status --json".into());
-        }
+            token,
+            slt,
+            slt_stdin,
+            command,
+            recover,
+            cancel,
+        } => match command {
+            Some(LoginCommand::Status { json })
+                if token.is_none() && slt.is_none() && !slt_stdin && !recover && !cancel =>
+            {
+                session::status(json).await?
+            }
+            None if cancel => session::cancel_login().await?,
+            None if recover => session::recover_login().await?,
+            None => {
+                if slt_stdin {
+                    let mut token = String::new();
+                    io::stdin().take(8193).read_to_string(&mut token)?;
+                    if token.len() > 8192 {
+                        return Err("SLT must be at most 8192 bytes".into());
+                    }
+                    session::login(Some(token.trim())).await?;
+                } else if let Some(token) = token.or(slt) {
+                    session::login(Some(&token)).await?;
+                } else {
+                    session::device_login(false).await?;
+                }
+            }
+            _ => {
+                return Err(
+                    "usage: starter login --slt <SLT> | starter login status --json".into(),
+                );
+            }
+        },
+        Command::Logout => session::logout().await?,
         Command::Context { command } => checkout_context(command)?,
-        Command::Permission { command } => permissions::run(command).await?,
         Command::Init => init()?,
         Command::New { visibility, id } => new_starter(&c.api, &visibility, &id).await?,
         Command::Commit {
@@ -457,7 +456,7 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     }
     if !silicon_starter_core::valid_id(id) {
         return Err(
-            "starter id must be org.name; the name uses lowercase letters, numbers and hyphens"
+            "starter id must be handle.name; the name uses lowercase letters, numbers and hyphens"
                 .into(),
         );
     }
@@ -857,24 +856,10 @@ async fn daemon(api: &str, once: bool, background: bool) -> Result<(), Box<dyn s
                 .auth_context
                 .as_ref()
                 .map_or("default", |context| context.profile.as_str());
-            let world = binding
-                .auth_context
-                .as_ref()
-                .map_or("production", |context| context.world.as_str());
             let result = std::env::current_exe().and_then(|exe| {
                 Process::new(exe)
                     .current_dir(&entry.path)
-                    .args([
-                        "--api",
-                        &binding.api,
-                        "--profile",
-                        profile,
-                        "--world",
-                        world,
-                        "update",
-                        "now",
-                    ])
-                    .env_remove("SILICON_ORG")
+                    .args(["--api", &binding.api, "--profile", profile, "update", "now"])
                     .stdin(std::process::Stdio::null())
                     .status()
             });

@@ -15,11 +15,6 @@ variables:
     prompt: What is this silicon's ID (si:handle)?
     default: ""
 
-  silicon_org_id:
-    type: string
-    prompt: What is this silicon's organization ID?
-    default: ""
-
   silicon_token:
     # Masks terminal input; the value is still saved and passed to scripts.
     type: secret
