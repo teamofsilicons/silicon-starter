@@ -41,9 +41,6 @@ pub async fn publish(
     blocks::parse_id(id)?;
     let snapshot = super::session::current()?;
     let _lock = snapshot.selection.lock().await?;
-    if snapshot.saved.is_none() {
-        return Err("publishing requires a saved login".into());
-    }
     let context = snapshot.binding();
     let receipt_path = snapshot.selection.dir.join("block-publication.json");
     let pending = super::session::read_private(&receipt_path)?
@@ -51,15 +48,18 @@ pub async fn publish(
         .transpose()?;
     if let Some(receipt) = &pending
         && (receipt["api"] != api
-            || receipt["context"] != serde_json::to_value(&context)?
-            || receipt["body"]["id"] != id)
+            || receipt["body"]["id"] != id
+            || !options.cancel && receipt["context"] != serde_json::to_value(&context)?)
     {
-        return Err("the pending block belongs to its original account and ID; restore that context before retrying or cancelling".into());
+        return Err("Select the original API and block ID; retries also require the original account.".into());
     }
     if options.cancel {
         super::session::remove(&receipt_path)?;
         println!("Local block retry discarded; a completed publication is unchanged.");
         return Ok(());
+    }
+    if snapshot.saved.is_none() {
+        return Err("publishing requires a saved login".into());
     }
     if options.retry {
         let receipt = pending.ok_or("no block publication is waiting to retry")?;
