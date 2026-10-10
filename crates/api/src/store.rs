@@ -17,26 +17,39 @@ impl Store {
             .connect(&url.to_string_lossy())
             .await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS starter_accounts_state (id SMALLINT PRIMARY KEY CHECK(id=1),payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())").execute(&pool).await?;
-        // Copy only the former production catalog, retaining the original for rollback.
-        let old: Option<String> =
-            sqlx::query_scalar("SELECT to_regclass('starter_world_state')::text")
-                .fetch_one(&pool)
-                .await?;
-        if old.is_some() {
-            sqlx::query("INSERT INTO starter_accounts_state(id,payload) SELECT 1,payload FROM starter_world_state WHERE world_fingerprint::jsonb->>'id'='production' AND world_fingerprint::jsonb->>'environment_id' IS NULL ORDER BY updated_at DESC LIMIT 1 ON CONFLICT(id) DO NOTHING").execute(&pool).await?;
-        }
-        let old: Option<String> = sqlx::query_scalar("SELECT to_regclass('starter_state')::text")
-            .fetch_one(&pool)
-            .await?;
-        if old.is_some() {
-            sqlx::query("INSERT INTO starter_accounts_state(id,payload) SELECT 1,payload FROM starter_state WHERE id=1 ON CONFLICT(id) DO NOTHING").execute(&pool).await?;
-        }
         Ok(Some(Self { pool }))
     }
     pub async fn load(&self) -> Result<Option<Value>, sqlx::Error> {
-        sqlx::query_scalar("SELECT payload FROM starter_accounts_state WHERE id=1")
-            .fetch_optional(&self.pool)
-            .await
+        if let Some(payload) =
+            sqlx::query_scalar("SELECT payload FROM starter_accounts_state WHERE id=1")
+                .fetch_optional(&self.pool)
+                .await?
+        {
+            return Ok(Some(payload));
+        }
+        // Read the former production catalog without committing an import until
+        // restore succeeds. Retain the original tables for rollback.
+        let old: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('starter_world_state')::text")
+                .fetch_one(&self.pool)
+                .await?;
+        if old.is_some() {
+            let payload = sqlx::query_scalar("SELECT payload FROM starter_world_state WHERE world_fingerprint::jsonb->>'id'='production' AND world_fingerprint::jsonb->>'environment_id' IS NULL ORDER BY updated_at DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?;
+            if payload.is_some() {
+                return Ok(payload);
+            }
+        }
+        let old: Option<String> = sqlx::query_scalar("SELECT to_regclass('starter_state')::text")
+            .fetch_one(&self.pool)
+            .await?;
+        if old.is_some() {
+            return sqlx::query_scalar("SELECT payload FROM starter_state WHERE id=1")
+                .fetch_optional(&self.pool)
+                .await;
+        }
+        Ok(None)
     }
     pub async fn save(&self, payload: Value) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO starter_accounts_state(id,payload,updated_at) VALUES(1,$1,now()) ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=now()").bind(payload).execute(&self.pool).await.map(|_| ())

@@ -51,7 +51,10 @@ pub async fn publish(
             || receipt["body"]["id"] != id
             || !options.cancel && receipt["context"] != serde_json::to_value(&context)?)
     {
-        return Err("Select the original API and block ID; retries also require the original account.".into());
+        return Err(
+            "Select the original API and block ID; retries also require the original account."
+                .into(),
+        );
     }
     if options.cancel {
         super::session::remove(&receipt_path)?;

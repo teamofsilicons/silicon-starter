@@ -979,7 +979,10 @@ async fn restore_state(
             .as_str()
             .filter(|id| valid_account_id(id))
             .ok_or("owner mapping requires a canonical Carbon or Silicon id")?;
-        if let Some(entries) = payload["starters"].as_object_mut() {
+        if let Some(entries) = payload
+            .get_mut("starters")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             for item in entries.values_mut().filter(|item| {
                 item["owner"] == *old && item["owner_uuid"].as_str().is_none_or(str::is_empty)
             }) {
@@ -987,7 +990,10 @@ async fn restore_state(
                 item["owner"] = json!(id);
             }
         }
-        if let Some(entries) = payload["blocks"].as_object_mut() {
+        if let Some(entries) = payload
+            .get_mut("blocks")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             for entry in entries.values_mut() {
                 let item = &mut entry["block"];
                 if item["owner"] == *old && item["owner_uuid"].as_str().is_none_or(str::is_empty) {
