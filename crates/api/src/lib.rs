@@ -32,7 +32,6 @@ mod feature_routes;
 mod files;
 mod semantic;
 mod store;
-mod telemetry;
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -47,7 +46,6 @@ pub struct AppState {
     pub bundles: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub bundle_commits: Arc<RwLock<HashMap<String, String>>>,
     pub auth: Arc<auth::AuthState>,
-    pub telemetry: Arc<telemetry::Telemetry>,
     pub store: Option<Arc<store::Store>>,
     pub account_event_ids: Arc<RwLock<HashSet<String>>>,
     pub account_profile_updated_at: Arc<RwLock<HashMap<String, chrono::DateTime<Utc>>>>,
@@ -87,7 +85,6 @@ pub fn seeded_state() -> AppState {
     AppState {
         starters: Arc::new(RwLock::new(HashMap::new())),
         auth: Arc::new(auth::AuthState::from_env()),
-        telemetry: Arc::new(telemetry::Telemetry::from_env()),
         ..Default::default()
     }
 }
@@ -410,10 +407,6 @@ async fn create(
         }
         starters.insert(input.id, x.clone());
     }
-    s.telemetry.record(
-        "backend",
-        json!({"type":"starter.created","starter_id":x.id,"source":"api"}),
-    );
     persist_state(&s).await;
     Ok((StatusCode::CREATED, Json(x)))
 }

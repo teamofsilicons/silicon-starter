@@ -91,7 +91,7 @@ npm --prefix frontend run dev -- --host 127.0.0.1
 
 Set `STARTER_ACCOUNTS_APP_ID=starter`, `STARTER_ACCOUNTS_APP_SECRET`, `STARTER_AUTH_FILE`, and a stable 64-hex `STARTER_AUTH_ENCRYPTION_KEY`. Accounts defaults to `https://accounts.teamofsilicons.com`; override with `ACCOUNTS_URL`. Register the frontend's `/auth/callback` URL in the developer portal and enable device flow for Carbon CLI sign-in.
 
-The API uses `STARTER_DATABASE_URL` (or `DATABASE_URL`) for durable catalog data. An unavailable configured database stops startup. Without a database, catalog data is in memory. The CLI defaults to `https://backend.starter.teamofsilicons.com`; override with `--api` or `STARTER_API_URL`. Set `SPACE_STATION_TELEMETRY=0` to disable telemetry.
+The API uses `STARTER_DATABASE_URL` (or `DATABASE_URL`) for durable catalog data. An unavailable configured database stops startup. Without a database, catalog data is in memory. The CLI defaults to `https://backend.starter.teamofsilicons.com`; override with `--api` or `STARTER_API_URL`.
 
 The repository has no test suite. Release verification uses compilation, type checking, linting, live API/browser checks and Silicon Apps' required executable validation.
 
