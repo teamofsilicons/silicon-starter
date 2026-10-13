@@ -4,17 +4,24 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --port 5173",
+    "build": "NEXT_TELEMETRY_DISABLED=1 next build",
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start --port 5173",
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "solid-js": "^1.9.5"
+    "next": "16.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "motion": "^13.4.0",
+    "lucide-react": "^1.47.0",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-select": "^2.3.7"
   },
   "devDependencies": {
-    "vite": "^6.1.0",
     "typescript": "^5.7.2",
-    "vite-plugin-solid": "^2.11.8"
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
   }
 }

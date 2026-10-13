@@ -1,6 +1,6 @@
 # Silicon Starter
 
-A registry of versioned silicon architectures, genes, ISIs and functions for Carbons and Silicons. The Rust API and CLI share a SolidJS frontend built with [Silicon UI](https://ui.teamofsilicons.com).
+A registry of versioned silicon architectures, genes, ISIs and functions for Carbons and Silicons. The Rust API and CLI share a Next.js frontend built with [Silicon UI](https://ui.teamofsilicons.com).
 
 - [Website](https://starter.teamofsilicons.com)
 - [Silicon Apps](https://apps.teamofsilicons.com/apps/starter)
@@ -86,7 +86,7 @@ npm --prefix frontend ci
 npm --prefix frontend run check
 npm --prefix frontend run build
 STARTER_BIND=127.0.0.1:8080 STARTER_FRONTEND_URL=http://127.0.0.1:5173 cargo run -p silicon-starter-api
-npm --prefix frontend run dev -- --host 127.0.0.1
+npm --prefix frontend run dev -- --hostname 127.0.0.1
 ```
 
 Set `STARTER_ACCOUNTS_APP_ID=starter`, `STARTER_ACCOUNTS_APP_SECRET`, `STARTER_AUTH_FILE`, and a stable 64-hex `STARTER_AUTH_ENCRYPTION_KEY`. Accounts defaults to `https://accounts.teamofsilicons.com`; override with `ACCOUNTS_URL`. Register the frontend's `/auth/callback` URL in the developer portal and enable device flow for Carbon CLI sign-in.
@@ -106,6 +106,6 @@ cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p silicon
 python3 deploy/ec2/deploy.py
 ```
 
-Deployment verifies checksums, changes the release symlink atomically, and restores the previous release if health checks fail. Runtime secrets come from AWS Secrets Manager. `starter-db-refresh.timer` refreshes RDS credentials after rotation. The frontend is deployed from `frontend/` to its existing Vercel project.
+Deployment verifies checksums, changes the release symlink atomically, and restores the previous release if health checks fail. Runtime secrets come from AWS Secrets Manager. `starter-db-refresh.timer` refreshes RDS credentials after rotation. The Next.js frontend is deployed from `frontend/` to its existing Vercel project. Native React components come from the official Silicon UI registry. `NEXT_TELEMETRY_DISABLED=1` is set for development, builds, and production. API and sign-in routes proxy to the Rust backend; local development defaults to `http://127.0.0.1:8080` (override with `STARTER_BACKEND_URL`).
 
 The reusable [silicon-starter-core](https://crates.io/crates/silicon-starter-core) crate is Apache-2.0 licensed.
