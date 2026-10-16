@@ -1,8 +1,8 @@
 # Silicon Apps distribution
 
-The `starter` app is authored and published by `si:tos`. Silicon Apps distributes the CLI. The Rust API and SolidJS frontend keep their existing deployments. Accounts and publishing configuration are managed through [Silicon Developer](https://developers.teamofsilicons.com) and the `silicon-apps` CLI.
+The `starter` app is authored and published by `si:tos`. Silicon Apps distributes the CLI. The Rust API and Next.js frontend keep their existing deployments. Accounts and publishing configuration are managed through [Silicon Developer](https://developers.teamofsilicons.com) and the `silicon-apps` CLI.
 
-Build with `bash scripts/build-cli-release.sh` on macOS. This needs Xcode command-line tools, Rust targets, cargo-zigbuild, Zig, cargo-xwin, LLVM/lld, Python 3.11+, and Silicon Apps. It produces six native executables and a separate deterministic Silicon Apps archive for each target. Each archive has a root `apps.yaml` with `schema_version: 1`, `app_id: starter`, the release version, `command: starter`, and its target's `binary` path. `scripts/package-apps.py` can package existing native builds.
+Build with `bash scripts/build-cli-release.sh` on macOS. This needs Xcode command-line tools, Rust targets, cargo-zigbuild, Zig, cargo-xwin, LLVM/lld, and Python 3.11+. It produces nine native executables: macOS ARM64/x86_64; Linux ARM64/x86_64/i686/ARMv7 hard-float; and Windows ARM64/x86_64/i686. Each target gets a separate deterministic Silicon Apps archive. Each archive has a root `apps.yaml` with `schema_version: 1`, `app_id: starter`, the release version, `command: starter`, and its target's `binary` path. `scripts/package-apps.py` can package existing native builds without signing in to Accounts.
 
 The binaries implement `--help`, `accounts --json`, and `login status --json`, including signed-out use. Silicon Apps controls installed CLI updates; Starter's daemon only updates downloaded project checkouts.
 
@@ -10,9 +10,9 @@ The binaries implement `--help`, `accounts --json`, and `login status --json`, i
 silicon-apps login status --json
 silicon-apps capabilities --json
 silicon-apps setup starter show --json
-silicon-apps upload starter target/cli-release/starter-apps-0.4.0-linux-x86_64.tar.gz --target linux-x86_64 --json
-silicon-apps release starter --version 0.4.0 --package <package-id> --notes 'Silicon Accounts and Silicon Apps migration' --json
-silicon-apps promote starter <release-id> --version 0.4.0 --json
+silicon-apps upload starter target/cli-release/starter-apps-0.4.1-linux-x86_64.tar.gz --target linux-x86_64 --json
+silicon-apps release starter --version 0.4.1 --package <package-id> --notes 'Native packages for all nine supported platforms' --json
+silicon-apps promote starter <release-id> --version 0.4.1 --json
 silicon-apps publish starter --json
 silicon-apps install starter
 ```

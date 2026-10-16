@@ -97,7 +97,7 @@ The repository has no test suite. Release verification uses compilation, type ch
 
 ## Release and deployment
 
-See [publishing to Silicon Apps](deploy/apps/README.md) and [Accounts deployment](docs/ACCOUNTS.md). `bash scripts/build-cli-release.sh` builds native packages for macOS, Linux and Windows on ARM64 and x86_64. Upload each target supported by live Silicon Apps validation workers, create a development release, promote it, and publish as `si:tos`.
+See [publishing to Silicon Apps](deploy/apps/README.md) and [Accounts deployment](docs/ACCOUNTS.md). `bash scripts/build-cli-release.sh` builds all nine native packages: macOS ARM64/x86_64, Linux ARM64/x86_64/i686/ARMv7 hard-float, and Windows ARM64/x86_64/i686. Upload each target supported by live Silicon Apps validation workers, create a development release, promote it, and publish as `si:tos`.
 
 The production API runs on ARM64 EC2 behind Caddy, with deployment through AWS SSM and encrypted S3 artifacts:
 

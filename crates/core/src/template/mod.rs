@@ -303,7 +303,12 @@ fn walk(root: &Path, dir: &Path, output: bool) -> Result<Vec<PathBuf>> {
         let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let relative = path.strip_prefix(root).unwrap();
         if output {
-            safe_relative(relative.to_str().ok_or("output paths must be UTF-8")?)?;
+            safe_relative(
+                entry
+                    .file_name()
+                    .to_str()
+                    .ok_or("output paths must be UTF-8")?,
+            )?;
         }
         if meta.file_type().is_symlink() {
             return Err(format!(

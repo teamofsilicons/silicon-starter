@@ -21,7 +21,14 @@ esac
 case "$(uname -m)" in
     arm64|aarch64) arch=aarch64 ;;
     x86_64|amd64) arch=x86_64 ;;
-    *) fail 'supported architectures are ARM64 and x86_64' ;;
+    i686)
+        [ "$platform" = unknown-linux-musl ] || fail '32-bit packages require Linux'
+        arch=i686 ;;
+    armv7l|armv7hl)
+        [ "$platform" = unknown-linux-musl ] || fail 'ARMv7 packages require Linux'
+        arch=armv7
+        platform=unknown-linux-musleabihf ;;
+    *) fail 'supported architectures are ARM64, x86_64, Linux i686 and Linux ARMv7 hard-float' ;;
 esac
 repository=https://github.com/teamofsilicons/silicon-starter
 version=${STARTER_VERSION:-}
