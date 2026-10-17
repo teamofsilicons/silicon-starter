@@ -1,7 +1,9 @@
 // IndexedDB preserves large ZIP drafts without sending them to a different login.
 export type BlockDraft = { body: Record<string, unknown>; key: string };
 export function blockDraftKey(api: string, context: string, id?: string) {
-  return JSON.stringify([api, context, id || 'new']);
+  // Keep old edit retries reachable after a link adopts its canonical name.
+  const savedId = id?.replace(/^g\./, 'gene:').replace(/^i\./, 'isi:').replace(/^f\./, 'function:');
+  return JSON.stringify([api, context, savedId || 'new']);
 }
 export async function blockDraftStore(key: string, action: 'read' | 'write' | 'remove', draft?: BlockDraft): Promise<BlockDraft | undefined> {
   const database = await new Promise<IDBDatabase>((resolve, reject) => {

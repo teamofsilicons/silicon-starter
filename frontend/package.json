@@ -7,7 +7,8 @@
     "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --port 5173",
     "build": "NEXT_TELEMETRY_DISABLED=1 next build",
     "start": "NEXT_TELEMETRY_DISABLED=1 next start --port 5173",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types tests/catalog.test.ts"
   },
   "dependencies": {
     "next": "16.4.0",

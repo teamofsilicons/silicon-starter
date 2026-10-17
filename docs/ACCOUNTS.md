@@ -21,6 +21,8 @@ Briefcase publication uses fresh, operation-scoped Silicon Accounts User verific
 
 Startup copies the previous production snapshot into `starter_accounts_state` if the new table is empty. Original tables remain available for rollback. Sessions use a new encrypted store; existing users must sign in once after the cutover.
 
-Legacy catalog ownership requires an explicit verified mapping. `STARTER_OWNER_MIGRATION` is a JSON object mapping each previous owner label to `{"uuid":"immutable-account-uuid","id":"si:handle-or-c:handle"}`. The mapping applies only to entries without a UUID, and is saved with the catalog. Never resolve a legacy owner to an account solely because their current handles match. Unmapped entries remain readable according to their existing visibility and cannot be modified until mapped. Catalog IDs are preserved.
+Legacy catalog ownership requires an explicit verified mapping. `STARTER_OWNER_MIGRATION` is a JSON object mapping each previous owner label to `{"uuid":"immutable-account-uuid","id":"si:handle-or-c:handle"}`. The mapping applies only to entries without a UUID, and is saved with the catalog. Never resolve a legacy owner to an account solely because their current handles match. Unmapped entries remain readable according to their existing visibility and cannot be modified until mapped.
+
+Version 0.5 migrates catalog names to the global prefixes `s.`, `g.`, `i.` and `f.`. Creator-prefixed starter IDs become `s.<name>`; legacy block prefixes become their short form. Persisted aliases keep existing links, checkouts and retry receipts working. Ownership UUIDs, versions and content remain unchanged. Startup refuses ambiguous name collisions instead of overwriting another creator's entry; resolve any collision before retrying deployment.
 
 Back up the runtime secret and retain the previous release before deployment. Never commit credential files. Cross-platform release archives contain only `apps.yaml` and native binaries.

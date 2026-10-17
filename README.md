@@ -32,15 +32,15 @@ starter logout
 
 Starter never receives a Silicon's STK. Browser and CLI sessions survive restarts until the Accounts refresh token expires, access is revoked, or the user logs out. Refreshing an access token preserves the account and the original session expiry. The backend encrypts credentials at rest; the CLI stores only its opaque Starter session in a private file below `SILICON_HOME` (or the user home) in `.starter`.
 
-Every action belongs to one Carbon or Silicon. Ownership is keyed by immutable Accounts UUID; handles such as `c:alice` and `si:tos` are display identifiers and can change. Existing catalog IDs such as `tos.classic` remain stable. New starter IDs use your current handle followed by a dot and a lowercase name.
+Every action belongs to one Carbon or Silicon. Ownership is keyed by immutable Accounts UUID; handles such as `c:alice` and `si:tos` are display identifiers and can change. Names belong to a global namespace for each kind: `s.udd` is a starter, `g.creativity` a gene, `i.researcher` an ISI, and `f.docker` a function. Names use lowercase letters, numbers and hyphens, and are independent of the creator. Existing creator-prefixed starter IDs and `gene:`/`isi:`/`function:` IDs remain aliases, so saved checkouts and old links continue to work.
 
 ## Projects and blocks
 
 ```sh
 starter search classic
-starter download tos.classic                 # downloaded project, hourly project updates
-starter download tos.classic@2.1             # pinned release
-starter pull tos.classic                      # editable checkout; requires sign-in
+starter download s.classic                   # downloaded project, hourly project updates
+starter download s.classic@2.1               # pinned release
+starter pull s.classic                       # editable checkout; requires sign-in
 starter pull                                 # update the current editable checkout
 starter push
 starter publish latest 2.1 --notes "Release notes"
@@ -48,14 +48,16 @@ starter publish history
 starter update on|off|now
 starter revert <commit>
 
-starter publish gene:creativity --text "Explore several approaches."
-starter publish isi:researcher researcher.zip
-starter publish function:greet greet.zip
-starter download gene:creativity
-starter history gene:creativity
+starter publish g.creativity --text "Explore several approaches."
+starter publish i.researcher researcher.zip
+starter publish f.greet greet.zip
+starter download g.creativity
+starter history g.creativity
 ```
 
 Public content is readable anonymously. Private content and publishing require the owning account. Genes contain Markdown; ISIs and functions contain ZIP files with a root `isi.yaml` or `function.yaml`. Block versions are SHA-256 hashes. Public archives are stored through Briefcase using Silicon Accounts User verification proofs scoped to the requested operation. Its delegated API checks the represented account and confines Starter to its own application folder.
+
+The website's main catalog includes all four kinds together, with filters for starters, genes, ISIs and functions.
 
 `starter update` and `starter daemon` update downloaded project checkouts; Silicon Apps alone updates the installed CLI. Pinned releases and editable pulls never auto-update. Unresolved merge conflicts leave the installed revision intact and disable project updates until resolved.
 
@@ -64,7 +66,7 @@ Public content is readable anonymously. Private content and publishing require t
 A starter can include `.starterbase/starter.yaml` and ingredients. Pulling or downloading seeds its destination. Recipes support typed conditional questions, CEL and Bash defaults, Jinja templates, copied files, and ordered build commands.
 
 ```sh
-starter download tos.example --dir my-project --defaults
+starter download s.example --dir my-project --defaults
 starter seed
 starter seed --set waveform=false
 starter seed --answers answers.json --defaults
@@ -80,6 +82,7 @@ See the [authoring example](starter_template/README.md) and [variable catalog](s
 
 ```sh
 cargo fmt --check
+cargo test --workspace
 cargo check --workspace
 cargo clippy --workspace -- -D warnings
 npm --prefix frontend ci
@@ -93,7 +96,7 @@ Set `STARTER_ACCOUNTS_APP_ID=starter`, `STARTER_ACCOUNTS_APP_SECRET`, `STARTER_A
 
 The API uses `STARTER_DATABASE_URL` (or `DATABASE_URL`) for durable catalog data. An unavailable configured database stops startup. Without a database, catalog data is in memory. The CLI defaults to `https://backend.starter.teamofsilicons.com`; override with `--api` or `STARTER_API_URL`.
 
-The repository has no test suite. Release verification uses compilation, type checking, linting, live API/browser checks and Silicon Apps' required executable validation.
+Release verification uses Rust tests, compilation, type checking, linting, live API/browser checks and Silicon Apps' required executable validation.
 
 ## Release and deployment
 

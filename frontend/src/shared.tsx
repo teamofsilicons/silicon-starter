@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Bot, Dna } from 'lucide-react';
 import { createApi } from "./api";
 import { Button } from "./silicon-ui";
 
@@ -35,6 +36,8 @@ export const sizeLabel = (file: RepoFile) => {
   return bytes === null ? 'Size unavailable' : bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
 };
 export const Icon = (props: { name: string; size?: number }) => {
+  if (props.name === 'gene') return <Dna size={props.size || 18} strokeWidth={1.7} aria-hidden="true" />;
+  if (props.name === 'isi') return <Bot size={props.size || 18} strokeWidth={1.7} aria-hidden="true" />;
   const paths: Record<string, string> = {
     code: 'm8 7-5 5 5 5m8-10 5 5-5 5m-3-14-2 18', folder: 'M3 7V5h7l2 2h9v13H3V7Z', file: 'M6 3h8l4 4v14H6V3Zm8 0v5h4',
     star: 'm12 3 2.8 5.67 6.2.9-4.5 4.4 1.06 6.2L12 18.25 6.44 21.17 7.5 14.97 3 10.57l6.2-.9L12 3Z',

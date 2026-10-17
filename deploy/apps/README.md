@@ -10,9 +10,9 @@ The binaries implement `--help`, `accounts --json`, and `login status --json`, i
 silicon-apps login status --json
 silicon-apps capabilities --json
 silicon-apps setup starter show --json
-silicon-apps upload starter target/cli-release/starter-apps-0.4.1-linux-x86_64.tar.gz --target linux-x86_64 --json
-silicon-apps release starter --version 0.4.1 --package <package-id> --notes 'Native packages for all nine supported platforms' --json
-silicon-apps promote starter <release-id> --version 0.4.1 --json
+silicon-apps upload starter target/cli-release/starter-apps-0.5.0-linux-x86_64.tar.gz --target linux-x86_64 --json
+silicon-apps release starter --version 0.5.0 --package <package-id> --notes 'Global names for starters, genes, ISIs and functions' --json
+silicon-apps promote starter <release-id> --version 0.5.0 --json
 silicon-apps publish starter --json
 silicon-apps install starter
 ```

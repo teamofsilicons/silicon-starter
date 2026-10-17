@@ -8,7 +8,8 @@ import { createApi, sessionOf, contextsOf, type Session, type SavedContext } fro
 import { popupLogin } from './popup';
 import { API, api, client, ErrorMessage, Icon, message, type Route } from './shared';
 import { RepositoryPage } from './repository-page';
-import { Blocks, BlockPage, PublishBlock, Explore, CreateStarter, Docs } from './catalog-pages';
+import { BlockPage, PublishBlock, Explore, Publish, Docs } from './catalog-pages';
+import { catalogTypes, selectedKind, type CatalogKind } from './catalog';
 
 function parseRoute(pathname: string): Route {
   try {
@@ -144,20 +145,31 @@ export default function StarterApp() {
   const accountName = session.actor?.display_name || session.actor?.id || (session.authenticated ? 'Signed in' : 'Guest');
   const savedAccounts = contexts.length ? contexts : session.context_id && session.actor ? [{ context_id: session.context_id, actor: session.actor, selected: true }] : [];
 
+  const routeKind: CatalogKind | '' = route.page === 'starters' ? 'starter' : route.page === 'genes' ? 'gene' : route.page === 'isis' ? 'isi' : route.page === 'functions' ? 'function' : '';
+  const isCatalog = ['explore', 'blocks', 'starters', 'genes', 'isis', 'functions'].includes(route.page) && !route.id;
+  const activeKind = routeKind || selectedKind(new URLSearchParams(search).get('type'));
   let page;
   if (route.page === 'starters' && route.id) page = <RepositoryPage key={route.id} id={route.id} route={route} session={session} navigate={navigate} login={login} />;
-  else if (route.page === 'explore') page = <Explore session={session} search={search} />;
+  else if (isCatalog) page = <Explore session={session} search={search} initialKind={routeKind} />;
   else if (route.page === 'docs') page = <Docs />;
-  else if (route.page === 'new') page = <CreateStarter session={session} login={login} navigate={navigate} />;
+  else if (route.page === 'new') page = <Publish session={session} search={search} login={login} navigate={navigate} />;
   else if (route.page === 'blocks' && (route.id === 'new' || route.tab === 'edit')) page = <PublishBlock key={route.id} id={route.id === 'new' ? undefined : route.id} session={session} login={login} navigate={navigate} />;
   else if (route.page === 'blocks' && route.id) page = <BlockPage key={route.id} id={route.id} session={session} />;
-  else if (route.page === 'blocks') page = <Blocks search={search} />;
-  else page = <div className="page-width empty"><h1>Page not found</h1><Link href="/">Explore starters</Link></div>;
+  else page = <div className="page-width empty"><h1>Page not found</h1><Link href="/">Explore the registry</Link></div>;
 
   return <div className="app">
+    <a className="skip-link" href="#main-content">Skip to content</a>
+    <aside className="app-sidebar">
+      <Link className="brand" href="/"><span className="brand-mark" aria-hidden="true">✦</span><span>starter<small>by team of silicons</small></span></Link>
+      <div className="sidebar-section-label">YOUR NEXT BEGINNING</div>
+      <nav className="sidebar-nav" aria-label="Main navigation"><Link href="/" aria-current={isCatalog && !activeKind ? 'page' : undefined}><Icon name="template" />Everything<span className="nav-shortcut">⌘ K</span></Link>{catalogTypes.map(type => <Link key={type.kind} href={`/?type=${type.kind}`} aria-current={isCatalog && activeKind === type.kind ? 'page' : undefined}><Icon name={type.icon} />{type.plural}<code>{type.prefix}</code></Link>)}</nav>
+      <div className="sidebar-divider" /><nav className="sidebar-nav" aria-label="Resources"><Link href="/docs" aria-current={route.page === 'docs' ? 'page' : undefined}><Icon name="book" />Documentation<span aria-hidden="true">↗</span></Link><a href="https://github.com/teamofsilicons/silicon-starter"><Icon name="code" />On GitHub<span aria-hidden="true">↗</span></a></nav>
+      <div className="sidebar-bottom"><p>Build on a good idea.<br />Then make it yours.</p><Link className="button primary full-width" href="/new"><Icon name="plus" size={16} />Publish something</Link><a className="silicon-family" href="https://teamofsilicons.com">Part of the Silicon family ↗</a></div>
+    </aside>
+    <div className="app-main">
     <header className="site-header">
-      <Link className="brand" href="/"><span className="brand-mark">✦</span>starter</Link>
-      <nav aria-label="Main navigation"><Link href="/" aria-current={route.page === 'explore' ? 'page' : undefined}>Explore</Link><Link href="/blocks" aria-current={route.page === 'blocks' ? 'page' : undefined}>Blocks</Link><Link href="/docs" aria-current={route.page === 'docs' ? 'page' : undefined}>Docs</Link></nav>
+      <Link className="brand mobile-brand" href="/"><span className="brand-mark" aria-hidden="true">✦</span>starter</Link>
+      <div className="header-location"><span>Workspace</span><span>/</span><strong>{isCatalog ? 'Explore the registry' : route.page === 'docs' ? 'Documentation' : route.page === 'new' ? 'Publish something' : 'The registry'}</strong></div>
       <div className="account">{authLoading ? <span className="muted">Checking session…</span> : !authReady ? <Button variant="secondary" onClick={recoverLogin}>Retry session</Button> : <>
         {session.authenticated ? <div className="account-controls">
           <span className="account-name" title={session.actor?.id}>{accountName}</span>
@@ -169,9 +181,10 @@ export default function StarterApp() {
             </div>
           </details>
         </div> : <Button variant="secondary" disabled={popupPending} onClick={login}>Log in</Button>}
-        <Link className="button primary" href="/new"><Icon name="plus" size={16} />New starter</Link>
+        <Link className="button primary" href="/new"><Icon name="plus" size={16} />Publish</Link>
       </>}</div>
     </header>
+    <nav className="mobile-nav" aria-label="Registry navigation"><Link href="/" aria-current={isCatalog && !activeKind ? 'page' : undefined}>Everything</Link>{catalogTypes.map(type => <Link key={type.kind} href={`/?type=${type.kind}`} aria-current={isCatalog && activeKind === type.kind ? 'page' : undefined}>{type.plural}</Link>)}<Link href="/docs" aria-current={route.page === 'docs' ? 'page' : undefined}>Docs</Link></nav>
     <Dialog open={loginOpen} onOpenChange={changeLoginOpen}>
       <DialogContent className="login-dialog" title="Continue with Silicon Accounts" description="Sign in as a Carbon, or connect a Silicon with a short-lived token. You stay signed in until your session expires or you sign out." onCloseAutoFocus={event => { event.preventDefault(); loginFocus.current?.focus(); }}>
         <div className="login-choices"><Button disabled={siliconBusy} onClick={loginCarbon}>Continue as Carbon</Button><Button variant="secondary" disabled={siliconBusy} onClick={() => setSiliconLogin(value => !value)}>Continue as Silicon</Button></div>
@@ -186,7 +199,8 @@ export default function StarterApp() {
     </Dialog>
     {popupPending && <div className="page-width notice" role="status"><p>Complete sign-in in the Silicon Accounts window.</p><Button variant="secondary" onClick={() => cancelPopup.current?.()}>Cancel sign-in</Button></div>}
     {authError && <div className="page-width"><ErrorMessage error={authError} retry={recoverLogin} /></div>}
-    <main>{authReady ? page : <div className="page-width loading">{authLoading ? 'Checking session…' : 'Your saved login could not be checked. Retry when the connection is available.'}</div>}</main>
-    <footer className="site-footer"><span>✦ Silicon Starter</span><Link href="/docs">Documentation</Link><a href="https://apps.teamofsilicons.com/apps/starter">Silicon Apps ↗</a><a href="https://github.com/teamofsilicons/silicon-starter">GitHub ↗</a></footer>
+    <main id="main-content">{authReady ? page : <div className="page-width loading">{authLoading ? 'Checking session…' : 'Your saved login could not be checked. Retry when the connection is available.'}</div>}</main>
+    <footer className="site-footer"><span>Good beginnings, shared.</span><Link href="/docs">Documentation</Link><a href="https://apps.teamofsilicons.com/apps/starter">Silicon Apps ↗</a><a href="https://github.com/teamofsilicons/silicon-starter">GitHub ↗</a></footer>
+    </div>
   </div>;
 }

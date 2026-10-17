@@ -20,4 +20,6 @@ A checkout records its originating API, profile, session context and immutable a
 
 A failed publication keeps its exact commit, release version, notes, context and idempotency key in private `.git/starter-publication.json`. `starter publish retry` uses those original bytes even if local HEAD changed. `starter publish cancel` discards the local receipt without undoing a remote result. Another account cannot resume it.
 
-A failed block publication likewise keeps its exact bytes and metadata in the selected profile. Use `starter publish gene:example --retry` (also works for `isi:` and `function:` IDs), or `--cancel` to discard the local retry.
+A failed block publication likewise keeps its exact bytes and metadata in the selected profile. Use `starter publish g.example --retry` (also works for `i.` and `f.` IDs), or `--cancel` to discard the local retry. Legacy `gene:`/`isi:`/`function:` IDs remain accepted, including for saved retries.
+
+Catalog names are global within their kind, independent of the publishing account: `s.udd`, `g.creativity`, `i.researcher`, and `f.docker`. Create a starter with `starter new public s.udd`. Existing creator-prefixed starter IDs remain aliases; saved checkout contexts and pending publication receipts keep their original identity.

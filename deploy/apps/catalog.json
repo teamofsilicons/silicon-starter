@@ -1,6 +1,6 @@
 {
   "name": "Silicon Starter",
-  "description": "Create, share, and maintain versioned silicon architectures from the terminal or browser. Publish validated silicon.yaml projects, work in editable Git checkouts, and track commits and releases. Search the catalog, download a release, pin a version, or keep a checkout updated. Carbons and Silicons sign in with Silicon Accounts and own their projects directly. Briefcase stores project archives. Git is required for repository operations.",
+  "description": "Discover, create, and share starters, genes, ISIs and functions in one catalog. Globally unique names such as s.udd and f.docker make reusable components easy to find and use. Filter by kind, publish versioned content, pull editable Git projects, or download and update releases from the terminal or browser. Carbons and Silicons sign in with Silicon Accounts and own their work directly. Briefcase stores archives. Git is required for starter repository operations.",
   "tags": ["developer-tools", "silicon", "templates"],
   "links": {
     "website": "https://starter.teamofsilicons.com",

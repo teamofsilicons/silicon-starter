@@ -113,12 +113,12 @@ pub async fn search_items(
 }
 
 async fn readable(s: &AppState, headers: &HeaderMap, id: &str) -> Result<StoredBlock, StatusCode> {
-    core::parse_id(id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = core::canonical_id(id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let entry = s
         .blocks
         .read()
         .await
-        .get(id)
+        .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     if matches!(entry.block.visibility, Visibility::Private)
@@ -178,7 +178,8 @@ async fn payload(
         .iter()
         .find(|v| v.version.version == version)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let mut value = json!({"id":id,"kind":entry.block.kind,"version":stored.version.version});
+    let mut value =
+        json!({"id":entry.block.id,"kind":entry.block.kind,"version":stored.version.version});
     if entry.block.kind == BlockKind::Gene {
         let bytes = BASE64
             .decode(&stored.content_base64)
@@ -188,7 +189,7 @@ async fn payload(
     } else {
         value["archive_base64"] = json!(stored.content_base64);
     }
-    Ok((id.into(), value))
+    Ok((entry.block.id, value))
 }
 pub async fn content(
     State(s): State<AppState>,
@@ -224,6 +225,7 @@ pub async fn publish(
         .map_err(|status| error(status, "authentication required"))?;
     let action_key = feature_routes::key(&headers).map_err(|e| (e.status, Json(e.value())))?;
     let (kind, slug) = core::parse_id(&input.id).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let id = core::canonical_id(&input.id).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
     let bytes = match (kind, &input.text, &input.archive_base64) {
         (BlockKind::Gene, Some(text), None) => text.as_bytes().to_vec(),
         (BlockKind::Isi | BlockKind::Function, None, Some(encoded)) => {
@@ -252,15 +254,15 @@ pub async fn publish(
     briefcase::retain_block_action(&s, &session, action_key, &input)
         .await
         .map_err(|e| (e.status, Json(e.value())))?;
-    let previous = s.blocks.read().await.get(&input.id).cloned();
+    let previous = s.blocks.read().await.get(&id).cloned();
     let owner = session.actor_id().to_owned();
     if previous
         .as_ref()
         .is_some_and(|entry| require_owner(&session, &entry.block.owner_uuid).is_err())
     {
         return Err(error(
-            StatusCode::FORBIDDEN,
-            "only the owning account can publish this block",
+            StatusCode::CONFLICT,
+            "this name is already taken; only the owning account can publish it",
         ));
     }
     if previous
@@ -277,7 +279,7 @@ pub async fn publish(
     }
     let now = Utc::now();
     let block = Block {
-        id: input.id.clone(),
+        id: id.clone(),
         kind,
         name: input.name.unwrap_or_else(|| {
             previous
@@ -337,7 +339,7 @@ pub async fn publish(
     }
     let _snapshot = s.persist_lock.lock().await;
     s.blocks.write().await.insert(
-        input.id.clone(),
+        id.clone(),
         StoredBlock {
             block: block.clone(),
             versions,
@@ -346,9 +348,9 @@ pub async fn publish(
     if let Err(message) = save_state_unlocked(&s).await {
         let mut blocks = s.blocks.write().await;
         if let Some(previous) = previous {
-            blocks.insert(input.id, previous);
+            blocks.insert(id, previous);
         } else {
-            blocks.remove(&input.id);
+            blocks.remove(&id);
         }
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, message));
     }

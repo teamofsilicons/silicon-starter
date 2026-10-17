@@ -2,7 +2,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Args;
 use reqwest::Method;
 use serde_json::json;
-use silicon_starter_core::{blocks, local};
+use silicon_starter_core::{
+    blocks::{self, BlockKind},
+    local,
+};
 use std::{fs, path::Path};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -27,7 +30,7 @@ pub struct PublishOptions {
 }
 
 pub fn is_block(id: &str) -> bool {
-    ["gene:", "isi:", "function:"]
+    ["g.", "i.", "f.", "gene:", "isi:", "function:"]
         .iter()
         .any(|prefix| id.starts_with(prefix))
 }
@@ -38,7 +41,7 @@ pub async fn publish(
     file: Option<&str>,
     options: &PublishOptions,
 ) -> Result<()> {
-    blocks::parse_id(id)?;
+    let (kind, name) = blocks::parse_id(id)?;
     let snapshot = super::session::current()?;
     let _lock = snapshot.selection.lock().await?;
     let context = snapshot.binding();
@@ -48,7 +51,8 @@ pub async fn publish(
         .transpose()?;
     if let Some(receipt) = &pending
         && (receipt["api"] != api
-            || receipt["body"]["id"] != id
+            || blocks::parse_id(receipt["body"]["id"].as_str().unwrap_or_default())
+                != Ok((kind, name))
             || !options.cancel && receipt["context"] != serde_json::to_value(&context)?)
     {
         return Err(
@@ -82,11 +86,14 @@ pub async fn publish(
     }
     let bytes = match (file, &options.text) {
         (Some(file), None) => fs::read(file)?,
-        (None, Some(text)) if id.starts_with("gene:") => text.as_bytes().to_vec(),
+        (None, Some(text)) if kind == BlockKind::Gene => text.as_bytes().to_vec(),
         _ => return Err("publish a block with one Markdown/ZIP file, or --text for a gene".into()),
     };
     blocks::validate_payload(id, &bytes)?;
-    let mut body = json!({"id": id});
+    let mut body = json!({"id": blocks::canonical_id(id)?});
+    if let Some(receipt) = &pending {
+        body["id"] = receipt["body"]["id"].clone();
+    }
     for (key, value) in [
         ("visibility", &options.visibility),
         ("name", &options.name),
@@ -96,7 +103,7 @@ pub async fn publish(
             body[key] = json!(value);
         }
     }
-    if id.starts_with("gene:") {
+    if kind == BlockKind::Gene {
         body["text"] = json!(String::from_utf8(bytes)?);
     } else {
         body["archive_base64"] = json!(B64.encode(bytes));
@@ -143,7 +150,7 @@ pub async fn download(api: &str, spec: &str, destination: Option<&Path>) -> Resu
     let (id, version) = spec
         .split_once('@')
         .map_or((spec, "latest"), |(id, version)| (id, version));
-    let (_, name) = blocks::parse_id(id)?;
+    let (kind, name) = blocks::parse_id(id)?;
     if version != "latest"
         && (version.len() != 64 || !version.bytes().all(|b| b.is_ascii_hexdigit()))
     {
@@ -164,10 +171,10 @@ pub async fn download(api: &str, spec: &str, destination: Option<&Path>) -> Resu
         None,
     )
     .await?;
-    if response["id"].as_str() != Some(id) {
+    if blocks::parse_id(response["id"].as_str().unwrap_or_default()) != Ok((kind, name)) {
         return Err("block response returned a different ID".into());
     }
-    let bytes = if id.starts_with("gene:") {
+    let bytes = if kind == BlockKind::Gene {
         response["text"]
             .as_str()
             .ok_or("gene response omitted text")?
@@ -195,7 +202,7 @@ pub async fn download(api: &str, spec: &str, destination: Option<&Path>) -> Resu
         local::unique()
     )));
     fs::create_dir(&stage.0)?;
-    if id.starts_with("gene:") {
+    if kind == BlockKind::Gene {
         fs::write(stage.0.join(format!("{name}.md")), bytes)?;
     } else {
         blocks::extract_archive(&bytes, &stage.0)?;
@@ -206,4 +213,26 @@ pub async fn download(api: &str, spec: &str, destination: Option<&Path>) -> Resu
     fs::rename(&stage.0, &target)?;
     println!("downloaded {id}@{hash} in {}", target.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_block;
+
+    #[test]
+    fn routes_canonical_and_legacy_blocks_with_optional_version() {
+        for id in [
+            "g.creativity",
+            "i.researcher@latest",
+            "f.docker",
+            "gene:creativity",
+            "isi:researcher",
+            "function:docker",
+        ] {
+            assert!(is_block(id), "{id}");
+        }
+        for id in ["s.udd", "tos.classic", "latest"] {
+            assert!(!is_block(id), "{id}");
+        }
+    }
 }

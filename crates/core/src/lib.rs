@@ -67,14 +67,23 @@ pub struct CreateDiscussion {
 }
 
 pub fn valid_id(id: &str) -> bool {
-    id.len() <= 128
-        && id.split_once('.').is_some_and(|(handle, name)| {
-            !handle.is_empty()
-                && handle
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                && valid_slug(name)
-        })
+    id.strip_prefix("s.").is_some_and(valid_slug)
+        || id.len() <= 128
+            && id.split_once('.').is_some_and(|(handle, name)| {
+                !handle.is_empty()
+                    && handle
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    && valid_slug(name)
+            })
+}
+
+/// Legacy creator-qualified IDs remain valid references to migrated starters.
+pub fn canonical_starter_id(id: &str) -> Result<String, String> {
+    if !valid_id(id) {
+        return Err("starter id must be s.<name>".into());
+    }
+    Ok(format!("s.{}", id.split_once('.').unwrap().1))
 }
 
 pub fn valid_slug(name: &str) -> bool {
@@ -134,3 +143,17 @@ pub fn validate_directory(path: &Path) -> Result<(), String> {
     )
 }
 pub const SEED_YAML: &str = "silicon:\n  id: si:starter\n  token: local-development-token\n  timezone: UTC\n  SILICON_HOME: .\n  inference_providers: [all-available-providers]\nisi:\n  registry:\n    model: fast\n    primary_send_mode: global\n    session_type: persistent\n    dna:\n      assemble: []\naccess:\n  registry: []\nflow: []\n";
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_starters_and_legacy_references() {
+        assert_eq!(canonical_starter_id("s.udd").unwrap(), "s.udd");
+        assert_eq!(canonical_starter_id("alice.udd").unwrap(), "s.udd");
+        for invalid in ["s.", "s.Upper", "s.a.b", "s.a/b", "udd"] {
+            assert!(!valid_id(invalid), "{invalid}");
+        }
+    }
+}

@@ -22,6 +22,16 @@ pub enum BlockKind {
     Function,
 }
 
+impl BlockKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Gene => "g",
+            Self::Isi => "i",
+            Self::Function => "f",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub id: String,
@@ -45,18 +55,27 @@ pub struct BlockVersion {
 
 pub fn parse_id(id: &str) -> Result<(BlockKind, &str), String> {
     let (kind, name) = id
-        .split_once(':')
-        .ok_or("block id must begin with gene:, isi: or function:")?;
+        .split_once('.')
+        .or_else(|| id.split_once(':'))
+        .ok_or("block id must begin with g., i. or f.")?;
     let kind = match kind {
-        "gene" => BlockKind::Gene,
-        "isi" => BlockKind::Isi,
-        "function" => BlockKind::Function,
-        _ => return Err("block id must begin with gene:, isi: or function:".into()),
+        "g" if id.starts_with("g.") => BlockKind::Gene,
+        "i" if id.starts_with("i.") => BlockKind::Isi,
+        "f" if id.starts_with("f.") => BlockKind::Function,
+        "gene" if id.starts_with("gene:") => BlockKind::Gene,
+        "isi" if id.starts_with("isi:") => BlockKind::Isi,
+        "function" if id.starts_with("function:") => BlockKind::Function,
+        _ => return Err("block id must begin with g., i. or f.".into()),
     };
     if !valid_slug(name) {
         return Err("block name must contain 1–128 lowercase letters, digits or hyphens".into());
     }
     Ok((kind, name))
+}
+
+pub fn canonical_id(id: &str) -> Result<String, String> {
+    let (kind, name) = parse_id(id)?;
+    Ok(format!("{}.{name}", kind.prefix()))
 }
 
 pub fn content_hash(bytes: &[u8]) -> String {
@@ -306,4 +325,32 @@ pub fn validate_payload(id: &str, bytes: &[u8]) -> Result<String, String> {
         }
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn typed_ids_preserve_legacy_references() {
+        for (old, new, kind) in [
+            ("gene:plan", "g.plan", BlockKind::Gene),
+            ("isi:plan", "i.plan", BlockKind::Isi),
+            ("function:plan", "f.plan", BlockKind::Function),
+        ] {
+            assert_eq!(parse_id(new).unwrap(), (kind, "plan"));
+            assert_eq!(canonical_id(old).unwrap(), new);
+        }
+        for invalid in [
+            "s.plan",
+            "g:",
+            "gene.plan",
+            "g:plan",
+            "g.Upper",
+            "f.a.b",
+            "i.a/b",
+        ] {
+            assert!(parse_id(invalid).is_err(), "{invalid}");
+        }
+    }
 }

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use reqwest::Method;
 use serde_json::{Value, json};
 use silicon_starter_core::{
-    SEED_YAML,
+    SEED_YAML, canonical_starter_id,
     local::{self, Binding, Mode},
     validate_silicon_yaml,
 };
@@ -23,7 +23,7 @@ mod templates;
 #[command(
     name = "starter",
     version,
-    about = "Version controlled silicon starter registry. Use --help to explore the command tree."
+    about = "A shared registry of starters (s.), genes (g.), ISIs (i.) and functions (f.). Use --help to explore the command tree."
 )]
 struct Cli {
     #[arg(
@@ -77,6 +77,7 @@ enum Command {
     Init,
     New {
         visibility: String,
+        /// A globally unique starter ID, such as s.udd.
         id: String,
     },
     Commit {
@@ -111,7 +112,7 @@ enum Command {
         check: bool,
     },
     Publish {
-        /// latest/commit for starters, history, or a gene:/isi:/function: ID.
+        /// latest/commit for starters, history, or a g./i./f. ID.
         selector: Option<String>,
         /// Starter release Y.X, block Markdown/ZIP file, or block ID after history.
         version: Option<String>,
@@ -438,6 +439,12 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     if !matches!(v, "public" | "private") {
         return Err("visibility must be public or private".into());
     }
+    if !id.starts_with("s.") || !silicon_starter_core::valid_id(id) {
+        return Err(
+            "starter id must be s.name; the globally unique name uses lowercase letters, numbers and hyphens"
+                .into(),
+        );
+    }
     if local::is_repo(".") && local::load_binding(".").is_err() {
         let occupied = fs::read_dir(".")?.any(|entry| {
             entry
@@ -454,12 +461,6 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     if !local::is_repo(".") {
         init()?
     }
-    if !silicon_starter_core::valid_id(id) {
-        return Err(
-            "starter id must be handle.name; the name uses lowercase letters, numbers and hyphens"
-                .into(),
-        );
-    }
     if !Path::new("silicon.yaml").exists() {
         fs::write("silicon.yaml", SEED_YAML)?
     }
@@ -473,7 +474,7 @@ async fn new_starter(api: &str, v: &str, id: &str) -> Result<(), Box<dyn std::er
     .await?;
     let binding = Binding {
         auth_context: Some(session::current()?.binding()),
-        id: id.into(),
+        id: response_starter_id(&value, id)?,
         api: api.into(),
         mode: Mode::Development,
         pinned: None,
@@ -576,7 +577,11 @@ async fn pull(
     if !silicon_starter_core::valid_id(id) || reference == Some("") {
         return Err("invalid starter id or empty version reference".into());
     }
-    let existing = destination.is_none() && current_binding.as_ref().is_some_and(|b| b.id == id);
+    let canonical_id = canonical_starter_id(id)?;
+    let existing = destination.is_none()
+        && current_binding
+            .as_ref()
+            .is_some_and(|b| canonical_starter_id(&b.id).as_deref() == Ok(canonical_id.as_str()));
     let target = if existing {
         root
     } else if let Some(path) = destination {
@@ -630,6 +635,7 @@ async fn pull(
             !download,
         )
         .await?;
+    let canonical_id = response_starter_id(&archive, id)?;
     let temp = templates::Temporary::new("archive.bundle");
     fs::write(
         &temp.0,
@@ -716,7 +722,7 @@ async fn pull(
         if !templates::exists(&target) {
             return Ok(());
         }
-        let state = templates::install(&target, options, id, &commit)?;
+        let state = templates::install(&target, options, &canonical_id, &commit)?;
         templates::trim_install(&target, &state)?;
         if download {
             templates::commit(&target, "Seed Starter instance")?;
@@ -730,7 +736,7 @@ async fn pull(
     let auto_update = download && reference.is_none();
     let binding = Binding {
         auth_context: Some(session::current()?.binding()),
-        id: id.into(),
+        id: canonical_id,
         api: api.into(),
         mode: if download {
             Mode::Download
@@ -750,6 +756,18 @@ async fn pull(
         if auto_update { "on" } else { "off" }
     );
     Ok(())
+}
+
+fn response_starter_id(
+    value: &Value,
+    requested: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let id = value["id"].as_str().ok_or("starter response omitted id")?;
+    let canonical = canonical_starter_id(id)?;
+    if canonical != canonical_starter_id(requested)? {
+        return Err("starter response returned a different ID".into());
+    }
+    Ok(canonical)
 }
 
 fn pause_updates(target: &Path, binding: &Binding) -> Result<(), Box<dyn std::error::Error>> {
@@ -1237,4 +1255,21 @@ fn encode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_starter_id;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_canonical_starter_for_legacy_request() {
+        assert_eq!(
+            response_starter_id(&json!({"id":"s.classic"}), "tos.classic").unwrap(),
+            "s.classic"
+        );
+        assert!(response_starter_id(&json!({"id":"s.other"}), "tos.classic").is_err());
+        assert!(response_starter_id(&json!({}), "s.classic").is_err());
+        assert!(response_starter_id(&json!({"id":"../classic"}), "s.classic").is_err());
+    }
 }

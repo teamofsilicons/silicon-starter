@@ -30,6 +30,7 @@ mod briefcase;
 mod durable;
 mod feature_routes;
 mod files;
+mod namespaces;
 mod semantic;
 mod store;
 
@@ -39,6 +40,7 @@ pub struct AppState {
     pub block_publish_lock: Arc<Mutex<()>>,
     pub persist_lock: Arc<Mutex<()>>,
     pub starters: Arc<RwLock<HashMap<String, Starter>>>,
+    pub starter_aliases: Arc<RwLock<HashMap<String, String>>>,
     pub versions: Arc<RwLock<HashMap<String, Vec<Version>>>>,
     pub discussions: Arc<RwLock<HashMap<String, Vec<Discussion>>>>,
     pub sessions: Arc<RwLock<HashMap<String, serde_json::Value>>>,
@@ -168,6 +170,7 @@ async fn save_state_unlocked(s: &AppState) -> Result<(), String> {
     let value = json!({
         "blocks": *s.blocks.read().await,
         "starters": *s.starters.read().await,
+        "starter_aliases": *s.starter_aliases.read().await,
         "versions": *s.versions.read().await,
         "discussions": *s.discussions.read().await,
         "bundles": s.bundles.read().await.iter().map(|(k,v)| (k.clone(), BASE64.encode(v))).collect::<HashMap<_,_>>(),
@@ -239,7 +242,7 @@ async fn list(
             })
             .filter(|x| {
                 term.is_empty()
-                    || format!("{} {} {}", x.name, x.description, x.tags.join(" "))
+                    || format!("{} {} {} {}", x.id, x.name, x.description, x.tags.join(" "))
                         .to_lowercase()
                         .contains(&term)
             })
@@ -318,6 +321,7 @@ async fn show(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Starter>, StatusCode> {
+    let id = resolve_starter_id(&s, &id).await;
     let x = s
         .starters
         .read()
@@ -339,7 +343,8 @@ async fn versions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<Version>>, StatusCode> {
-    let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(starter) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = starter.id;
     Ok(Json(
         s.versions
             .read()
@@ -358,25 +363,11 @@ async fn create(
         .await
         .map_err(|status| (status, Json(json!({"error":"authentication required"}))))?;
     let owner = session.actor_id().to_owned();
-    let handle = owner.split_once(':').map(|(_, handle)| handle).ok_or((
-        StatusCode::FORBIDDEN,
-        Json(json!({"error":"invalid account"})),
-    ))?;
-    if !valid_id(&input.id) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"invalid starter id"})),
-        ));
-    }
-    if !input
-        .id
-        .strip_prefix(&format!("{handle}."))
-        .is_some_and(|name| !name.is_empty())
-    {
+    if !input.id.starts_with("s.") || !valid_id(&input.id) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(
-                json!({"error":format!("starter id must begin with {handle}. followed by a name")}),
+                json!({"error":"starter id must be s.<name>, using lowercase letters, digits or hyphens"}),
             ),
         ));
     }
@@ -402,7 +393,7 @@ async fn create(
         if starters.contains_key(&input.id) {
             return Err((
                 StatusCode::CONFLICT,
-                Json(json!({"error":"starter id already exists"})),
+                Json(json!({"error":"this starter name is already taken"})),
             ));
         }
         starters.insert(input.id, x.clone());
@@ -416,7 +407,8 @@ async fn star(
     Path(id): Path<String>,
 ) -> Result<Json<Starter>, StatusCode> {
     authenticated_session(&s, &headers).await?;
-    let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(starter) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = starter.id;
     let mut m = s.starters.write().await;
     let x = m.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     x.stars += 1;
@@ -432,14 +424,11 @@ async fn fork(
 ) -> Result<(StatusCode, Json<Starter>), StatusCode> {
     let session = authenticated_session(&s, &headers).await?;
     let owner = session.actor_id().to_owned();
-    let handle = owner
-        .split_once(':')
-        .map(|(_, handle)| handle)
-        .ok_or(StatusCode::FORBIDDEN)?;
-    let Json(src) = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(src) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = src.id.clone();
     let mut m = s.starters.write().await;
     let fork = Starter {
-        id: format!("{handle}.fork-{}", Uuid::new_v4().simple()),
+        id: format!("s.fork-{}", Uuid::new_v4().simple()),
         name: format!("{} (fork)", src.name),
         owner,
         owner_uuid: session.account_uuid().into(),
@@ -479,7 +468,8 @@ async fn archive(
     {
         authenticated_session(&s, &headers).await?;
     }
-    let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(visible) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = visible.id;
     let mut starters = s.starters.write().await;
     let starter = starters.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     starter.downloads += 1;
@@ -512,6 +502,7 @@ async fn archive(
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(json!({
+        "id": id,
         "bundle_base64": BASE64.encode(bundle),
         "commit": commit
     })))
@@ -523,9 +514,10 @@ async fn files(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<files::RepositoryFiles>, (StatusCode, Json<serde_json::Value>)> {
-    let Json(starter) = show(State(s.clone()), headers, Path(id.clone()))
+    let Json(starter) = show(State(s.clone()), headers, Path(id))
         .await
         .map_err(|status| (status, Json(json!({"error":"starter not found"}))))?;
+    let id = starter.id;
     let bundle = s.bundles.read().await.get(&id).cloned();
     let Some(bundle) = bundle else {
         return Ok(Json(files::draft(starter.yaml)));
@@ -559,6 +551,7 @@ async fn push(
     Path(id): Path<String>,
     Json(input): Json<PushRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let id = resolve_starter_id(&s, &id).await;
     let session = authenticated_session(&s, &headers)
         .await
         .map_err(|status| (status, Json(json!({"error":"authentication required"}))))?;
@@ -626,6 +619,7 @@ async fn publish(
     Path(id): Path<String>,
     Json(input): Json<PublishRequest>,
 ) -> authority::Result<Json<Version>> {
+    let id = resolve_starter_id(&s, &id).await;
     let session = authenticated_session(&s, &headers).await?;
     let starter = s
         .starters
@@ -683,7 +677,8 @@ async fn commits(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(starter) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = starter.id;
     Ok(Json(
         s.versions
             .read()
@@ -701,12 +696,10 @@ async fn discussions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Json<Vec<Discussion>> {
-    if show(State(s.clone()), headers, Path(id.clone()))
-        .await
-        .is_err()
-    {
+    let Ok(Json(starter)) = show(State(s.clone()), headers, Path(id)).await else {
         return Json(Vec::new());
-    }
+    };
+    let id = starter.id;
     Json(
         s.discussions
             .read()
@@ -723,7 +716,8 @@ async fn add_discussion(
     Json(input): Json<CreateDiscussion>,
 ) -> Result<(StatusCode, Json<Discussion>), StatusCode> {
     let session = authenticated_session(&s, &headers).await?;
-    let _ = show(State(s.clone()), headers, Path(id.clone())).await?;
+    let Json(starter) = show(State(s.clone()), headers, Path(id)).await?;
+    let id = starter.id;
     if input.body.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -751,6 +745,15 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
         .or_else(|| cookie_value(headers, "starter_session").map(str::to_owned))
+}
+
+async fn resolve_starter_id(s: &AppState, id: &str) -> String {
+    s.starter_aliases
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| id.into())
 }
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let mut values = headers
@@ -996,12 +999,16 @@ async fn restore_state(
             }
         }
     }
+    let payload = namespaces::migrate(payload)?;
     let object = payload.as_object().ok_or("invalid starter snapshot")?;
     if let Some(value) = object.get("blocks") {
         *s.blocks.write().await = serde_json::from_value(value.clone())?;
     }
     if let Some(value) = object.get("starters") {
         *s.starters.write().await = serde_json::from_value(value.clone())?;
+    }
+    if let Some(value) = object.get("starter_aliases") {
+        *s.starter_aliases.write().await = serde_json::from_value(value.clone())?;
     }
     if let Some(value) = object.get("versions") {
         *s.versions.write().await = serde_json::from_value(value.clone())?;

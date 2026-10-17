@@ -30,6 +30,33 @@ struct Publication {
     cancelled: bool,
 }
 impl Publication {
+    fn retained(
+        lease: &crate::durable::Lease,
+        context: &str,
+        candidates: Vec<(String, String, String)>,
+    ) -> Result<Option<(String, Self)>> {
+        let mut existing = None;
+        for (identity, key, input_hash) in candidates {
+            if let Some(row) = lease.get::<Self>("publication", &key)? {
+                if row.context_id != context
+                    || row.starter != identity
+                    || row.input_hash != input_hash
+                {
+                    return Err(Error::conflict(
+                        "Retry the original publication content in its original account",
+                    ));
+                }
+                if existing.is_some() {
+                    return Err(Error::conflict(
+                        "Multiple publication receipts occupy this action",
+                    ));
+                }
+                existing = Some((key, row));
+            }
+        }
+        Ok(existing)
+    }
+
     fn upload_operation(&self) -> Uuid {
         operation(&json!([self.id, "upload"]))
     }
@@ -72,18 +99,26 @@ async fn publish_with_feature(
     key: &str,
     provider: &Provider,
 ) -> Result<Version> {
-    let stored_key = digest(&encode(&(feature.context_id.as_str(), id, key))?);
+    let mut identities = vec![id.to_owned()];
+    identities.extend(
+        s.starter_aliases
+            .read()
+            .await
+            .iter()
+            .filter(|(_, target)| target.as_str() == id)
+            .map(|(alias, _)| alias.clone()),
+    );
+    let mut stored_key = digest(&encode(&(feature.context_id.as_str(), id, key))?);
     let input_hash = digest(&encode(input)?);
-    let mut row = if let Some(row) = feature
-        .lease
-        .get::<Publication>("publication", &stored_key)?
+    let mut candidates = Vec::new();
+    for identity in identities {
+        let candidate_key = digest(&encode(&(feature.context_id.as_str(), &identity, key))?);
+        candidates.push((identity, candidate_key, input_hash.clone()));
+    }
+    let mut row = if let Some((key, row)) =
+        Publication::retained(&feature.lease, &feature.context_id, candidates)?
     {
-        if row.context_id != feature.context_id || row.starter != id || row.input_hash != input_hash
-        {
-            return Err(Error::conflict(
-                "Retry publication with the original context, version and notes",
-            ));
-        }
+        stored_key = key;
         row
     } else {
         let version = release_version(&input.version).map_err(|_| {
@@ -161,7 +196,7 @@ async fn publish_with_feature(
     let folders = [
         "starters".to_owned(),
         feature.account_uuid.clone(),
-        id.into(),
+        row.starter.clone(),
         row.version.version.clone(),
     ];
     drive_upload(
@@ -258,27 +293,43 @@ async fn publish_block_with_feature(
             "Block content or account does not match the selected action",
         ));
     }
-    let input_hash = digest(&encode(&json!([
-        block.id,
-        block.owner,
-        block.name,
-        block.description,
-        block.visibility,
-        block.version
-    ]))?);
-    let stored_key = digest(&encode(&("block-v2", &feature.context_id, &block.id, key))?);
-    let mut row = if let Some(row) = feature
-        .lease
-        .get::<Publication>("publication", &stored_key)?
+    let (kind, slug) = silicon_starter_core::blocks::parse_id(&block.id)
+        .map_err(|_| Error::conflict("Invalid block identity"))?;
+    let legacy_kind = match kind {
+        silicon_starter_core::blocks::BlockKind::Gene => "gene",
+        silicon_starter_core::blocks::BlockKind::Isi => "isi",
+        silicon_starter_core::blocks::BlockKind::Function => "function",
+    };
+    let input_hash_for = |id: &str| {
+        digest(
+            &json!([
+                id,
+                block.owner,
+                if block.name == block.id {
+                    id
+                } else {
+                    &block.name
+                },
+                block.description,
+                block.visibility,
+                block.version
+            ])
+            .to_string()
+            .into_bytes(),
+        )
+    };
+    let input_hash = input_hash_for(&block.id);
+    let mut stored_key = digest(&encode(&("block-v2", &feature.context_id, &block.id, key))?);
+    let mut candidates = Vec::new();
+    for identity in [block.id.clone(), format!("{legacy_kind}:{slug}")] {
+        let candidate_key = digest(&encode(&("block-v2", &feature.context_id, &identity, key))?);
+        let candidate_hash = input_hash_for(&identity);
+        candidates.push((identity, candidate_key, candidate_hash));
+    }
+    let mut row = if let Some((key, row)) =
+        Publication::retained(&feature.lease, &feature.context_id, candidates)?
     {
-        if row.context_id != feature.context_id
-            || row.starter != block.id
-            || row.input_hash != input_hash
-        {
-            return Err(Error::conflict(
-                "Retry the original block content and metadata in its original account",
-            ));
-        }
+        stored_key = key;
         row
     } else {
         let row = Publication {
@@ -311,18 +362,14 @@ async fn publish_block_with_feature(
         ])?;
         row
     };
-    let (kind, slug) = block
-        .id
-        .split_once(':')
-        .ok_or_else(|| Error::conflict("Invalid block identity"))?;
     let folders = [
         "blocks".to_owned(),
         feature.account_uuid.clone(),
-        kind.into(),
+        legacy_kind.into(),
         slug.into(),
         block.version.clone(),
     ];
-    let filename = if kind == "gene" {
+    let filename = if kind == silicon_starter_core::blocks::BlockKind::Gene {
         "gene.md"
     } else {
         "block.zip"
@@ -661,4 +708,65 @@ async fn read_json(mut response: Response) -> Result<Value> {
     }
     serde_json::from_slice(&body)
         .map_err(|_| Error::unavailable("Briefcase returned an unreadable response"))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_receipts_retain_operation_and_validate_context_and_input() {
+        let directory = std::env::temp_dir().join(format!("starter-receipts-{}", Uuid::new_v4()));
+        {
+            let store =
+                crate::durable::FeatureStore::open(&directory.join("features.sqlite"), &[7; 32])
+                    .unwrap();
+            let lease = store.lease("account").unwrap();
+            let original = Publication {
+                id: Uuid::new_v4(),
+                context_id: "context".into(),
+                starter: "alice.udd".into(),
+                input_hash: "unchanged".into(),
+                version: Version {
+                    version: "1.0".into(),
+                    commit: "a".repeat(40),
+                    notes: String::new(),
+                    published_at: chrono::Utc::now(),
+                },
+                bundle_hash: "bundle".into(),
+                destination: None,
+                parent_path: "original/path".into(),
+                next_folder: 2,
+                upload_id: Some(Uuid::new_v4()),
+                entry_id: None,
+                linked: false,
+                cancelled: false,
+            };
+            lease.put("publication", "legacy-key", &original).unwrap();
+            let candidates = vec![
+                ("s.udd".into(), "canonical-key".into(), "unchanged".into()),
+                ("alice.udd".into(), "legacy-key".into(), "unchanged".into()),
+            ];
+            let (key, retained) = Publication::retained(&lease, "context", candidates.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(key, "legacy-key");
+            assert_eq!(retained.id, original.id);
+            assert_eq!(retained.upload_id, original.upload_id);
+            assert_eq!(retained.parent_path, original.parent_path);
+            assert!(
+                Publication::retained(&lease, "other-account-context", candidates.clone()).is_err()
+            );
+            let mut changed = candidates.clone();
+            changed[1].2 = "changed-content".into();
+            assert!(Publication::retained(&lease, "context", changed).is_err());
+            let mut duplicate = original.clone();
+            duplicate.starter = "s.udd".into();
+            lease
+                .put("publication", "canonical-key", &duplicate)
+                .unwrap();
+            assert!(Publication::retained(&lease, "context", candidates).is_err());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

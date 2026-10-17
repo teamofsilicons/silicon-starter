@@ -3,7 +3,7 @@
 This is a working authoring example for Starter recipes. Run `starter seed`
 in this folder to generate a silicon, or `starter seed --check` to validate
 its ingredients without executing commands.
-It borrows the Waveform choice from `tos.classic`, but uses one ISI and a small
+It borrows the Waveform choice from `s.classic`, but uses one ISI and a small
 event route to keep the example readable.
 
 Recipe expressions follow Stemcell's [reference YAML](https://github.com/teamofsilicons/silicon-stemcell/blob/main/stemcell/silicon/silicon.yaml)
@@ -21,7 +21,7 @@ starter needs. Automatic updates run without questions or terminal input.
 
 ## Before: running from workspace/
 
-Assume this sample has been published as `tos.classic-sample`. Your terminal's
+Assume this sample has been published as `s.classic-sample`. Your terminal's
 current directory is an empty `workspace/` folder:
 
 ```text
@@ -33,9 +33,9 @@ workspace/                            current working directory; empty
 An interactive developer pull looks like this:
 
 ```text
-workspace $ starter pull tos.classic-sample
+workspace $ starter pull s.classic-sample
 
-Pulling tos.classic-sample...
+Pulling s.classic-sample...
 
 Folder name: research-assistant
 What is this silicon's ID (si:handle)? [empty] si:research
@@ -65,7 +65,8 @@ without them, but those defaults do not create an identity or working login.
 Creators can supply command defaults to resolve those values in their setup.
 Use the complete Silicon Accounts ID (`si:research`).
 Application IDs are bare (`dm`, `briefcase`, `waveform`). Starter catalog IDs
-such as `tos.classic-sample` are unchanged.
+such as `s.classic-sample` use a global `s.` namespace, independent of the creator.
+Existing creator-prefixed IDs remain aliases for saved checkouts and old links.
 
 The folder question belongs to Starter and appears for every new instance
 unless a destination was already supplied. An occupied name needs a different
