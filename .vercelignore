@@ -1,0 +1,12 @@
+.env
+.env.*
+**/.env
+**/.env.*
+target/
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/*.tsbuildinfo
+.vercel/
+frontend/.vercel/
+.git/
