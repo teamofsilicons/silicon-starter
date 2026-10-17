@@ -470,11 +470,10 @@ async fn archive(
     }
     let Json(visible) = show(State(s.clone()), headers, Path(id)).await?;
     let id = visible.id;
+    let _snapshot = s.persist_lock.lock().await;
     let mut starters = s.starters.write().await;
     let starter = starters.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    starter.downloads += 1;
-    let bundles = s.bundles.read().await;
-    let bundle = bundles.get(&id).cloned().unwrap_or_default();
+    let bundle = s.bundles.read().await.get(&id).cloned().unwrap_or_default();
     if bundle.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -500,6 +499,14 @@ async fn archive(
     };
     if !silicon_starter_core::local::is_hex_commit(&commit) {
         return Err(StatusCode::NOT_FOUND);
+    }
+    starter.downloads += 1;
+    drop(starters);
+    if save_state_unlocked(&s).await.is_err() {
+        if let Some(starter) = s.starters.write().await.get_mut(&id) {
+            starter.downloads -= 1;
+        }
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     Ok(Json(json!({
         "id": id,

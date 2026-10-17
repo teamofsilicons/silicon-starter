@@ -193,6 +193,36 @@ mod tests {
             "discussions":{old:[{"id":"discussion","starter_id":old,"parent_id":null,"author":"c:alice","body":"hello","created_at":now}]}
         })).await.unwrap();
         for id in [old, "s.udd"] {
+            assert_eq!(
+                archive(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path(id.into()),
+                    Query(HashMap::from([("ref".into(), "missing-release".into())]))
+                )
+                .await
+                .unwrap_err(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(state.starters.read().await["s.udd"].downloads, 7);
+        }
+        let bundle = state.bundles.write().await.remove("s.udd").unwrap();
+        for id in [old, "s.udd"] {
+            assert_eq!(
+                archive(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path(id.into()),
+                    Query(HashMap::new())
+                )
+                .await
+                .unwrap_err(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(state.starters.read().await["s.udd"].downloads, 7);
+        }
+        state.bundles.write().await.insert("s.udd".into(), bundle);
+        for id in [old, "s.udd"] {
             let Json(starter) = show(State(state.clone()), HeaderMap::new(), Path(id.into()))
                 .await
                 .unwrap();
@@ -246,6 +276,7 @@ mod tests {
                 discussions(State(state.clone()), HeaderMap::new(), Path(id.into())).await;
             assert!(threads.is_empty());
         }
+        assert_eq!(state.starters.read().await["s.udd"].downloads, 9);
     }
 
     #[tokio::test]
