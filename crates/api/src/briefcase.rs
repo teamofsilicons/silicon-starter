@@ -568,6 +568,48 @@ fn validate_status(value: &Value, operation: Uuid, expected: Option<Uuid>) -> Re
     }
     Ok(id)
 }
+/// Contract 4 is the Silicon Accounts receiver. Briefcase keeps every operation
+/// revision across a minor release (4.1.0 only retired telemetry), so any 4.x
+/// serves; the operations Starter calls are still matched exactly.
+fn verify_contract(value: &Value) -> Result<()> {
+    let contract_4 = value["contract_version"].as_str().is_some_and(|v| {
+        let parts: Vec<_> = v.split('.').collect();
+        parts.len() == 3
+            && parts[0] == "4"
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if value["service"] != "silicon-briefcase"
+        || value["selected_api_version"] != "v1"
+        || !contract_4
+    {
+        return Err(Error::unavailable(
+            "Briefcase requires the Silicon Accounts receiver rollout",
+        ));
+    }
+    let operations = value["operations"]
+        .as_array()
+        .ok_or_else(|| Error::unavailable("Briefcase omitted its operation contract"))?;
+    for (method, path, revision) in [
+        ("POST", "/obo/folders/create", "3.0.0"),
+        ("POST", "/obo/uploads/reserve", "3.0.0"),
+        ("POST", "/obo/uploads/status", "3.0.0"),
+        ("POST", "/obo/uploads/commit", "3.0.0"),
+        ("POST", "/obo/link-access", "3.0.0"),
+        ("PUT", "/obo/uploads/{upload_id}/content", "2.1.0"),
+    ] {
+        if !operations
+            .iter()
+            .any(|op| op["path"] == path && op["method"] == method && op["version"] == revision)
+        {
+            return Err(Error::unavailable(
+                "Briefcase has not activated delegated publication operations",
+            ));
+        }
+    }
+    Ok(())
+}
 
 struct Provider {
     http: Client,
@@ -598,36 +640,7 @@ impl Provider {
             .send()
             .await
             .map_err(|_| Error::unavailable("Briefcase version check failed"))?;
-        let value = read_json(response).await?;
-        if value["service"] != "silicon-briefcase"
-            || value["selected_api_version"] != "v1"
-            || value["contract_version"] != "4.0.0"
-        {
-            return Err(Error::unavailable(
-                "Briefcase requires the Silicon Accounts receiver rollout",
-            ));
-        }
-        let operations = value["operations"]
-            .as_array()
-            .ok_or_else(|| Error::unavailable("Briefcase omitted its operation contract"))?;
-        for (method, path, revision) in [
-            ("POST", "/obo/folders/create", "3.0.0"),
-            ("POST", "/obo/uploads/reserve", "3.0.0"),
-            ("POST", "/obo/uploads/status", "3.0.0"),
-            ("POST", "/obo/uploads/commit", "3.0.0"),
-            ("POST", "/obo/link-access", "3.0.0"),
-            ("PUT", "/obo/uploads/{upload_id}/content", "2.1.0"),
-        ] {
-            if !operations
-                .iter()
-                .any(|op| op["path"] == path && op["method"] == method && op["version"] == revision)
-            {
-                return Err(Error::unavailable(
-                    "Briefcase has not activated delegated publication operations",
-                ));
-            }
-        }
-        Ok(())
+        verify_contract(&read_json(response).await?)
     }
     async fn json(
         &self,
@@ -708,6 +721,94 @@ async fn read_json(mut response: Response) -> Result<Value> {
     }
     serde_json::from_slice(&body)
         .map_err(|_| Error::unavailable("Briefcase returned an unreadable response"))
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    // The publication operations as Briefcase 4.1.0 serves them, plus the
+    // retired telemetry relay it still lists for 4.0 clients.
+    fn served(contract: &str) -> Value {
+        json!({
+            "service": "silicon-briefcase",
+            "selected_api_version": "v1",
+            "supported_api_versions": ["v1"],
+            "contract_version": contract,
+            "build": contract,
+            "operations": [
+                {"id":"reserveDelegatedUpload","version":"3.0.0","method":"POST","path":"/obo/uploads/reserve"},
+                {"id":"commitDelegatedUpload","version":"3.0.0","method":"POST","path":"/obo/uploads/commit"},
+                {"id":"getDelegatedUploadStatus","version":"3.0.0","method":"POST","path":"/obo/uploads/status"},
+                {"id":"transferDelegatedUpload","version":"2.1.0","method":"PUT","path":"/obo/uploads/{upload_id}/content"},
+                {"id":"submitTelemetry","version":"1.0.0","method":"POST","path":"/telemetry"},
+                {"id":"createFolderOnBehalfOfMember","version":"3.0.0","method":"POST","path":"/obo/folders/create"},
+                {"id":"listEntriesOnBehalfOfMember","version":"3.1.0","method":"POST","path":"/obo/entries/list"},
+                {"id":"setLinkAccessOnBehalfOfMember","version":"3.0.0","method":"POST","path":"/obo/link-access"},
+            ],
+        })
+    }
+    fn refusal(value: &Value) -> String {
+        verify_contract(value).unwrap_err().value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn any_contract_4_release_is_accepted() {
+        for contract in ["4.0.0", "4.1.0", "4.12.3"] {
+            assert!(verify_contract(&served(contract)).is_ok(), "{contract}");
+        }
+    }
+
+    #[test]
+    fn other_majors_and_malformed_contracts_are_refused() {
+        for contract in [
+            "3.0.0",
+            "5.0.0",
+            "40.0.0",
+            "4",
+            "4.1",
+            "4.1.0.0",
+            "4..0",
+            "4.1.0-rc.1",
+        ] {
+            assert_eq!(
+                refusal(&served(contract)),
+                "Briefcase requires the Silicon Accounts receiver rollout",
+                "{contract}"
+            );
+        }
+        let mut numeric = served("4.1.0");
+        numeric["contract_version"] = json!(4.1);
+        assert!(verify_contract(&numeric).is_err());
+        let mut other = served("4.1.0");
+        other["selected_api_version"] = json!("v2");
+        assert!(verify_contract(&other).is_err());
+        other = served("4.1.0");
+        other["service"] = json!("silicon-drive");
+        assert!(verify_contract(&other).is_err());
+    }
+
+    #[test]
+    fn a_minor_release_must_keep_every_publication_operation() {
+        let mut changed = served("4.1.0");
+        changed["operations"][1]["version"] = json!("3.1.0");
+        assert_eq!(
+            refusal(&changed),
+            "Briefcase has not activated delegated publication operations"
+        );
+        let mut missing = served("4.1.0");
+        missing["operations"].as_array_mut().unwrap().remove(7);
+        assert!(verify_contract(&missing).is_err());
+        let mut omitted = served("4.1.0");
+        omitted.as_object_mut().unwrap().remove("operations");
+        assert_eq!(
+            refusal(&omitted),
+            "Briefcase omitted its operation contract"
+        );
+    }
 }
 
 #[cfg(test)]
